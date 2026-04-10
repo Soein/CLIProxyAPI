@@ -3,6 +3,11 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-and-push-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
