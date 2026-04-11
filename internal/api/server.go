@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -535,6 +536,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 
+		mgmt.GET("/codex-weekly-automation/enabled", s.mgmt.GetCodexWeeklyAutomationEnabled)
+		mgmt.PUT("/codex-weekly-automation/enabled", s.mgmt.PutCodexWeeklyAutomationEnabled)
+		mgmt.PATCH("/codex-weekly-automation/enabled", s.mgmt.PutCodexWeeklyAutomationEnabled)
+		mgmt.GET("/codex-weekly-automation/interval-seconds", s.mgmt.GetCodexWeeklyAutomationIntervalSeconds)
+		mgmt.PUT("/codex-weekly-automation/interval-seconds", s.mgmt.PutCodexWeeklyAutomationIntervalSeconds)
+		mgmt.PATCH("/codex-weekly-automation/interval-seconds", s.mgmt.PutCodexWeeklyAutomationIntervalSeconds)
+		mgmt.GET("/codex-weekly-automation/status", s.mgmt.GetCodexWeeklyAutomationStatus)
+
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
@@ -1026,6 +1035,13 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 		return
 	}
 	s.wsAuthChanged = fn
+}
+
+func (s *Server) SetCodexWeeklyAutomationStatusProvider(provider func() codexweekly.Status) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetCodexWeeklyAutomationStatusProvider(provider)
 }
 
 // (management handlers moved to internal/api/handlers/management)

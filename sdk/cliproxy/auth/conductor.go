@@ -1723,6 +1723,16 @@ func resolveUpstreamModelForOpenAICompatAPIKey(cfg *internalconfig.Config, auth 
 
 type apiKeyModelAliasTable map[string]map[string]string
 
+func isRequestScopedCodexStoreMiss(message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "Item with id") &&
+		strings.Contains(message, "not found") &&
+		strings.Contains(message, "store")
+}
+
 func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatName, authProvider string) *internalconfig.OpenAICompatibility {
 	if cfg == nil {
 		return nil
@@ -2017,7 +2027,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 404:
-							if disableCooling {
+							if isRequestScopedCodexStoreMiss(result.Error.Message) || disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(12 * time.Hour)
@@ -2430,11 +2440,16 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
 	case 404:
-		auth.StatusMessage = "not_found"
-		if disableCooling {
+		if resultErr != nil && isRequestScopedCodexStoreMiss(resultErr.Message) {
+			auth.StatusMessage = ""
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(12 * time.Hour)
+			auth.StatusMessage = "not_found"
+			if disableCooling {
+				auth.NextRetryAfter = time.Time{}
+			} else {
+				auth.NextRetryAfter = now.Add(12 * time.Hour)
+			}
 		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"

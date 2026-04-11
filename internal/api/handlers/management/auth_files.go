@@ -29,6 +29,7 @@ import (
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -335,6 +336,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
+					excludedResult := gjson.GetBytes(data, codexweekly.AutomationExcludedMetadataKey)
+					excluded := excludedResult.Exists() && excludedResult.Bool()
+					fileData["codex_weekly_automation_excluded"] = excluded
+					fileData["codexWeeklyAutomationExcluded"] = excluded
+				}
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
 					case gjson.Number:
@@ -463,6 +470,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 				entry["note"] = trimmed
 			}
 		}
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		excluded := codexweekly.IsAutomationExcluded(auth)
+		entry["codex_weekly_automation_excluded"] = excluded
+		entry["codexWeeklyAutomationExcluded"] = excluded
 	}
 	return entry
 }
@@ -1128,12 +1140,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string            `json:"name"`
-		Prefix   *string           `json:"prefix"`
-		ProxyURL *string           `json:"proxy_url"`
-		Headers  map[string]string `json:"headers"`
-		Priority *int              `json:"priority"`
-		Note     *string           `json:"note"`
+		Name                          string            `json:"name"`
+		Prefix                        *string           `json:"prefix"`
+		ProxyURL                      *string           `json:"proxy_url"`
+		Headers                       map[string]string `json:"headers"`
+		Priority                      *int              `json:"priority"`
+		Note                          *string           `json:"note"`
+		CodexWeeklyAutomationExcluded *bool             `json:"codex_weekly_automation_excluded"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1192,6 +1205,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else {
 			targetAuth.Metadata["proxy_url"] = proxyURL
 		}
+		changed = true
+	}
+	if req.CodexWeeklyAutomationExcluded != nil {
+		codexweekly.SetAutomationExcluded(targetAuth, *req.CodexWeeklyAutomationExcluded, time.Now())
 		changed = true
 	}
 	if len(req.Headers) > 0 {

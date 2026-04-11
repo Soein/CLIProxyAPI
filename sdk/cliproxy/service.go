@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -89,6 +90,9 @@ type Service struct {
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
+
+	// codexWeeklyAutomation periodically disables and re-enables Codex auth files based on weekly usage.
+	codexWeeklyAutomation *codexweekly.Automation
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -526,6 +530,16 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	if s.coreManager != nil {
+		s.codexWeeklyAutomation = codexweekly.NewAutomation(s.coreManager, func() *config.Config {
+			s.cfgMu.RLock()
+			defer s.cfgMu.RUnlock()
+			return s.cfg
+		})
+		if s.server != nil {
+			s.server.SetCodexWeeklyAutomationStatusProvider(s.codexWeeklyAutomation.Status)
+		}
+	}
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
@@ -691,6 +705,10 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
+	if s.codexWeeklyAutomation != nil {
+		s.codexWeeklyAutomation.Start(context.Background())
+		log.Info("codex weekly automation started")
+	}
 
 	select {
 	case <-ctx.Done():
@@ -727,6 +745,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
+		}
+		if s.codexWeeklyAutomation != nil {
+			s.codexWeeklyAutomation.Stop()
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {

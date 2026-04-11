@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/Soein/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 
@@ -78,6 +78,9 @@ type Config struct {
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
+
+	// CodexWeeklyAutomation controls periodic Codex weekly-limit detection.
+	CodexWeeklyAutomation CodexWeeklyAutomation `yaml:"codex-weekly-automation" json:"codex-weekly-automation"`
 
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
@@ -205,6 +208,15 @@ type QuotaExceeded struct {
 	// AntigravityCredits indicates whether to retry Antigravity quota_exhausted 429s once
 	// on the same credential with enabledCreditTypes=["GOOGLE_ONE_AI"].
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
+}
+
+// CodexWeeklyAutomation controls automatic Codex weekly-limit detection and recovery.
+type CodexWeeklyAutomation struct {
+	// Enabled toggles the background automation loop.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// IntervalSeconds controls how often the weekly-limit check runs.
+	IntervalSeconds int `yaml:"interval-seconds" json:"interval-seconds"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.

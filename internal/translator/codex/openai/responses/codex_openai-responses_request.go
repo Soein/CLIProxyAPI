@@ -18,7 +18,10 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	}
 
 	rawJSON, _ = sjson.SetBytes(rawJSON, "stream", true)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
+	// Preserve explicit store=true so item references can be resolved upstream.
+	if !gjson.GetBytes(rawJSON, "store").Exists() {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
+	}
 	rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.

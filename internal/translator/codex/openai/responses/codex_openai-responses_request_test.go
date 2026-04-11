@@ -364,3 +364,17 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToCodex_PreservesExplicitStoreTrue(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"store": true,
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "store").Bool(); !got {
+		t.Fatalf("store = %v, want true", got)
+	}
+}
