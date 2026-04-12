@@ -163,21 +163,50 @@ func (a *Automation) RunOnce(ctx context.Context) {
 	}()
 
 	auths := a.listAuths()
+	log.Infof("codex weekly automation: RunOnce started, total auths from manager=%d", len(auths))
+	var codexCount, managedCount, excludedCount, checkedCount, reachedCount, reenabledCount int
+	providerCounts := make(map[string]int)
 	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		providerCounts[strings.ToLower(strings.TrimSpace(auth.Provider))]++
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			codexCount++
+		}
 		if !shouldManageAuth(auth) {
 			continue
 		}
+		managedCount++
+		if IsAutomationExcluded(auth) {
+			excludedCount++
+		}
+		accountID := resolveAccountID(auth)
+		tokenLen := 0
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["access_token"].(string); ok {
+				tokenLen = len(v)
+			}
+		}
+		log.Infof("codex weekly automation: managed auth id=%s provider=%s disabled=%v account_id_len=%d token_len=%d excluded=%v has_marker=%v",
+			redactAuthID(auth), auth.Provider, auth.Disabled, len(accountID), tokenLen, IsAutomationExcluded(auth), HasAutoDisabledMarker(auth))
 		limitReached, err := a.checkWeeklyLimit(ctx, auth)
 		if err != nil {
 			log.WithError(err).Warnf("codex weekly automation: check failed for auth %s", redactAuthID(auth))
 			continue
 		}
+		checkedCount++
+		log.Infof("codex weekly automation: check result auth=%s limit_reached=%v", redactAuthID(auth), limitReached)
 		if limitReached {
+			reachedCount++
 			a.autoDisable(ctx, auth)
 			continue
 		}
+		reenabledCount++
 		a.autoReenable(ctx, auth)
 	}
+	log.Infof("codex weekly automation: RunOnce complete provider_counts=%v codex=%d managed=%d excluded=%d checked=%d reached=%d reenabled_path=%d",
+		providerCounts, codexCount, managedCount, excludedCount, checkedCount, reachedCount, reenabledCount)
 
 	a.mu.Lock()
 	a.lastCheckedAt = a.now()
@@ -187,6 +216,7 @@ func (a *Automation) RunOnce(ctx context.Context) {
 func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) (bool, error) {
 	accountID := resolveAccountID(auth)
 	if accountID == "" {
+		log.Warnf("codex weekly automation: empty account_id for auth %s (skipping silently)", redactAuthID(auth))
 		return false, nil
 	}
 
@@ -196,10 +226,14 @@ func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) 
 	headers.Set("User-Agent", codexUsageUserAgent)
 	req, err := a.manager.NewHttpRequest(ctx, auth, http.MethodGet, usageURL, nil, headers)
 	if err != nil {
+		log.WithError(err).Warnf("codex weekly automation: NewHttpRequest failed for %s", redactAuthID(auth))
 		return false, err
 	}
+	log.Infof("codex weekly automation: sending wham/usage for %s (account_id=%s) Authorization_set=%v",
+		redactAuthID(auth), accountID, req.Header.Get("Authorization") != "")
 	resp, err := a.manager.HttpRequest(ctx, auth, req)
 	if err != nil {
+		log.WithError(err).Warnf("codex weekly automation: HttpRequest failed for %s", redactAuthID(auth))
 		return false, err
 	}
 	defer func() {
@@ -212,11 +246,23 @@ func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) 
 	if err != nil {
 		return false, err
 	}
+	log.Infof("codex weekly automation: wham/usage response auth=%s status=%d body_preview=%s",
+		redactAuthID(auth), resp.StatusCode, truncateForLog(body, 300))
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return false, &coreauth.Error{Code: "usage_request_failed", Message: strings.TrimSpace(string(body))}
 	}
 
-	return weeklyLimitReached(body), nil
+	reached := weeklyLimitReached(body)
+	log.Infof("codex weekly automation: weeklyLimitReached=%v for auth=%s", reached, redactAuthID(auth))
+	return reached, nil
+}
+
+func truncateForLog(b []byte, n int) string {
+	s := string(b)
+	if len(s) > n {
+		return s[:n] + "...(truncated)"
+	}
+	return s
 }
 
 func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
