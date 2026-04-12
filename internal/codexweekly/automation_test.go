@@ -105,11 +105,11 @@ func TestAutomationRunOnce_DisablesCodexAuthWhenWeeklyLimitReached(t *testing.T)
 	if auth.Status != coreauth.StatusDisabled {
 		t.Fatalf("status = %s, want %s", auth.Status, coreauth.StatusDisabled)
 	}
-	if !HasAutoDisabledMarker(auth) {
-		t.Fatal("expected auto-disabled marker to be written")
-	}
 	if auth.StatusMessage != StatusMessageAutoDisabled {
 		t.Fatalf("status message = %q, want %q", auth.StatusMessage, StatusMessageAutoDisabled)
+	}
+	if auth.Metadata == nil || auth.Metadata[AutoDisabledAtMetadataKey] == nil {
+		t.Fatal("expected audit timestamp codex_weekly_auto_disabled_at to be written")
 	}
 	status := automation.Status()
 	if !status.Enabled {
@@ -123,7 +123,11 @@ func TestAutomationRunOnce_DisablesCodexAuthWhenWeeklyLimitReached(t *testing.T)
 	}
 }
 
-func TestAutomationRunOnce_ReenablesOnlyAutoDisabledAuthAfterWeeklyRecovery(t *testing.T) {
+// TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery 验证单门禁模型:
+// 只要 excluded=false,任何 disabled 的 codex auth 在周限恢复后都会被自动启用,
+// 不再区分 "automation 自动禁用" 与 "用户手动禁用"。
+// 同时验证旧版 marker 字段被 autoReenable 兼容清理。
+func TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
@@ -139,9 +143,9 @@ func TestAutomationRunOnce_ReenablesOnlyAutoDisabledAuthAfterWeeklyRecovery(t *t
 				Metadata: map[string]any{
 					"account_id":                  "acct_auto",
 					"access_token":                "token",
-					AutoDisabledMetadataKey:       true,
+					legacyAutoDisabledMarkerKey:   true,
 					AutoDisabledAtMetadataKey:     now.Add(-time.Hour).Format(time.RFC3339),
-					AutoDisabledReasonMetadataKey: "weekly_limit",
+					legacyAutoReasonKey:           "weekly_limit",
 				},
 			},
 			"manual-disabled": {
@@ -193,16 +197,29 @@ func TestAutomationRunOnce_ReenablesOnlyAutoDisabledAuthAfterWeeklyRecovery(t *t
 	if autoDisabled.Status != coreauth.StatusActive {
 		t.Fatalf("status = %s, want %s", autoDisabled.Status, coreauth.StatusActive)
 	}
-	if HasAutoDisabledMarker(autoDisabled) {
-		t.Fatal("expected auto-disabled marker to be cleared after recovery")
+	if autoDisabled.StatusMessage != "" {
+		t.Fatalf("status message = %q, want empty after re-enable", autoDisabled.StatusMessage)
+	}
+	if _, ok := autoDisabled.Metadata[AutoDisabledAtMetadataKey]; ok {
+		t.Fatal("expected auto_disabled_at audit timestamp to be cleared after recovery")
+	}
+	if _, ok := autoDisabled.Metadata[legacyAutoDisabledMarkerKey]; ok {
+		t.Fatal("expected legacy marker codex_weekly_auto_disabled to be cleaned up")
+	}
+	if _, ok := autoDisabled.Metadata[legacyAutoReasonKey]; ok {
+		t.Fatal("expected legacy reason codex_weekly_auto_reason to be cleaned up")
 	}
 
+	// 新行为: 单门禁模型下,手动禁用的账号在周限恢复后也应被自动启用。
 	manualDisabled := manager.auths["manual-disabled"]
-	if !manualDisabled.Disabled {
-		t.Fatal("expected manual-disabled auth to remain disabled")
+	if manualDisabled.Disabled {
+		t.Fatal("expected manual-disabled auth to be re-enabled under single-gate model")
 	}
-	if manualDisabled.StatusMessage != "disabled via management API" {
-		t.Fatalf("manual status message = %q, want manual disable message", manualDisabled.StatusMessage)
+	if manualDisabled.Status != coreauth.StatusActive {
+		t.Fatalf("manual status = %s, want %s", manualDisabled.Status, coreauth.StatusActive)
+	}
+	if manualDisabled.StatusMessage != "" {
+		t.Fatalf("manual status message = %q, want empty after re-enable", manualDisabled.StatusMessage)
 	}
 }
 
@@ -250,8 +267,13 @@ func TestAutomationRunOnce_DoesNotDisableExcludedCodexAuth(t *testing.T) {
 	if auth.Disabled {
 		t.Fatal("expected excluded auth to remain enabled")
 	}
-	if HasAutoDisabledMarker(auth) {
-		t.Fatal("expected excluded auth to never get auto-disabled marker")
+	if auth.StatusMessage == StatusMessageAutoDisabled {
+		t.Fatal("expected excluded auth to never get auto-disabled status message")
+	}
+	if auth.Metadata != nil {
+		if _, ok := auth.Metadata[AutoDisabledAtMetadataKey]; ok {
+			t.Fatal("expected excluded auth to never get auto_disabled_at timestamp")
+		}
 	}
 }
 
@@ -271,9 +293,7 @@ func TestAutomationRunOnce_DoesNotReenableExcludedAutoDisabledCodexAuth(t *testi
 				Metadata: map[string]any{
 					"account_id":                  "acct_excluded_auto",
 					"access_token":                "token",
-					AutoDisabledMetadataKey:       true,
 					AutoDisabledAtMetadataKey:     now.Add(-time.Hour).Format(time.RFC3339),
-					AutoDisabledReasonMetadataKey: "weekly_limit",
 					AutomationExcludedMetadataKey: true,
 				},
 			},
@@ -304,7 +324,10 @@ func TestAutomationRunOnce_DoesNotReenableExcludedAutoDisabledCodexAuth(t *testi
 	if !auth.Disabled {
 		t.Fatal("expected excluded auto-disabled auth to stay disabled")
 	}
-	if !HasAutoDisabledMarker(auth) {
-		t.Fatal("expected auto-disabled marker to remain while excluded")
+	if auth.StatusMessage != StatusMessageAutoDisabled {
+		t.Fatalf("expected auto-disabled status message to remain while excluded, got %q", auth.StatusMessage)
+	}
+	if auth.Metadata == nil || auth.Metadata[AutoDisabledAtMetadataKey] == nil {
+		t.Fatal("expected auto_disabled_at timestamp to remain while excluded")
 	}
 }

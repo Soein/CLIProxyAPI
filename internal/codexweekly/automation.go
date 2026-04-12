@@ -16,9 +16,8 @@ import (
 )
 
 const (
-	AutoDisabledMetadataKey         = "codex_weekly_auto_disabled"
+	// AutoDisabledAtMetadataKey 记录 automation 最近一次自动禁用该 auth 的时间戳 (审计用)。
 	AutoDisabledAtMetadataKey       = "codex_weekly_auto_disabled_at"
-	AutoDisabledReasonMetadataKey   = "codex_weekly_auto_reason"
 	AutomationExcludedMetadataKey   = "codex_weekly_automation_excluded"
 	AutomationExcludedAtMetadataKey = "codex_weekly_automation_excluded_at"
 	StatusMessageAutoDisabled       = "disabled via codex weekly automation"
@@ -27,6 +26,11 @@ const (
 	weeklyWindowSeconds             = 604800
 	usageURL                        = "https://chatgpt.com/backend-api/wham/usage"
 	codexUsageUserAgent             = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+
+	// legacyAutoDisabledMarkerKey / legacyAutoReasonKey 是旧版 marker 字段,
+	// 仅在 autoReenable 路径做兼容清理,不再参与决策。
+	legacyAutoDisabledMarkerKey = "codex_weekly_auto_disabled"
+	legacyAutoReasonKey         = "codex_weekly_auto_reason"
 )
 
 type authManager interface {
@@ -188,8 +192,8 @@ func (a *Automation) RunOnce(ctx context.Context) {
 				tokenLen = len(v)
 			}
 		}
-		log.Infof("codex weekly automation: managed auth id=%s provider=%s disabled=%v account_id_len=%d token_len=%d excluded=%v has_marker=%v",
-			redactAuthID(auth), auth.Provider, auth.Disabled, len(accountID), tokenLen, IsAutomationExcluded(auth), HasAutoDisabledMarker(auth))
+		log.Infof("codex weekly automation: managed auth id=%s provider=%s disabled=%v account_id_len=%d token_len=%d excluded=%v",
+			redactAuthID(auth), auth.Provider, auth.Disabled, len(accountID), tokenLen, IsAutomationExcluded(auth))
 		limitReached, err := a.checkWeeklyLimit(ctx, auth)
 		if err != nil {
 			log.WithError(err).Warnf("codex weekly automation: check failed for auth %s", redactAuthID(auth))
@@ -265,6 +269,8 @@ func truncateForLog(b []byte, n int) string {
 	return s
 }
 
+// autoDisable 在账号当前启用且未被用户排除在自动化外时,禁用该账号并写入审计时间戳。
+// 单门禁模型: excluded 是唯一的 "不要碰" 信号。
 func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
 	if auth == nil {
 		return
@@ -272,10 +278,7 @@ func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
 	if IsAutomationExcluded(auth) {
 		return
 	}
-	if auth.Disabled && HasAutoDisabledMarker(auth) {
-		return
-	}
-	if auth.Disabled && !HasAutoDisabledMarker(auth) {
+	if auth.Disabled {
 		return
 	}
 
@@ -286,9 +289,7 @@ func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
 	if next.Metadata == nil {
 		next.Metadata = make(map[string]any)
 	}
-	next.Metadata[AutoDisabledMetadataKey] = true
 	next.Metadata[AutoDisabledAtMetadataKey] = a.now().UTC().Format(time.RFC3339)
-	next.Metadata[AutoDisabledReasonMetadataKey] = "weekly_limit"
 	next.UpdatedAt = a.now()
 
 	if _, err := a.manager.Update(ctx, next); err != nil {
@@ -296,23 +297,16 @@ func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
 	}
 }
 
+// autoReenable 在账号当前禁用且未被排除在自动化外时,启用该账号并清理审计/遗留字段。
+// 单门禁模型: 不再区分 "自动禁用" vs "手动禁用" —— 只要 excluded=false,周限恢复就统一启用。
 func (a *Automation) autoReenable(ctx context.Context, auth *coreauth.Auth) {
-	if auth == nil || !HasAutoDisabledMarker(auth) {
+	if auth == nil {
 		return
 	}
 	if IsAutomationExcluded(auth) {
 		return
 	}
 	if !auth.Disabled {
-		next := auth.Clone()
-		ClearAutoDisabledMetadata(next)
-		next.UpdatedAt = a.now()
-		if _, err := a.manager.Update(ctx, next); err != nil {
-			log.WithError(err).Warnf("codex weekly automation: failed to clear stale auto marker for auth %s", redactAuthID(auth))
-		}
-		return
-	}
-	if auth.StatusMessage != StatusMessageAutoDisabled {
 		return
 	}
 
@@ -320,7 +314,11 @@ func (a *Automation) autoReenable(ctx context.Context, auth *coreauth.Auth) {
 	next.Disabled = false
 	next.Status = coreauth.StatusActive
 	next.StatusMessage = ""
-	ClearAutoDisabledMetadata(next)
+	if next.Metadata != nil {
+		delete(next.Metadata, AutoDisabledAtMetadataKey)
+		delete(next.Metadata, legacyAutoDisabledMarkerKey)
+		delete(next.Metadata, legacyAutoReasonKey)
+	}
 	next.UpdatedAt = a.now()
 
 	if _, err := a.manager.Update(ctx, next); err != nil {
@@ -346,33 +344,6 @@ func (a *Automation) listAuths() []*coreauth.Auth {
 		return nil
 	}
 	return a.manager.List()
-}
-
-func HasAutoDisabledMarker(auth *coreauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
-	}
-	raw, ok := auth.Metadata[AutoDisabledMetadataKey]
-	if !ok {
-		return false
-	}
-	switch v := raw.(type) {
-	case bool:
-		return v
-	case string:
-		return strings.EqualFold(strings.TrimSpace(v), "true")
-	default:
-		return false
-	}
-}
-
-func ClearAutoDisabledMetadata(auth *coreauth.Auth) {
-	if auth == nil || auth.Metadata == nil {
-		return
-	}
-	delete(auth.Metadata, AutoDisabledMetadataKey)
-	delete(auth.Metadata, AutoDisabledAtMetadataKey)
-	delete(auth.Metadata, AutoDisabledReasonMetadataKey)
 }
 
 func IsAutomationExcluded(auth *coreauth.Auth) bool {
@@ -529,13 +500,15 @@ func automationInterval(cfg *internalconfig.Config) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// countAutoDisabledAuths 统计当前处于 "被 automation 自动禁用" 状态的账号数。
+// 单门禁模型下通过 status_message 识别,不再依赖 marker metadata。
 func countAutoDisabledAuths(auths []*coreauth.Auth) int {
 	count := 0
 	for _, auth := range auths {
 		if auth == nil || !shouldManageAuth(auth) {
 			continue
 		}
-		if auth.Disabled && HasAutoDisabledMarker(auth) {
+		if auth.Disabled && auth.StatusMessage == StatusMessageAutoDisabled {
 			count++
 		}
 	}
