@@ -123,6 +123,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 
 	a := &coreauth.Auth{
 		ID:       id,
+		FileName: id,
 		Provider: provider,
 		Label:    label,
 		Prefix:   prefix,
