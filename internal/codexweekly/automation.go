@@ -501,15 +501,34 @@ func automationInterval(cfg *internalconfig.Config) time.Duration {
 }
 
 // countAutoDisabledAuths 统计当前处于 "被 automation 自动禁用" 状态的账号数。
-// 单门禁模型下通过 status_message 识别,不再依赖 marker metadata。
+// 通过 AutoDisabledAtMetadataKey 审计时间戳识别 (该字段持久化到磁盘,
+// 容器重启后依然可见;而 status_message 不随 auth 文件落盘)。
+// 兼容旧版 marker codex_weekly_auto_disabled: true。
 func countAutoDisabledAuths(auths []*coreauth.Auth) int {
 	count := 0
 	for _, auth := range auths {
 		if auth == nil || !shouldManageAuth(auth) {
 			continue
 		}
-		if auth.Disabled && auth.StatusMessage == StatusMessageAutoDisabled {
+		if !auth.Disabled || auth.Metadata == nil {
+			continue
+		}
+		if _, ok := auth.Metadata[AutoDisabledAtMetadataKey]; ok {
 			count++
+			continue
+		}
+		// 兼容旧版 boolean marker
+		if v, ok := auth.Metadata[legacyAutoDisabledMarkerKey]; ok {
+			switch tv := v.(type) {
+			case bool:
+				if tv {
+					count++
+				}
+			case string:
+				if strings.EqualFold(strings.TrimSpace(tv), "true") {
+					count++
+				}
+			}
 		}
 	}
 	return count
