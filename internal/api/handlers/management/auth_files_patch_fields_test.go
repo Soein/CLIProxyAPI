@@ -163,7 +163,9 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 	}
 }
 
-func TestPatchAuthFileFields_UpdatesCodexWeeklyAutomationExcluded(t *testing.T) {
+// TestPatchAuthFileFields_UpdatesCodexAutomationExcluded_LegacyField 验证 PATCH 接受旧字段
+// codex_weekly_automation_excluded 并迁移到新字段 codex_automation_excluded。
+func TestPatchAuthFileFields_UpdatesCodexAutomationExcluded_LegacyField(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -202,17 +204,73 @@ func TestPatchAuthFileFields_UpdatesCodexWeeklyAutomationExcluded(t *testing.T) 
 	if !ok || updated == nil {
 		t.Fatalf("expected auth record to exist after patch")
 	}
-	got, ok := updated.Metadata["codex_weekly_automation_excluded"].(bool)
+	// 新字段应被写入。
+	got, ok := updated.Metadata["codex_automation_excluded"].(bool)
 	if !ok || !got {
-		t.Fatalf("expected codex_weekly_automation_excluded=true, got %#v", updated.Metadata["codex_weekly_automation_excluded"])
+		t.Fatalf("expected codex_automation_excluded=true after migration, got %#v", updated.Metadata["codex_automation_excluded"])
+	}
+	// 旧字段应被清理,避免新/旧值漂移。
+	if _, exists := updated.Metadata["codex_weekly_automation_excluded"]; exists {
+		t.Fatalf("expected legacy codex_weekly_automation_excluded to be migrated/removed, still present=%#v", updated.Metadata["codex_weekly_automation_excluded"])
 	}
 }
 
-func TestBuildAuthFileEntry_IncludesCodexWeeklyAutomationExcluded(t *testing.T) {
+// TestPatchAuthFileFields_UpdatesCodexAutomationExcluded_NewField 验证 PATCH 接受新字段
+// codex_automation_excluded 并正确写入。
+func TestPatchAuthFileFields_UpdatesCodexAutomationExcluded_NewField(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex.json",
+		FileName: "codex.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/codex.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"codex.json","codex_automation_excluded":true}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	got, ok := updated.Metadata["codex_automation_excluded"].(bool)
+	if !ok || !got {
+		t.Fatalf("expected codex_automation_excluded=true, got %#v", updated.Metadata["codex_automation_excluded"])
+	}
+}
+
+// TestBuildAuthFileEntry_IncludesCodexAutomationExcluded 验证输出响应同时包含新旧字段,
+// 且两者值一致(镜像),前端可平滑过渡。
+func TestBuildAuthFileEntry_IncludesCodexAutomationExcluded(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+
+	// 模拟旧版 on-disk auth 文件:只有旧字段。
 	entry := h.buildAuthFileEntry(&coreauth.Auth{
 		ID:       "codex.json",
 		FileName: "codex.json",
@@ -229,7 +287,12 @@ func TestBuildAuthFileEntry_IncludesCodexWeeklyAutomationExcluded(t *testing.T) 
 	if entry == nil {
 		t.Fatal("expected entry")
 	}
+	// 新主字段。
+	if got := entry["codex_automation_excluded"]; got != true {
+		t.Fatalf("entry[codex_automation_excluded] = %#v, want true", got)
+	}
+	// 向后兼容字段。
 	if got := entry["codex_weekly_automation_excluded"]; got != true {
-		t.Fatalf("entry excluded flag = %#v, want true", got)
+		t.Fatalf("entry[codex_weekly_automation_excluded] = %#v, want true", got)
 	}
 }

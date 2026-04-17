@@ -1,4 +1,6 @@
-package codexweekly
+// Package codexhourly 提供 Codex 5h (primary_window, limit_window_seconds=18000)
+// 限额的周期性主动探测与自动禁用/恢复机制,结构与 codexweekly 包严格对称。
+package codexhourly
 
 import (
 	"context"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	codexweekly "github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -16,27 +19,15 @@ import (
 )
 
 const (
-	// AutoDisabledAtMetadataKey 记录 weekly automation 最近一次自动禁用该 auth 的时间戳 (审计用)。
-	AutoDisabledAtMetadataKey = "codex_weekly_auto_disabled_at"
-	// AutomationExcludedMetadataKey 是新版统一排除字段,同时控制 weekly + hourly automation。
-	AutomationExcludedMetadataKey = "codex_automation_excluded"
-	// AutomationExcludedAtMetadataKey 是新版排除时间戳。
-	AutomationExcludedAtMetadataKey = "codex_automation_excluded_at"
-	// LegacyWeeklyAutomationExcludedKey / LegacyWeeklyAutomationExcludedAtKey 是旧版
-	// weekly 专用排除字段,保留用于向后兼容读写与同步清理。
-	LegacyWeeklyAutomationExcludedKey   = "codex_weekly_automation_excluded"
-	LegacyWeeklyAutomationExcludedAtKey = "codex_weekly_automation_excluded_at"
-	StatusMessageAutoDisabled           = "disabled via codex weekly automation"
-	defaultInterval                     = 5 * time.Minute
-	pollTick                            = 1 * time.Second
-	weeklyWindowSeconds                 = 604800
-	usageURL                            = "https://chatgpt.com/backend-api/wham/usage"
-	codexUsageUserAgent                 = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-
-	// legacyAutoDisabledMarkerKey / legacyAutoReasonKey 是旧版 marker 字段,
-	// 仅在 autoReenable 路径做兼容清理,不再参与决策。
-	legacyAutoDisabledMarkerKey = "codex_weekly_auto_disabled"
-	legacyAutoReasonKey         = "codex_weekly_auto_reason"
+	// AutoDisabledAtMetadataKey 记录 hourly automation 最近一次自动禁用该 auth 的时间戳 (审计用)。
+	AutoDisabledAtMetadataKey = "codex_hourly_auto_disabled_at"
+	// StatusMessageAutoDisabled 是 hourly automation 标注 auth.StatusMessage 的固定文案。
+	StatusMessageAutoDisabled = "disabled via codex hourly automation"
+	defaultInterval           = 5 * time.Minute
+	pollTick                  = 1 * time.Second
+	hourlyWindowSeconds       = 18000
+	usageURL                  = "https://chatgpt.com/backend-api/wham/usage"
+	codexUsageUserAgent       = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 )
 
 type authManager interface {
@@ -46,6 +37,7 @@ type authManager interface {
 	HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error)
 }
 
+// Status 汇报 hourly automation 的运行时状态,与 codexweekly.Status 对称。
 type Status struct {
 	Enabled           bool       `json:"enabled"`
 	Running           bool       `json:"running"`
@@ -53,6 +45,7 @@ type Status struct {
 	AutoDisabledCount int        `json:"auto_disabled_count"`
 }
 
+// Automation 控制 hourly 窗口的轮询检测,结构镜像 codexweekly.Automation。
 type Automation struct {
 	manager   authManager
 	getConfig func() *internalconfig.Config
@@ -66,6 +59,7 @@ type Automation struct {
 	now func() time.Time
 }
 
+// NewAutomation 构造 hourly automation 实例。
 func NewAutomation(manager authManager, getConfig func() *internalconfig.Config) *Automation {
 	return &Automation{
 		manager:   manager,
@@ -74,6 +68,7 @@ func NewAutomation(manager authManager, getConfig func() *internalconfig.Config)
 	}
 }
 
+// Start 启动 ticker loop。
 func (a *Automation) Start(parent context.Context) {
 	if a == nil {
 		return
@@ -101,7 +96,7 @@ func (a *Automation) Start(parent context.Context) {
 				return
 			case <-ticker.C:
 				cfg := a.currentConfig()
-				if cfg == nil || !cfg.CodexWeeklyAutomation.Enabled {
+				if cfg == nil || !cfg.CodexHourlyAutomation.Enabled {
 					continue
 				}
 				interval := automationInterval(cfg)
@@ -114,6 +109,7 @@ func (a *Automation) Start(parent context.Context) {
 	}()
 }
 
+// Stop 关停 ticker loop。
 func (a *Automation) Stop() {
 	if a == nil {
 		return
@@ -128,12 +124,13 @@ func (a *Automation) Stop() {
 	}
 }
 
+// Status 汇报当前状态。
 func (a *Automation) Status() Status {
 	if a == nil {
 		return Status{}
 	}
 	cfg := a.currentConfig()
-	enabled := cfg != nil && cfg.CodexWeeklyAutomation.Enabled
+	enabled := cfg != nil && cfg.CodexHourlyAutomation.Enabled
 
 	a.mu.RLock()
 	lastCheckedAt := a.lastCheckedAt
@@ -152,6 +149,7 @@ func (a *Automation) Status() Status {
 	return status
 }
 
+// RunOnce 执行一次全量检查。
 func (a *Automation) RunOnce(ctx context.Context) {
 	if a == nil || a.manager == nil {
 		return
@@ -173,7 +171,7 @@ func (a *Automation) RunOnce(ctx context.Context) {
 	}()
 
 	auths := a.listAuths()
-	log.Infof("codex weekly automation: RunOnce started, total auths from manager=%d", len(auths))
+	log.Infof("codex hourly automation: RunOnce started, total auths from manager=%d", len(auths))
 	var codexCount, managedCount, excludedCount, checkedCount, reachedCount, reenabledCount int
 	providerCounts := make(map[string]int)
 	for _, auth := range auths {
@@ -188,7 +186,7 @@ func (a *Automation) RunOnce(ctx context.Context) {
 			continue
 		}
 		managedCount++
-		if IsAutomationExcluded(auth) {
+		if codexweekly.IsAutomationExcluded(auth) {
 			excludedCount++
 		}
 		accountID := resolveAccountID(auth)
@@ -198,15 +196,15 @@ func (a *Automation) RunOnce(ctx context.Context) {
 				tokenLen = len(v)
 			}
 		}
-		log.Infof("codex weekly automation: managed auth id=%s provider=%s disabled=%v account_id_len=%d token_len=%d excluded=%v",
-			redactAuthID(auth), auth.Provider, auth.Disabled, len(accountID), tokenLen, IsAutomationExcluded(auth))
-		limitReached, err := a.checkWeeklyLimit(ctx, auth)
+		log.Infof("codex hourly automation: managed auth id=%s provider=%s disabled=%v account_id_len=%d token_len=%d excluded=%v",
+			redactAuthID(auth), auth.Provider, auth.Disabled, len(accountID), tokenLen, codexweekly.IsAutomationExcluded(auth))
+		limitReached, err := a.checkHourlyLimit(ctx, auth)
 		if err != nil {
-			log.WithError(err).Warnf("codex weekly automation: check failed for auth %s", redactAuthID(auth))
+			log.WithError(err).Warnf("codex hourly automation: check failed for auth %s", redactAuthID(auth))
 			continue
 		}
 		checkedCount++
-		log.Infof("codex weekly automation: check result auth=%s limit_reached=%v", redactAuthID(auth), limitReached)
+		log.Infof("codex hourly automation: check result auth=%s limit_reached=%v", redactAuthID(auth), limitReached)
 		if limitReached {
 			reachedCount++
 			a.autoDisable(ctx, auth)
@@ -215,7 +213,7 @@ func (a *Automation) RunOnce(ctx context.Context) {
 		reenabledCount++
 		a.autoReenable(ctx, auth)
 	}
-	log.Infof("codex weekly automation: RunOnce complete provider_counts=%v codex=%d managed=%d excluded=%d checked=%d reached=%d reenabled_path=%d",
+	log.Infof("codex hourly automation: RunOnce complete provider_counts=%v codex=%d managed=%d excluded=%d checked=%d reached=%d reenabled_path=%d",
 		providerCounts, codexCount, managedCount, excludedCount, checkedCount, reachedCount, reenabledCount)
 
 	a.mu.Lock()
@@ -223,10 +221,10 @@ func (a *Automation) RunOnce(ctx context.Context) {
 	a.mu.Unlock()
 }
 
-func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) (bool, error) {
+func (a *Automation) checkHourlyLimit(ctx context.Context, auth *coreauth.Auth) (bool, error) {
 	accountID := resolveAccountID(auth)
 	if accountID == "" {
-		log.Warnf("codex weekly automation: empty account_id for auth %s (skipping silently)", redactAuthID(auth))
+		log.Warnf("codex hourly automation: empty account_id for auth %s (skipping silently)", redactAuthID(auth))
 		return false, nil
 	}
 
@@ -236,19 +234,19 @@ func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) 
 	headers.Set("User-Agent", codexUsageUserAgent)
 	req, err := a.manager.NewHttpRequest(ctx, auth, http.MethodGet, usageURL, nil, headers)
 	if err != nil {
-		log.WithError(err).Warnf("codex weekly automation: NewHttpRequest failed for %s", redactAuthID(auth))
+		log.WithError(err).Warnf("codex hourly automation: NewHttpRequest failed for %s", redactAuthID(auth))
 		return false, err
 	}
-	log.Infof("codex weekly automation: sending wham/usage for %s (account_id=%s) Authorization_set=%v",
+	log.Infof("codex hourly automation: sending wham/usage for %s (account_id=%s) Authorization_set=%v",
 		redactAuthID(auth), accountID, req.Header.Get("Authorization") != "")
 	resp, err := a.manager.HttpRequest(ctx, auth, req)
 	if err != nil {
-		log.WithError(err).Warnf("codex weekly automation: HttpRequest failed for %s", redactAuthID(auth))
+		log.WithError(err).Warnf("codex hourly automation: HttpRequest failed for %s", redactAuthID(auth))
 		return false, err
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
-			log.WithError(errClose).Debug("codex weekly automation: failed to close usage response body")
+			log.WithError(errClose).Debug("codex hourly automation: failed to close usage response body")
 		}
 	}()
 
@@ -256,14 +254,14 @@ func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) 
 	if err != nil {
 		return false, err
 	}
-	log.Infof("codex weekly automation: wham/usage response auth=%s status=%d body_preview=%s",
+	log.Infof("codex hourly automation: wham/usage response auth=%s status=%d body_preview=%s",
 		redactAuthID(auth), resp.StatusCode, truncateForLog(body, 300))
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return false, &coreauth.Error{Code: "usage_request_failed", Message: strings.TrimSpace(string(body))}
 	}
 
-	reached := weeklyLimitReached(body)
-	log.Infof("codex weekly automation: weeklyLimitReached=%v for auth=%s", reached, redactAuthID(auth))
+	reached := hourlyLimitReached(body)
+	log.Infof("codex hourly automation: hourlyLimitReached=%v for auth=%s", reached, redactAuthID(auth))
 	return reached, nil
 }
 
@@ -275,13 +273,12 @@ func truncateForLog(b []byte, n int) string {
 	return s
 }
 
-// autoDisable 在账号当前启用且未被用户排除在自动化外时,禁用该账号并写入审计时间戳。
-// 单门禁模型: excluded 是唯一的 "不要碰" 信号。
+// autoDisable 禁用 5h 命中的 auth,写入 codex_hourly_auto_disabled_at 审计时间戳。
 func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
 	if auth == nil {
 		return
 	}
-	if IsAutomationExcluded(auth) {
+	if codexweekly.IsAutomationExcluded(auth) {
 		return
 	}
 	if auth.Disabled {
@@ -299,18 +296,18 @@ func (a *Automation) autoDisable(ctx context.Context, auth *coreauth.Auth) {
 	next.UpdatedAt = a.now()
 
 	if _, err := a.manager.Update(ctx, next); err != nil {
-		log.WithError(err).Warnf("codex weekly automation: failed to disable auth %s", redactAuthID(auth))
+		log.WithError(err).Warnf("codex hourly automation: failed to disable auth %s", redactAuthID(auth))
 	}
 }
 
-// autoReenable 只启用**本 automation 自己禁用**的账号 (通过 AutoDisabledAtMetadataKey 识别),
-// 避免在 weekly/hourly 共存场景下,weekly 错误启用被 hourly 禁用的账号,或错误启用用户手动禁用的账号。
+// autoReenable 只启用**本 automation 自己禁用**的账号 (通过 codex_hourly_auto_disabled_at 识别),
+// 避免在 weekly/hourly 共存场景下错误启用其他来源禁用的 auth。
 // 前置门禁: excluded=true 跳过;auth 未禁用跳过;不含自有 auto_disabled_at 标记跳过。
 func (a *Automation) autoReenable(ctx context.Context, auth *coreauth.Auth) {
 	if auth == nil {
 		return
 	}
-	if IsAutomationExcluded(auth) {
+	if codexweekly.IsAutomationExcluded(auth) {
 		return
 	}
 	if !auth.Disabled {
@@ -326,34 +323,20 @@ func (a *Automation) autoReenable(ctx context.Context, auth *coreauth.Auth) {
 	next.StatusMessage = ""
 	if next.Metadata != nil {
 		delete(next.Metadata, AutoDisabledAtMetadataKey)
-		delete(next.Metadata, legacyAutoDisabledMarkerKey)
-		delete(next.Metadata, legacyAutoReasonKey)
 	}
 	next.UpdatedAt = a.now()
 
 	if _, err := a.manager.Update(ctx, next); err != nil {
-		log.WithError(err).Warnf("codex weekly automation: failed to re-enable auth %s", redactAuthID(auth))
+		log.WithError(err).Warnf("codex hourly automation: failed to re-enable auth %s", redactAuthID(auth))
 	}
 }
 
-// hasSelfDisabledMarker 判断 auth 是否含有 weekly automation 自身的"自动禁用"审计标记。
-// 兼容旧版 boolean marker codex_weekly_auto_disabled: true。
 func hasSelfDisabledMarker(auth *coreauth.Auth) bool {
 	if auth == nil || auth.Metadata == nil {
 		return false
 	}
-	if _, ok := auth.Metadata[AutoDisabledAtMetadataKey]; ok {
-		return true
-	}
-	if v, ok := auth.Metadata[legacyAutoDisabledMarkerKey]; ok {
-		switch tv := v.(type) {
-		case bool:
-			return tv
-		case string:
-			return strings.EqualFold(strings.TrimSpace(tv), "true")
-		}
-	}
-	return false
+	_, ok := auth.Metadata[AutoDisabledAtMetadataKey]
+	return ok
 }
 
 func (a *Automation) currentConfig() *internalconfig.Config {
@@ -374,61 +357,6 @@ func (a *Automation) listAuths() []*coreauth.Auth {
 		return nil
 	}
 	return a.manager.List()
-}
-
-// IsAutomationExcluded 读取"排除出 codex 自动化"标记,同时作用于 weekly + hourly。
-// 读取顺序:优先新字段 codex_automation_excluded,回落旧字段 codex_weekly_automation_excluded。
-func IsAutomationExcluded(auth *coreauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
-	}
-	if v, ok := readBoolish(auth.Metadata[AutomationExcludedMetadataKey]); ok {
-		return v
-	}
-	if v, ok := readBoolish(auth.Metadata[LegacyWeeklyAutomationExcludedKey]); ok {
-		return v
-	}
-	return false
-}
-
-// SetAutomationExcluded 写入"排除出 codex 自动化"标记,统一写入新字段并同步清理旧字段,
-// 避免两份值漂移。excluded=false 时同时清除新旧字段。
-func SetAutomationExcluded(auth *coreauth.Auth, excluded bool, now time.Time) {
-	if auth == nil {
-		return
-	}
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
-	}
-	// 始终清理旧字段,避免新/旧值不一致。
-	delete(auth.Metadata, LegacyWeeklyAutomationExcludedKey)
-	delete(auth.Metadata, LegacyWeeklyAutomationExcludedAtKey)
-	if !excluded {
-		delete(auth.Metadata, AutomationExcludedMetadataKey)
-		delete(auth.Metadata, AutomationExcludedAtMetadataKey)
-		return
-	}
-	auth.Metadata[AutomationExcludedMetadataKey] = true
-	auth.Metadata[AutomationExcludedAtMetadataKey] = now.UTC().Format(time.RFC3339)
-}
-
-// readBoolish 把 metadata 里的 bool/string 值解析成 bool。第二个返回值表示该键是否存在。
-func readBoolish(raw any) (bool, bool) {
-	if raw == nil {
-		return false, false
-	}
-	switch v := raw.(type) {
-	case bool:
-		return v, true
-	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			return false, false
-		}
-		return strings.EqualFold(trimmed, "true"), true
-	default:
-		return false, false
-	}
 }
 
 func shouldManageAuth(auth *coreauth.Auth) bool {
@@ -462,26 +390,29 @@ func resolveAccountID(auth *coreauth.Auth) string {
 	return ""
 }
 
-func weeklyLimitReached(body []byte) bool {
+// hourlyLimitReached 解析 wham/usage 响应,当 primary_window (5h) 任一 rate_limit 命中时返回 true。
+func hourlyLimitReached(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
-	if rateLimitWeeklyReached(gjson.GetBytes(body, "rate_limit")) {
+	if rateLimitHourlyReached(gjson.GetBytes(body, "rate_limit")) {
 		return true
 	}
-	if rateLimitWeeklyReached(gjson.GetBytes(body, "code_review_rate_limit")) {
+	if rateLimitHourlyReached(gjson.GetBytes(body, "code_review_rate_limit")) {
 		return true
 	}
-
 	for _, item := range gjson.GetBytes(body, "additional_rate_limits").Array() {
-		if rateLimitWeeklyReached(item.Get("rate_limit")) {
+		if rateLimitHourlyReached(item.Get("rate_limit")) {
 			return true
 		}
 	}
 	return false
 }
 
-func rateLimitWeeklyReached(limitInfo gjson.Result) bool {
+// rateLimitHourlyReached 判定单个 rate_limit 节点是否命中 5h 窗口。
+// 语义镜像 codexweekly.rateLimitWeeklyReached,但窗口时长匹配 hourlyWindowSeconds。
+// 5h 一般落在 primary_window,但也检测 secondary_window 做冗余保护。
+func rateLimitHourlyReached(limitInfo gjson.Result) bool {
 	if !limitInfo.Exists() {
 		return false
 	}
@@ -502,29 +433,17 @@ func rateLimitWeeklyReached(limitInfo gjson.Result) bool {
 		secondary = limitInfo.Get("secondaryWindow")
 	}
 
-	if windowIsWeekly(primary) || windowIsWeekly(secondary) {
-		return limitReached || (allowedKnown && !allowed)
-	}
-
-	// Legacy fallback: if the duration is absent, treat the secondary window as weekly.
-	if secondary.Exists() && !windowHasDuration(primary) && !windowHasDuration(secondary) {
+	if windowIsHourly(primary) || windowIsHourly(secondary) {
 		return limitReached || (allowedKnown && !allowed)
 	}
 	return false
 }
 
-func windowIsWeekly(window gjson.Result) bool {
+func windowIsHourly(window gjson.Result) bool {
 	if !window.Exists() {
 		return false
 	}
-	return windowDurationSeconds(window) == weeklyWindowSeconds
-}
-
-func windowHasDuration(window gjson.Result) bool {
-	if !window.Exists() {
-		return false
-	}
-	return window.Get("limit_window_seconds").Exists() || window.Get("limitWindowSeconds").Exists()
+	return windowDurationSeconds(window) == hourlyWindowSeconds
 }
 
 func windowDurationSeconds(window gjson.Result) int64 {
@@ -544,17 +463,15 @@ func automationInterval(cfg *internalconfig.Config) time.Duration {
 	if cfg == nil {
 		return defaultInterval
 	}
-	seconds := cfg.CodexWeeklyAutomation.IntervalSeconds
+	seconds := cfg.CodexHourlyAutomation.IntervalSeconds
 	if seconds <= 0 {
 		return defaultInterval
 	}
 	return time.Duration(seconds) * time.Second
 }
 
-// countAutoDisabledAuths 统计当前处于 "被 automation 自动禁用" 状态的账号数。
-// 通过 AutoDisabledAtMetadataKey 审计时间戳识别 (该字段持久化到磁盘,
-// 容器重启后依然可见;而 status_message 不随 auth 文件落盘)。
-// 兼容旧版 marker codex_weekly_auto_disabled: true。
+// countAutoDisabledAuths 统计当前处于 "被 hourly automation 自动禁用" 状态的账号数。
+// 通过 AutoDisabledAtMetadataKey (codex_hourly_auto_disabled_at) 审计时间戳识别。
 func countAutoDisabledAuths(auths []*coreauth.Auth) int {
 	count := 0
 	for _, auth := range auths {
@@ -566,20 +483,6 @@ func countAutoDisabledAuths(auths []*coreauth.Auth) int {
 		}
 		if _, ok := auth.Metadata[AutoDisabledAtMetadataKey]; ok {
 			count++
-			continue
-		}
-		// 兼容旧版 boolean marker
-		if v, ok := auth.Metadata[legacyAutoDisabledMarkerKey]; ok {
-			switch tv := v.(type) {
-			case bool:
-				if tv {
-					count++
-				}
-			case string:
-				if strings.EqualFold(strings.TrimSpace(tv), "true") {
-					count++
-				}
-			}
 		}
 	}
 	return count

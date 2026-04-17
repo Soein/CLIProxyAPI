@@ -86,6 +86,9 @@ type Config struct {
 	// CodexWeeklyAutomation controls periodic Codex weekly-limit detection.
 	CodexWeeklyAutomation CodexWeeklyAutomation `yaml:"codex-weekly-automation" json:"codex-weekly-automation"`
 
+	// CodexHourlyAutomation controls periodic Codex 5h (primary_window) limit detection.
+	CodexHourlyAutomation CodexHourlyAutomation `yaml:"codex-hourly-automation" json:"codex-hourly-automation"`
+
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
@@ -220,6 +223,16 @@ type CodexWeeklyAutomation struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 
 	// IntervalSeconds controls how often the weekly-limit check runs.
+	IntervalSeconds int `yaml:"interval-seconds" json:"interval-seconds"`
+}
+
+// CodexHourlyAutomation controls automatic Codex 5h (primary_window, limit_window_seconds=18000)
+// limit detection and recovery. Structure is symmetric to CodexWeeklyAutomation.
+type CodexHourlyAutomation struct {
+	// Enabled toggles the background automation loop.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// IntervalSeconds controls how often the hourly-limit check runs.
 	IntervalSeconds int `yaml:"interval-seconds" json:"interval-seconds"`
 }
 

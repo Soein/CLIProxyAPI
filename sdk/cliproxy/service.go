@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexhourly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
@@ -93,6 +94,9 @@ type Service struct {
 
 	// codexWeeklyAutomation periodically disables and re-enables Codex auth files based on weekly usage.
 	codexWeeklyAutomation *codexweekly.Automation
+
+	// codexHourlyAutomation periodically disables and re-enables Codex auth files based on 5h usage.
+	codexHourlyAutomation *codexhourly.Automation
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -534,6 +538,14 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.server != nil {
 			s.server.SetCodexWeeklyAutomationStatusProvider(s.codexWeeklyAutomation.Status)
 		}
+		s.codexHourlyAutomation = codexhourly.NewAutomation(s.coreManager, func() *config.Config {
+			s.cfgMu.RLock()
+			defer s.cfgMu.RUnlock()
+			return s.cfg
+		})
+		if s.server != nil {
+			s.server.SetCodexHourlyAutomationStatusProvider(s.codexHourlyAutomation.Status)
+		}
 	}
 
 	if s.authManager == nil {
@@ -730,6 +742,10 @@ func (s *Service) Run(ctx context.Context) error {
 		s.codexWeeklyAutomation.Start(context.Background())
 		log.Info("codex weekly automation started")
 	}
+	if s.codexHourlyAutomation != nil {
+		s.codexHourlyAutomation.Start(context.Background())
+		log.Info("codex hourly automation started")
+	}
 
 	select {
 	case <-ctx.Done():
@@ -769,6 +785,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.codexWeeklyAutomation != nil {
 			s.codexWeeklyAutomation.Stop()
+		}
+		if s.codexHourlyAutomation != nil {
+			s.codexHourlyAutomation.Stop()
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {

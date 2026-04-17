@@ -123,11 +123,12 @@ func TestAutomationRunOnce_DisablesCodexAuthWhenWeeklyLimitReached(t *testing.T)
 	}
 }
 
-// TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery 验证单门禁模型:
-// 只要 excluded=false,任何 disabled 的 codex auth 在周限恢复后都会被自动启用,
-// 不再区分 "automation 自动禁用" 与 "用户手动禁用"。
+// TestAutomationRunOnce_ReenablesOnlyWeeklyAutoDisabledAfterRecovery 验证新的 self-gate 语义:
+// 只有带 weekly 自身审计标记 (codex_weekly_auto_disabled_at 或旧 codex_weekly_auto_disabled) 的
+// auth 在周限恢复后会被自动启用;手动禁用的 auth 或被其他 automation(hourly)禁用的 auth
+// 不会被 weekly 错误启用。
 // 同时验证旧版 marker 字段被 autoReenable 兼容清理。
-func TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery(t *testing.T) {
+func TestAutomationRunOnce_ReenablesOnlyWeeklyAutoDisabledAfterRecovery(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
@@ -141,11 +142,11 @@ func TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery(t *
 				Disabled:      true,
 				StatusMessage: StatusMessageAutoDisabled,
 				Metadata: map[string]any{
-					"account_id":                  "acct_auto",
-					"access_token":                "token",
-					legacyAutoDisabledMarkerKey:   true,
-					AutoDisabledAtMetadataKey:     now.Add(-time.Hour).Format(time.RFC3339),
-					legacyAutoReasonKey:           "weekly_limit",
+					"account_id":                "acct_auto",
+					"access_token":              "token",
+					legacyAutoDisabledMarkerKey: true,
+					AutoDisabledAtMetadataKey:   now.Add(-time.Hour).Format(time.RFC3339),
+					legacyAutoReasonKey:         "weekly_limit",
 				},
 			},
 			"manual-disabled": {
@@ -160,6 +161,19 @@ func TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery(t *
 					"access_token": "token",
 				},
 			},
+			"hourly-disabled": {
+				ID:            "hourly-disabled",
+				Provider:      "codex",
+				FileName:      "hourly-disabled.json",
+				Status:        coreauth.StatusDisabled,
+				Disabled:      true,
+				StatusMessage: "disabled via codex hourly automation",
+				Metadata: map[string]any{
+					"account_id":                      "acct_hourly",
+					"access_token":                    "token",
+					"codex_hourly_auto_disabled_at":   now.Add(-10 * time.Minute).Format(time.RFC3339),
+				},
+			},
 		},
 		responseBody: map[string]string{
 			"auto-disabled": `{
@@ -170,6 +184,13 @@ func TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery(t *
 				}
 			}`,
 			"manual-disabled": `{
+				"rate_limit": {
+					"allowed": true,
+					"primary_window": {"limit_window_seconds": 18000},
+					"secondary_window": {"limit_window_seconds": 604800}
+				}
+			}`,
+			"hourly-disabled": `{
 				"rate_limit": {
 					"allowed": true,
 					"primary_window": {"limit_window_seconds": 18000},
@@ -210,16 +231,19 @@ func TestAutomationRunOnce_ReenablesAllDisabledCodexAuthsAfterWeeklyRecovery(t *
 		t.Fatal("expected legacy reason codex_weekly_auto_reason to be cleaned up")
 	}
 
-	// 新行为: 单门禁模型下,手动禁用的账号在周限恢复后也应被自动启用。
+	// self-gate 语义: 手动禁用的账号不应被 weekly automation 启用。
 	manualDisabled := manager.auths["manual-disabled"]
-	if manualDisabled.Disabled {
-		t.Fatal("expected manual-disabled auth to be re-enabled under single-gate model")
+	if !manualDisabled.Disabled {
+		t.Fatal("expected manually-disabled auth to remain disabled (no weekly self-marker)")
 	}
-	if manualDisabled.Status != coreauth.StatusActive {
-		t.Fatalf("manual status = %s, want %s", manualDisabled.Status, coreauth.StatusActive)
+
+	// 交互隔离: weekly 不应启用被 hourly 禁用的账号。
+	hourlyDisabled := manager.auths["hourly-disabled"]
+	if !hourlyDisabled.Disabled {
+		t.Fatal("expected hourly-disabled auth to remain disabled (weekly must not touch it)")
 	}
-	if manualDisabled.StatusMessage != "" {
-		t.Fatalf("manual status message = %q, want empty after re-enable", manualDisabled.StatusMessage)
+	if _, ok := hourlyDisabled.Metadata["codex_hourly_auto_disabled_at"]; !ok {
+		t.Fatal("expected hourly audit timestamp to remain untouched by weekly automation")
 	}
 }
 
@@ -274,6 +298,90 @@ func TestAutomationRunOnce_DoesNotDisableExcludedCodexAuth(t *testing.T) {
 		if _, ok := auth.Metadata[AutoDisabledAtMetadataKey]; ok {
 			t.Fatal("expected excluded auth to never get auto_disabled_at timestamp")
 		}
+	}
+}
+
+// TestAutomationRunOnce_DoesNotDisableLegacyExcludedCodexAuth 验证向后兼容:
+// 持有旧字段 codex_weekly_automation_excluded=true 的 auth 应当仍然被识别为 excluded。
+func TestAutomationRunOnce_DoesNotDisableLegacyExcludedCodexAuth(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 12, 4, 0, 0, 0, time.UTC)
+	manager := &fakeAuthManager{
+		auths: map[string]*coreauth.Auth{
+			"legacy-excluded": {
+				ID:       "legacy-excluded",
+				Provider: "codex",
+				FileName: "legacy-excluded.json",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"account_id":                        "acct_legacy",
+					"access_token":                      "token",
+					LegacyWeeklyAutomationExcludedKey:   true,
+					LegacyWeeklyAutomationExcludedAtKey: now.Add(-time.Hour).Format(time.RFC3339),
+				},
+			},
+		},
+		responseBody: map[string]string{
+			"legacy-excluded": `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window": {"limit_window_seconds": 18000},
+					"secondary_window": {"limit_window_seconds": 604800}
+				}
+			}`,
+		},
+	}
+	cfg := &internalconfig.Config{
+		CodexWeeklyAutomation: internalconfig.CodexWeeklyAutomation{
+			Enabled:         true,
+			IntervalSeconds: 300,
+		},
+	}
+
+	automation := NewAutomation(manager, func() *internalconfig.Config { return cfg })
+	automation.now = func() time.Time { return now }
+
+	automation.RunOnce(context.Background())
+
+	auth := manager.auths["legacy-excluded"]
+	if auth.Disabled {
+		t.Fatal("expected legacy-excluded auth to remain enabled (legacy field recognized)")
+	}
+}
+
+// TestSetAutomationExcluded_MigratesLegacyFieldToNewKey 验证写时迁移:
+// SetAutomationExcluded 会清理旧字段并只写新字段。
+func TestSetAutomationExcluded_MigratesLegacyFieldToNewKey(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 12, 5, 0, 0, 0, time.UTC)
+	auth := &coreauth.Auth{
+		Metadata: map[string]any{
+			LegacyWeeklyAutomationExcludedKey:   true,
+			LegacyWeeklyAutomationExcludedAtKey: now.Add(-time.Hour).Format(time.RFC3339),
+		},
+	}
+
+	SetAutomationExcluded(auth, true, now)
+
+	if v, ok := auth.Metadata[AutomationExcludedMetadataKey]; !ok || v != true {
+		t.Fatalf("expected new key %s=true, got %v", AutomationExcludedMetadataKey, auth.Metadata[AutomationExcludedMetadataKey])
+	}
+	if _, ok := auth.Metadata[LegacyWeeklyAutomationExcludedKey]; ok {
+		t.Fatal("expected legacy key to be removed after migration")
+	}
+	if _, ok := auth.Metadata[LegacyWeeklyAutomationExcludedAtKey]; ok {
+		t.Fatal("expected legacy at-key to be removed after migration")
+	}
+
+	SetAutomationExcluded(auth, false, now)
+
+	if _, ok := auth.Metadata[AutomationExcludedMetadataKey]; ok {
+		t.Fatal("expected new key to be removed when excluded=false")
+	}
+	if _, ok := auth.Metadata[AutomationExcludedAtMetadataKey]; ok {
+		t.Fatal("expected new at-key to be removed when excluded=false")
 	}
 }
 

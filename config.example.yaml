@@ -105,6 +105,11 @@ codex-weekly-automation:
   enabled: false # Whether to periodically check Codex weekly usage and auto-disable/re-enable auth files
   interval-seconds: 300 # How often to check Codex weekly usage
 
+# Codex hourly (5h primary_window) automation
+codex-hourly-automation:
+  enabled: false # Whether to periodically check Codex 5h usage and auto-disable/re-enable auth files
+  interval-seconds: 300 # How often to check Codex 5h usage
+
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first

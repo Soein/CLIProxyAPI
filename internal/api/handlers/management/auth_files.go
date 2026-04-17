@@ -335,8 +335,16 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
 				if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
+					// 读时兼容:优先新字段 codex_automation_excluded,回落旧字段 codex_weekly_automation_excluded。
 					excludedResult := gjson.GetBytes(data, codexweekly.AutomationExcludedMetadataKey)
 					excluded := excludedResult.Exists() && excludedResult.Bool()
+					if !excludedResult.Exists() {
+						legacy := gjson.GetBytes(data, codexweekly.LegacyWeeklyAutomationExcludedKey)
+						excluded = legacy.Exists() && legacy.Bool()
+					}
+					fileData["codex_automation_excluded"] = excluded
+					fileData["codexAutomationExcluded"] = excluded
+					// 向后兼容 deprecated 字段。前端可逐步迁移到新字段后删除。
 					fileData["codex_weekly_automation_excluded"] = excluded
 					fileData["codexWeeklyAutomationExcluded"] = excluded
 				}
@@ -471,6 +479,10 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		excluded := codexweekly.IsAutomationExcluded(auth)
+		// 新主字段。
+		entry["codex_automation_excluded"] = excluded
+		entry["codexAutomationExcluded"] = excluded
+		// Deprecated 向后兼容字段,值与新字段镜像。
 		entry["codex_weekly_automation_excluded"] = excluded
 		entry["codexWeeklyAutomationExcluded"] = excluded
 	}
@@ -1144,7 +1156,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		Headers                       map[string]string `json:"headers"`
 		Priority                      *int              `json:"priority"`
 		Note                          *string           `json:"note"`
-		CodexWeeklyAutomationExcluded *bool             `json:"codex_weekly_automation_excluded"`
+		// 新主字段:同时控制 weekly + hourly automation 是否排除此 auth。
+		CodexAutomationExcluded *bool `json:"codex_automation_excluded"`
+		// Deprecated:旧字段,保留用于向后兼容。新主字段优先。
+		CodexWeeklyAutomationExcluded *bool `json:"codex_weekly_automation_excluded"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1205,7 +1220,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		}
 		changed = true
 	}
-	if req.CodexWeeklyAutomationExcluded != nil {
+	// 新字段优先。若两者同时传入,以新字段为准。
+	if req.CodexAutomationExcluded != nil {
+		codexweekly.SetAutomationExcluded(targetAuth, *req.CodexAutomationExcluded, time.Now())
+		changed = true
+	} else if req.CodexWeeklyAutomationExcluded != nil {
 		codexweekly.SetAutomationExcluded(targetAuth, *req.CodexWeeklyAutomationExcluded, time.Now())
 		changed = true
 	}

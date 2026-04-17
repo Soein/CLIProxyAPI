@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexhourly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
@@ -530,6 +531,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/codex-weekly-automation/interval-seconds", s.mgmt.PutCodexWeeklyAutomationIntervalSeconds)
 		mgmt.GET("/codex-weekly-automation/status", s.mgmt.GetCodexWeeklyAutomationStatus)
 
+		mgmt.GET("/codex-hourly-automation/enabled", s.mgmt.GetCodexHourlyAutomationEnabled)
+		mgmt.PUT("/codex-hourly-automation/enabled", s.mgmt.PutCodexHourlyAutomationEnabled)
+		mgmt.PATCH("/codex-hourly-automation/enabled", s.mgmt.PutCodexHourlyAutomationEnabled)
+		mgmt.GET("/codex-hourly-automation/interval-seconds", s.mgmt.GetCodexHourlyAutomationIntervalSeconds)
+		mgmt.PUT("/codex-hourly-automation/interval-seconds", s.mgmt.PutCodexHourlyAutomationIntervalSeconds)
+		mgmt.PATCH("/codex-hourly-automation/interval-seconds", s.mgmt.PutCodexHourlyAutomationIntervalSeconds)
+		mgmt.GET("/codex-hourly-automation/status", s.mgmt.GetCodexHourlyAutomationStatus)
+
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
@@ -1025,6 +1034,13 @@ func (s *Server) SetCodexWeeklyAutomationStatusProvider(provider func() codexwee
 		return
 	}
 	s.mgmt.SetCodexWeeklyAutomationStatusProvider(provider)
+}
+
+func (s *Server) SetCodexHourlyAutomationStatusProvider(provider func() codexhourly.Status) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetCodexHourlyAutomationStatusProvider(provider)
 }
 
 // (management handlers moved to internal/api/handlers/management)

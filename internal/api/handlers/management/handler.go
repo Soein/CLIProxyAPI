@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexhourly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -50,6 +51,7 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	codexWeeklyStatus   func() codexweekly.Status
+	codexHourlyStatus   func() codexhourly.Status
 }
 
 // NewHandler creates a new management handler instance.
@@ -139,6 +141,11 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // SetCodexWeeklyAutomationStatusProvider registers a provider for Codex weekly automation status.
 func (h *Handler) SetCodexWeeklyAutomationStatusProvider(provider func() codexweekly.Status) {
 	h.codexWeeklyStatus = provider
+}
+
+// SetCodexHourlyAutomationStatusProvider registers a provider for Codex hourly (5h) automation status.
+func (h *Handler) SetCodexHourlyAutomationStatusProvider(provider func() codexhourly.Status) {
+	h.codexHourlyStatus = provider
 }
 
 // Middleware enforces access control for management endpoints.
