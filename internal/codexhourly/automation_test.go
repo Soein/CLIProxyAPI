@@ -78,8 +78,8 @@ func TestAutomationRunOnce_DisablesCodexAuthWhenHourlyLimitReached(t *testing.T)
 			"codex-auth": `{
 				"rate_limit": {
 					"limit_reached": true,
-					"primary_window": {"limit_window_seconds": 18000},
-					"secondary_window": {"limit_window_seconds": 604800}
+					"primary_window": {"limit_window_seconds": 18000, "limit_reached": true},
+					"secondary_window": {"limit_window_seconds": 604800, "limit_reached": false}
 				}
 			}`,
 		},
@@ -301,5 +301,82 @@ func TestHourlyLimitReached_OnlyTriggersFor18000Window(t *testing.T) {
 	disallowedBody := []byte(`{"rate_limit":{"allowed":false,"primary_window":{"limit_window_seconds":18000}}}`)
 	if !hourlyLimitReached(disallowedBody) {
 		t.Fatal("expected hourlyLimitReached=true when allowed=false on 18000 window")
+	}
+}
+
+// TestHourlyLimitReached_WindowScoped 是针对"周限命中不应被 hourly 误触发"bug 的
+// 回归测试。对称于 codexweekly.TestWeeklyLimitReached_WindowScoped。
+func TestHourlyLimitReached_WindowScoped(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "only secondary (weekly) hit - must not trigger hourly",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000,  "limit_reached": false},
+					"secondary_window": {"limit_window_seconds": 604800, "limit_reached": true}
+				}
+			}`,
+			want: false,
+		},
+		{
+			name: "only primary (5h) hit - must trigger hourly",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000,  "limit_reached": true},
+					"secondary_window": {"limit_window_seconds": 604800, "limit_reached": false}
+				}
+			}`,
+			want: true,
+		},
+		{
+			name: "5h window uses used_percent=100 signal",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000,  "used_percent": 100},
+					"secondary_window": {"limit_window_seconds": 604800, "used_percent": 10}
+				}
+			}`,
+			want: true,
+		},
+		{
+			name: "both windows below used_percent=100",
+			body: `{
+				"rate_limit": {
+					"limit_reached": false,
+					"primary_window":   {"limit_window_seconds": 18000,  "used_percent": 68},
+					"secondary_window": {"limit_window_seconds": 604800, "used_percent": 20}
+				}
+			}`,
+			want: false,
+		},
+		{
+			name: "legacy single 5h window with top-level limit_reached",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000}
+				}
+			}`,
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := hourlyLimitReached([]byte(tc.body)); got != tc.want {
+				t.Fatalf("hourlyLimitReached = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

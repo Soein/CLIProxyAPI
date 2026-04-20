@@ -10,6 +10,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 type fakeAuthManager struct {
@@ -77,8 +78,8 @@ func TestAutomationRunOnce_DisablesCodexAuthWhenWeeklyLimitReached(t *testing.T)
 			"codex-auth": `{
 				"rate_limit": {
 					"limit_reached": true,
-					"primary_window": {"limit_window_seconds": 18000},
-					"secondary_window": {"limit_window_seconds": 604800}
+					"primary_window": {"limit_window_seconds": 18000, "limit_reached": false},
+					"secondary_window": {"limit_window_seconds": 604800, "limit_reached": true}
 				}
 			}`,
 		},
@@ -437,5 +438,126 @@ func TestAutomationRunOnce_DoesNotReenableExcludedAutoDisabledCodexAuth(t *testi
 	}
 	if auth.Metadata == nil || auth.Metadata[AutoDisabledAtMetadataKey] == nil {
 		t.Fatal("expected auto_disabled_at timestamp to remain while excluded")
+	}
+}
+
+// TestWeeklyLimitReached_WindowScoped 是针对"5h 命中不应被 weekly 误触发"bug
+// 的回归测试。生产中 Codex wham/usage 响应里 primary_window (5h) 与
+// secondary_window (week) 共存,顶层 limit_reached=true 只代表至少一个窗口命中,
+// 过去的实现直接读顶层值,会把 5h 命中误判为 weekly 命中并自动禁用账号。
+func TestWeeklyLimitReached_WindowScoped(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "only primary (5h) hit, secondary (weekly) not hit - must not trigger weekly",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000,  "limit_reached": true},
+					"secondary_window": {"limit_window_seconds": 604800, "limit_reached": false}
+				}
+			}`,
+			want: false,
+		},
+		{
+			name: "only secondary (weekly) hit - must trigger weekly",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000,  "limit_reached": false},
+					"secondary_window": {"limit_window_seconds": 604800, "limit_reached": true}
+				}
+			}`,
+			want: true,
+		},
+		{
+			name: "weekly window uses used_percent=100 signal",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 18000,  "used_percent": 68},
+					"secondary_window": {"limit_window_seconds": 604800, "used_percent": 100}
+				}
+			}`,
+			want: true,
+		},
+		{
+			name: "both windows below used_percent=100",
+			body: `{
+				"rate_limit": {
+					"limit_reached": false,
+					"primary_window":   {"limit_window_seconds": 18000,  "used_percent": 52},
+					"secondary_window": {"limit_window_seconds": 604800, "used_percent": 0}
+				}
+			}`,
+			want: false,
+		},
+		{
+			name: "legacy single weekly window with top-level limit_reached",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {"limit_window_seconds": 604800}
+				}
+			}`,
+			want: true,
+		},
+		{
+			name: "legacy top-level without durations",
+			body: `{
+				"rate_limit": {
+					"limit_reached": true,
+					"primary_window":   {},
+					"secondary_window": {}
+				}
+			}`,
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := weeklyLimitReached([]byte(tc.body)); got != tc.want {
+				t.Fatalf("weeklyLimitReached = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWindowReached 覆盖共享 helper 的优先级判定。
+func TestWindowReached(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		json    string
+		want    bool
+		wantOk  bool
+	}{
+		{"empty node", `{}`, false, false},
+		{"limit_reached true wins", `{"limit_reached": true, "used_percent": 0}`, true, true},
+		{"limit_reached false wins", `{"limit_reached": false, "used_percent": 100}`, false, true},
+		{"camelCase limitReached", `{"limitReached": true}`, true, true},
+		{"allowed false -> reached", `{"allowed": false}`, true, true},
+		{"allowed true -> not reached", `{"allowed": true}`, false, true},
+		{"used_percent >= 100", `{"used_percent": 100}`, true, true},
+		{"used_percent < 100", `{"used_percent": 99}`, false, true},
+		{"no signal", `{"limit_window_seconds": 604800}`, false, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := WindowReached(gjson.Parse(tc.json))
+			if got != tc.want || ok != tc.wantOk {
+				t.Fatalf("WindowReached = (%v, %v), want (%v, %v)", got, ok, tc.want, tc.wantOk)
+			}
+		})
 	}
 }

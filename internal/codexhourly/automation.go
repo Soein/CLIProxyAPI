@@ -433,10 +433,45 @@ func rateLimitHourlyReached(limitInfo gjson.Result) bool {
 		secondary = limitInfo.Get("secondaryWindow")
 	}
 
-	if windowIsHourly(primary) || windowIsHourly(secondary) {
+	// 优先读取目标窗口(5h)自身的命中信号,避免周窗口命中顺带把 hourly 触发。
+	if windowIsHourly(primary) {
+		if reached, ok := codexweekly.WindowReached(primary); ok {
+			return reached
+		}
+	}
+	if windowIsHourly(secondary) {
+		if reached, ok := codexweekly.WindowReached(secondary); ok {
+			return reached
+		}
+	}
+
+	// 仅当 5h 目标窗口无明确信号,且不存在不同时长的对手窗口(weekly)时,
+	// 才沿用顶层 limit_reached - 避免歧义:两窗口共存时顶层无法归因到具体窗口。
+	hasHourlyTarget := windowIsHourly(primary) || windowIsHourly(secondary)
+	hasPeerWindow := hasPeerNonHourly(primary, secondary)
+	if hasHourlyTarget && !hasPeerWindow {
 		return limitReached || (allowedKnown && !allowed)
 	}
 	return false
+}
+
+// hasPeerNonHourly 判断两个窗口是否构成"5h + 非 5h"的共存组合,
+// 此时顶层 limit_reached 可能由任一窗口触发,读顶层会产生歧义。
+func hasPeerNonHourly(primary, secondary gjson.Result) bool {
+	if windowIsHourly(primary) && windowHasDuration(secondary) && !windowIsHourly(secondary) {
+		return true
+	}
+	if windowIsHourly(secondary) && windowHasDuration(primary) && !windowIsHourly(primary) {
+		return true
+	}
+	return false
+}
+
+func windowHasDuration(window gjson.Result) bool {
+	if !window.Exists() {
+		return false
+	}
+	return window.Get("limit_window_seconds").Exists() || window.Get("limitWindowSeconds").Exists()
 }
 
 func windowIsHourly(window gjson.Result) bool {

@@ -502,15 +502,71 @@ func rateLimitWeeklyReached(limitInfo gjson.Result) bool {
 		secondary = limitInfo.Get("secondaryWindow")
 	}
 
-	if windowIsWeekly(primary) || windowIsWeekly(secondary) {
+	// 优先读取目标窗口(weekly)自身的命中信号,避免 5h 命中顺带把 weekly 触发。
+	if windowIsWeekly(primary) {
+		if reached, ok := WindowReached(primary); ok {
+			return reached
+		}
+	}
+	if windowIsWeekly(secondary) {
+		if reached, ok := WindowReached(secondary); ok {
+			return reached
+		}
+	}
+
+	// 仅当 weekly 目标窗口无明确信号,且不存在不同时长的对手窗口(hourly)时,
+	// 才沿用顶层 limit_reached - 避免歧义:当 5h+周两个窗口共存时无法从顶层推断是谁触发。
+	hasWeeklyTarget := windowIsWeekly(primary) || windowIsWeekly(secondary)
+	hasPeerWindow := hasPeerNonWeekly(primary, secondary)
+	if hasWeeklyTarget && !hasPeerWindow {
 		return limitReached || (allowedKnown && !allowed)
 	}
 
-	// Legacy fallback: if the duration is absent, treat the secondary window as weekly.
+	// Legacy fallback: 两个窗口都没有时长信息时,沿用顶层 limit_reached。
 	if secondary.Exists() && !windowHasDuration(primary) && !windowHasDuration(secondary) {
 		return limitReached || (allowedKnown && !allowed)
 	}
 	return false
+}
+
+// hasPeerNonWeekly 判断两个窗口是否构成"周 + 非周"的共存组合,
+// 此时顶层 limit_reached 可能由任一窗口触发,读顶层会产生歧义。
+func hasPeerNonWeekly(primary, secondary gjson.Result) bool {
+	if windowIsWeekly(primary) && windowHasDuration(secondary) && !windowIsWeekly(secondary) {
+		return true
+	}
+	if windowIsWeekly(secondary) && windowHasDuration(primary) && !windowIsWeekly(primary) {
+		return true
+	}
+	return false
+}
+
+// WindowReached 读取单个 rate_limit window 节点的命中信号,
+// 供 weekly/hourly 两套 automation 共享使用。ok=false 表示节点未提供任何可判定信号。
+// 判定优先级:
+//  1. limit_reached / limitReached 布尔字段
+//  2. allowed=false (仅当字段存在)
+//  3. used_percent / usedPercent >= 100
+func WindowReached(window gjson.Result) (reached bool, ok bool) {
+	if !window.Exists() {
+		return false, false
+	}
+	if v := window.Get("limit_reached"); v.Exists() {
+		return v.Bool(), true
+	}
+	if v := window.Get("limitReached"); v.Exists() {
+		return v.Bool(), true
+	}
+	if v := window.Get("allowed"); v.Exists() {
+		return !v.Bool(), true
+	}
+	if v := window.Get("used_percent"); v.Exists() {
+		return v.Float() >= 100, true
+	}
+	if v := window.Get("usedPercent"); v.Exists() {
+		return v.Float() >= 100, true
+	}
+	return false, false
 }
 
 func windowIsWeekly(window gjson.Result) bool {
