@@ -137,6 +137,27 @@ func (s *PostgresStore) Close() error {
 	return s.db.Close()
 }
 
+// DB returns the underlying *sql.DB. Exposed so cluster-mode coordinators
+// (leader elector, advisory lock refresh locker, LISTEN/NOTIFY subscriber)
+// can share the pool instead of opening a second one. Returns nil on a
+// zero-value store.
+func (s *PostgresStore) DB() *sql.DB {
+	if s == nil {
+		return nil
+	}
+	return s.db
+}
+
+// DSN returns the original connection string supplied at construction. Used
+// by the ChangeSubscriber which needs its own pgx-native connection (LISTEN
+// is not supported via database/sql).
+func (s *PostgresStore) DSN() string {
+	if s == nil {
+		return ""
+	}
+	return s.cfg.DSN
+}
+
 // EnsureSchema creates the required tables (and schema when provided).
 func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	if s == nil || s.db == nil {
@@ -357,44 +378,93 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		if err = rows.Scan(&id, &payload, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("postgres store: scan auth row: %w", err)
 		}
-		path, errPath := s.absoluteAuthPath(id)
-		if errPath != nil {
-			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
+		auth, built := s.buildAuthFromRow(id, payload, createdAt, updatedAt)
+		if !built {
 			continue
 		}
-		metadata := make(map[string]any)
-		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
-			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
-			continue
-		}
-		provider := strings.TrimSpace(valueAsString(metadata["type"]))
-		if provider == "" {
-			provider = "unknown"
-		}
-		attr := map[string]string{"path": path}
-		if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
-			attr["email"] = email
-		}
-		auth := &cliproxyauth.Auth{
-			ID:               normalizeAuthID(id),
-			Provider:         provider,
-			FileName:         normalizeAuthID(id),
-			Label:            labelFor(metadata),
-			Status:           cliproxyauth.StatusActive,
-			Attributes:       attr,
-			Metadata:         metadata,
-			CreatedAt:        createdAt,
-			UpdatedAt:        updatedAt,
-			LastRefreshedAt:  time.Time{},
-			NextRefreshAfter: time.Time{},
-		}
-		cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres store: iterate auth rows: %w", err)
 	}
 	return auths, nil
+}
+
+// GetByID returns a single auth row by ID for cluster-mode precise reload on
+// NOTIFY. Returns (nil, nil) when the row does not exist — callers interpret
+// that as "deleted, drop from in-memory cache". This is the cheap path
+// consumed by Manager.ReloadByID to avoid a full List() on every NOTIFY.
+func (s *PostgresStore) GetByID(ctx context.Context, id string) (*cliproxyauth.Auth, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+	query := fmt.Sprintf(
+		"SELECT id, content, created_at, updated_at FROM %s WHERE id = $1",
+		s.fullTableName(s.cfg.AuthTable),
+	)
+	var (
+		rowID     string
+		payload   string
+		createdAt time.Time
+		updatedAt time.Time
+	)
+	err := s.db.QueryRowContext(ctx, query, id).Scan(&rowID, &payload, &createdAt, &updatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("postgres store: get auth %s: %w", id, err)
+	}
+	auth, built := s.buildAuthFromRow(rowID, payload, createdAt, updatedAt)
+	if !built {
+		// Row exists but payload invalid / outside spool — surface as
+		// "not found" so the Manager drops the cached copy; a subsequent
+		// Save will correct it.
+		return nil, nil
+	}
+	return auth, nil
+}
+
+// buildAuthFromRow decodes a single auth row into a *cliproxyauth.Auth.
+// Shared by List and GetByID so the shape of the in-memory auth stays
+// consistent across the two code paths. Returns (_, false) when the row
+// should be skipped (invalid path or bad JSON) — callers treat that as
+// "not present".
+func (s *PostgresStore) buildAuthFromRow(id, payload string, createdAt, updatedAt time.Time) (*cliproxyauth.Auth, bool) {
+	path, errPath := s.absoluteAuthPath(id)
+	if errPath != nil {
+		log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
+		return nil, false
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal([]byte(payload), &metadata); err != nil {
+		log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
+		return nil, false
+	}
+	provider := strings.TrimSpace(valueAsString(metadata["type"]))
+	if provider == "" {
+		provider = "unknown"
+	}
+	attr := map[string]string{"path": path}
+	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
+		attr["email"] = email
+	}
+	auth := &cliproxyauth.Auth{
+		ID:               normalizeAuthID(id),
+		Provider:         provider,
+		FileName:         normalizeAuthID(id),
+		Label:            labelFor(metadata),
+		Status:           cliproxyauth.StatusActive,
+		Attributes:       attr,
+		Metadata:         metadata,
+		CreatedAt:        createdAt,
+		UpdatedAt:        updatedAt,
+		LastRefreshedAt:  time.Time{},
+		NextRefreshAfter: time.Time{},
+	}
+	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	return auth, true
 }
 
 // Delete removes an auth file and the corresponding database record.

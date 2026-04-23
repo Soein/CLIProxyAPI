@@ -143,7 +143,38 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// Cluster configures multi-node HA coordination. Fields are all opt-in:
+	// with Enabled=false (default) the service runs in single-instance mode
+	// exactly as before. When Enabled=true the host must also configure a
+	// Postgres-backed token store — leader election, auth refresh lock and
+	// LISTEN/NOTIFY subscriber are wired up in sdk/cliproxy/service.go.
+	Cluster ClusterConfig `yaml:"cluster,omitempty" json:"cluster,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// ClusterConfig selects and parameterizes multi-node HA coordination. Meaningful
+// only when the token store is Postgres-backed; otherwise the fields are
+// ignored and the service logs a warning at startup.
+type ClusterConfig struct {
+	// Enabled turns on cluster-mode hooks: leader election gate for singleton
+	// background loops, per-auth advisory lock for refresh, and LISTEN/NOTIFY
+	// cross-replica change propagation.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// NodeID identifies this replica in the cluster_nodes heartbeat table and
+	// in the last_writer column of auth/config rows. Defaults to the machine
+	// hostname when empty.
+	NodeID string `yaml:"node-id,omitempty" json:"node-id,omitempty"`
+
+	// Region is a free-form label (e.g. "fra", "lon") surfaced in
+	// cluster_nodes for operator visibility. Has no runtime effect.
+	Region string `yaml:"region,omitempty" json:"region,omitempty"`
+
+	// ProbeInterval is how often the leader elector re-checks the advisory
+	// lock and refreshes its heartbeat. Parsed as a Go duration string
+	// (e.g. "5s"). Empty/invalid means use the elector's default (5s).
+	ProbeInterval string `yaml:"probe-interval,omitempty" json:"probe-interval,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.

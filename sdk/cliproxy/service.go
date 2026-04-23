@@ -97,6 +97,10 @@ type Service struct {
 
 	// codexHourlyAutomation periodically disables and re-enables Codex auth files based on 5h usage.
 	codexHourlyAutomation *codexhourly.Automation
+
+	// clusterCancel stops the cluster-mode goroutines (leader elector +
+	// change subscriber). nil when cluster mode is disabled.
+	clusterCancel context.CancelFunc
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -509,6 +513,15 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
+	// Wire cluster-mode coordination (opt-in). Failure here is logged and
+	// degraded to single-instance behavior rather than aborting startup, so
+	// misconfigured cluster fields can't brick an otherwise-working node.
+	if s.cfg != nil && s.cfg.Cluster.Enabled && s.coreManager != nil {
+		if err := s.bootstrapCluster(ctx); err != nil {
+			log.WithError(err).Warn("cluster bootstrap failed; running in single-instance mode")
+		}
+	}
+
 	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
@@ -545,6 +558,15 @@ func (s *Service) Run(ctx context.Context) error {
 		})
 		if s.server != nil {
 			s.server.SetCodexHourlyAutomationStatusProvider(s.codexHourlyAutomation.Status)
+		}
+
+		// Cluster-mode leader gate: wired only when bootstrapCluster ran
+		// successfully. Installed AFTER automation construction because
+		// NewAutomation doesn't accept a gate. Closures capture the same
+		// Manager whose IsLeader flag the advisory-lock elector drives.
+		if s.cfg != nil && s.cfg.Cluster.Enabled {
+			s.codexWeeklyAutomation.SetLeaderGate(s.coreManager.IsLeader)
+			s.codexHourlyAutomation.SetLeaderGate(s.coreManager.IsLeader)
 		}
 	}
 
@@ -779,6 +801,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		if s.watcherCancel != nil {
 			s.watcherCancel()
+		}
+		if s.clusterCancel != nil {
+			s.clusterCancel()
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
