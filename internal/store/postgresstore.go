@@ -42,7 +42,37 @@ type PostgresStore struct {
 	spoolRoot  string
 	configPath string
 	authDir    string
+	nodeID     string
 	mu         sync.Mutex
+}
+
+// NodeID sets an identifier recorded in last_writer on UPSERT. Used in cluster
+// mode to trace which replica last modified a row; optional.
+func (s *PostgresStore) NodeID() string {
+	if s == nil {
+		return ""
+	}
+	return s.nodeID
+}
+
+// SetNodeID updates the writer identity used when persisting rows.
+func (s *PostgresStore) SetNodeID(id string) {
+	if s == nil {
+		return
+	}
+	s.nodeID = id
+}
+
+// nodeWriter returns the value written into the last_writer column. A hostname
+// fallback keeps rows meaningful even when node_id was not wired.
+func (s *PostgresStore) nodeWriter() any {
+	if s == nil || strings.TrimSpace(s.nodeID) == "" {
+		if h, err := os.Hostname(); err == nil && h != "" {
+			return h
+		}
+		return "unknown"
+	}
+	return s.nodeID
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -123,22 +153,70 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		CREATE TABLE IF NOT EXISTS %s (
 			id TEXT PRIMARY KEY,
 			content TEXT NOT NULL,
+			version BIGINT NOT NULL DEFAULT 0,
+			last_writer TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 	`, configTable)); err != nil {
 		return fmt.Errorf("postgres store: create config table: %w", err)
 	}
+	// HA additive columns (idempotent) for clusters upgraded from pre-HA schema.
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0",
+		configTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: add version col to config table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS last_writer TEXT",
+		configTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: add last_writer col to config table: %w", err)
+	}
+
 	authTable := s.fullTableName(s.cfg.AuthTable)
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			id TEXT PRIMARY KEY,
 			content JSONB NOT NULL,
+			version BIGINT NOT NULL DEFAULT 0,
+			last_writer TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0",
+		authTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: add version col to auth table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS last_writer TEXT",
+		authTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: add last_writer col to auth table: %w", err)
+	}
+
+	// cluster_nodes: leader election heartbeat visibility (HA mode only).
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS cluster_nodes (
+			node_id         TEXT PRIMARY KEY,
+			role            TEXT NOT NULL,
+			region          TEXT,
+			last_heartbeat  TIMESTAMPTZ NOT NULL,
+			metadata        JSONB
+		)
+	`); err != nil {
+		return fmt.Errorf("postgres store: create cluster_nodes: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		"CREATE INDEX IF NOT EXISTS idx_cluster_nodes_heartbeat ON cluster_nodes(last_heartbeat DESC)",
+	); err != nil {
+		return fmt.Errorf("postgres store: create cluster_nodes index: %w", err)
 	}
 	return nil
 }
@@ -504,14 +582,16 @@ func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string
 func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
 	jsonPayload := json.RawMessage(data)
 	query := fmt.Sprintf(`
-		INSERT INTO %s (id, content, created_at, updated_at)
-		VALUES ($1, $2, NOW(), NOW())
+		INSERT INTO %s (id, content, version, last_writer, created_at, updated_at)
+		VALUES ($1, $2, 1, $3, NOW(), NOW())
 		ON CONFLICT (id)
-		DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
-	`, s.fullTableName(s.cfg.AuthTable))
-	if _, err := s.db.ExecContext(ctx, query, relID, jsonPayload); err != nil {
+		DO UPDATE SET content = EXCLUDED.content, version = %s.version + 1, last_writer = EXCLUDED.last_writer, updated_at = NOW()
+	`, s.fullTableName(s.cfg.AuthTable), s.fullTableName(s.cfg.AuthTable))
+	if _, err := s.db.ExecContext(ctx, query, relID, jsonPayload, s.nodeWriter()); err != nil {
 		return fmt.Errorf("postgres store: upsert auth record: %w", err)
 	}
+	// Best-effort NOTIFY to peers in cluster mode; harmless in single-instance.
+	_, _ = s.db.ExecContext(ctx, "SELECT pg_notify('cliproxy_auth_changed', $1)", relID)
 	return nil
 }
 
@@ -525,15 +605,17 @@ func (s *PostgresStore) deleteAuthRecord(ctx context.Context, relID string) erro
 
 func (s *PostgresStore) persistConfig(ctx context.Context, data []byte) error {
 	query := fmt.Sprintf(`
-		INSERT INTO %s (id, content, created_at, updated_at)
-		VALUES ($1, $2, NOW(), NOW())
+		INSERT INTO %s (id, content, version, last_writer, created_at, updated_at)
+		VALUES ($1, $2, 1, $3, NOW(), NOW())
 		ON CONFLICT (id)
-		DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
-	`, s.fullTableName(s.cfg.ConfigTable))
+		DO UPDATE SET content = EXCLUDED.content, version = %s.version + 1, last_writer = EXCLUDED.last_writer, updated_at = NOW()
+	`, s.fullTableName(s.cfg.ConfigTable), s.fullTableName(s.cfg.ConfigTable))
 	normalized := normalizeLineEndings(string(data))
-	if _, err := s.db.ExecContext(ctx, query, defaultConfigKey, normalized); err != nil {
+	if _, err := s.db.ExecContext(ctx, query, defaultConfigKey, normalized, s.nodeWriter()); err != nil {
 		return fmt.Errorf("postgres store: upsert config: %w", err)
 	}
+	// Best-effort NOTIFY to peers in cluster mode.
+	_, _ = s.db.ExecContext(ctx, "SELECT pg_notify('cliproxy_config_changed', '')")
 	return nil
 }
 

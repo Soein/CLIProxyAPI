@@ -84,6 +84,12 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 			if authID == "" {
 				continue
 			}
+			// In cluster mode only the leader runs scheduled refreshes; other
+			// replicas still requeue so they pick up work after failover.
+			if !l.manager.IsLeader() {
+				l.queueReschedule(authID)
+				continue
+			}
 			l.manager.refreshAuth(ctx, authID)
 			l.queueReschedule(authID)
 		}
