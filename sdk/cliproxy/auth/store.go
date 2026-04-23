@@ -11,3 +11,13 @@ type Store interface {
 	// Delete removes the auth record identified by id.
 	Delete(ctx context.Context, id string) error
 }
+
+// GetStore exposes the underlying store so hosts can feature-detect optional
+// capabilities (e.g. Postgres-backed stores also implement DB()/DSN() for the
+// cluster package). Returns nil when the Manager has no store wired.
+func (m *Manager) GetStore() Store {
+	if m == nil {
+		return nil
+	}
+	return m.store
+}

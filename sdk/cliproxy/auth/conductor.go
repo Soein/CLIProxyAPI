@@ -1223,6 +1223,72 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 }
 
 // Load resets manager state from the backing store.
+// authByIDStore is an optional store capability: when the underlying store
+// can fetch a single row cheaply (e.g. Postgres indexed lookup), ReloadByID
+// uses it to avoid a full List() on every NOTIFY. Nil return means "row
+// does not exist" (caller should drop from cache); error means transient.
+type authByIDStore interface {
+	GetByID(ctx context.Context, id string) (*Auth, error)
+}
+
+// ReloadByID fetches a single auth row from the store and syncs it into the
+// in-memory map + scheduler. Intended for cluster-mode LISTEN/NOTIFY
+// handlers: when another replica mutates an auth, we only need to refresh
+// that row, not the whole set. Falls back to full Load() when the store
+// does not implement authByIDStore.
+//
+// Behavior:
+//
+//	row exists      -> auths[id] = cloned row; scheduler.upsertAuth
+//	row missing     -> delete auths[id];       scheduler.removeAuth
+//	id empty        -> treated as "unknown payload", does a full Load
+//	store error     -> returned as-is; caller decides retry strategy
+func (m *Manager) ReloadByID(ctx context.Context, id string) error {
+	if m == nil || m.store == nil {
+		return nil
+	}
+	if strings.TrimSpace(id) == "" {
+		return m.Load(ctx)
+	}
+
+	byID, ok := m.store.(authByIDStore)
+	if !ok {
+		// Backwards-compatible fallback for stores without indexed lookup.
+		return m.Load(ctx)
+	}
+
+	fetched, err := byID.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if fetched != nil {
+		fetched.EnsureIndex()
+	}
+
+	m.mu.Lock()
+	var schedulerCopy *Auth
+	if fetched == nil {
+		delete(m.auths, id)
+	} else {
+		cloned := fetched.Clone()
+		m.auths[id] = cloned
+		schedulerCopy = cloned.Clone()
+	}
+	m.mu.Unlock()
+
+	// Scheduler mutations are done outside m.mu to honor the existing
+	// locking discipline (scheduler takes its own mutex).
+	if m.scheduler != nil {
+		if schedulerCopy != nil {
+			m.scheduler.upsertAuth(schedulerCopy)
+		} else {
+			m.scheduler.removeAuth(id)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
 	if m.store == nil {

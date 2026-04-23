@@ -56,7 +56,33 @@ type Automation struct {
 	checking      bool
 	cancel        context.CancelFunc
 
+	// leaderGate gates RunOnce so that in cluster mode only the replica
+	// currently holding the advisory lock actually probes the upstream
+	// usage endpoint. nil means "always leader" (single-instance mode).
+	leaderGate func() bool
+
 	now func() time.Time
+}
+
+// SetLeaderGate installs a cluster-mode gate consulted at the start of each
+// tick. Pass nil to disable (default). Typically wired to
+// sdk/cliproxy/auth.Manager.IsLeader via a closure.
+func (a *Automation) SetLeaderGate(gate func() bool) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.leaderGate = gate
+	a.mu.Unlock()
+}
+
+func (a *Automation) currentLeaderGate() func() bool {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.leaderGate
 }
 
 // NewAutomation 构造 hourly automation 实例。
@@ -97,6 +123,13 @@ func (a *Automation) Start(parent context.Context) {
 			case <-ticker.C:
 				cfg := a.currentConfig()
 				if cfg == nil || !cfg.CodexHourlyAutomation.Enabled {
+					continue
+				}
+				// Cluster leader gate: follower replicas skip the
+				// upstream probe entirely. Results come from the same
+				// chatgpt.com endpoint regardless of which replica
+				// asks, so running on every node is wasted load.
+				if gate := a.currentLeaderGate(); gate != nil && !gate() {
 					continue
 				}
 				interval := automationInterval(cfg)

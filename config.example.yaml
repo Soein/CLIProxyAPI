@@ -121,6 +121,24 @@ routing:
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 
+# Multi-node HA cluster coordination (opt-in). Requires the token store to be
+# Postgres-backed (internal/store.PostgresStore) — otherwise these settings
+# are ignored and a warning is logged at startup. In single-instance mode
+# leave this entire block absent or set enabled: false.
+#
+# When enabled:
+#   - Leader election via pg_try_advisory_lock(1, 1); only the leader runs
+#     the auto-refresh loop, codex automations and model updater.
+#   - Per-auth refresh mutex via pg_try_advisory_lock(2, hash32(authID)) so
+#     concurrent replicas cannot race on OAuth token rotation.
+#   - LISTEN/NOTIFY on cliproxy_auth_changed so peer replicas reload the
+#     affected auth rows within milliseconds of any mutation.
+# cluster:
+#   enabled: false           # master switch; default false
+#   node-id: ""              # default: machine hostname
+#   region: ""               # free-form label for cluster_nodes heartbeat
+#   probe-interval: "5s"     # advisory-lock probe cadence
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
 
