@@ -184,14 +184,12 @@ type Manager struct {
 	// extends this invariant across replicas in cluster mode.
 	refreshSF singleflight.Group
 
-	// Optional cross-instance advisory lock for auth refresh. Injected by the
-	// host; nil in single-instance deployments. See SetAuthRefreshLocker.
-	authRefreshLocker atomic.Value // AuthRefreshLocker
-
-	// Optional leader gate used to skip singleton background loops (auto
-	// refresh) on follower replicas. Injected by the host; nil means always
-	// "leader" (single-instance semantics).
-	leaderGate atomic.Value // LeaderGate
+	// clusterMu guards the optional cluster-mode hooks below. A plain RWMutex
+	// is used instead of atomic.Value because atomic.Value panics on Store(nil)
+	// and cannot safely roundtrip a nil interface value.
+	clusterMu         sync.RWMutex
+	authRefreshLocker AuthRefreshLocker // nil = single-instance (no cross-node lock)
+	leaderGate        LeaderGate        // nil = always "leader"
 }
 
 // LeaderGate reports whether this process should run singleton background
@@ -205,11 +203,9 @@ func (m *Manager) SetLeaderGate(g LeaderGate) {
 	if m == nil {
 		return
 	}
-	if g == nil {
-		m.leaderGate.Store((LeaderGate)(nil))
-		return
-	}
-	m.leaderGate.Store(g)
+	m.clusterMu.Lock()
+	m.leaderGate = g
+	m.clusterMu.Unlock()
 }
 
 // IsLeader returns true when the optional gate reports leadership, or when no
@@ -218,12 +214,10 @@ func (m *Manager) IsLeader() bool {
 	if m == nil {
 		return true
 	}
-	v := m.leaderGate.Load()
-	if v == nil {
-		return true
-	}
-	g, ok := v.(LeaderGate)
-	if !ok || g == nil {
+	m.clusterMu.RLock()
+	g := m.leaderGate
+	m.clusterMu.RUnlock()
+	if g == nil {
 		return true
 	}
 	return g.IsLeader()
@@ -246,23 +240,18 @@ func (m *Manager) SetAuthRefreshLocker(l AuthRefreshLocker) {
 	if m == nil {
 		return
 	}
-	if l == nil {
-		m.authRefreshLocker.Store((AuthRefreshLocker)(nil))
-		return
-	}
-	m.authRefreshLocker.Store(l)
+	m.clusterMu.Lock()
+	m.authRefreshLocker = l
+	m.clusterMu.Unlock()
 }
 
 func (m *Manager) currentAuthRefreshLocker() AuthRefreshLocker {
 	if m == nil {
 		return nil
 	}
-	v := m.authRefreshLocker.Load()
-	if v == nil {
-		return nil
-	}
-	l, _ := v.(AuthRefreshLocker)
-	return l
+	m.clusterMu.RLock()
+	defer m.clusterMu.RUnlock()
+	return m.authRefreshLocker
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

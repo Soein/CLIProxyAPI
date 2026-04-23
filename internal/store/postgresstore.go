@@ -579,6 +579,14 @@ func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string
 	return s.persistAuth(ctx, relID, data)
 }
 
+// persistAuth UPSERTs the auth record and bumps the version counter.
+//
+// NOTE: this is NOT an optimistic-lock UPSERT — it has no
+// "WHERE version = $expected" guard, so two concurrent writers would silently
+// clobber each other. Cross-instance mutual exclusion is provided at a higher
+// layer via auth.AuthRefreshLocker in Manager.refreshAuthOnce. The
+// version/last_writer columns here are an audit trail, not a concurrency
+// control mechanism.
 func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
 	jsonPayload := json.RawMessage(data)
 	query := fmt.Sprintf(`
@@ -591,7 +599,10 @@ func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []by
 		return fmt.Errorf("postgres store: upsert auth record: %w", err)
 	}
 	// Best-effort NOTIFY to peers in cluster mode; harmless in single-instance.
-	_, _ = s.db.ExecContext(ctx, "SELECT pg_notify('cliproxy_auth_changed', $1)", relID)
+	// Log at debug level so operators can spot misconfig without log spam.
+	if _, err := s.db.ExecContext(ctx, "SELECT pg_notify('cliproxy_auth_changed', $1)", relID); err != nil {
+		log.WithError(err).Debugf("pg_notify(cliproxy_auth_changed, %s) failed", relID)
+	}
 	return nil
 }
 
@@ -603,6 +614,9 @@ func (s *PostgresStore) deleteAuthRecord(ctx context.Context, relID string) erro
 	return nil
 }
 
+// persistConfig UPSERTs the single config row. Same non-optimistic-lock
+// caveat as persistAuth applies; callers expected to serialize writes via
+// Manager / host-level coordination.
 func (s *PostgresStore) persistConfig(ctx context.Context, data []byte) error {
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, content, version, last_writer, created_at, updated_at)
@@ -615,7 +629,9 @@ func (s *PostgresStore) persistConfig(ctx context.Context, data []byte) error {
 		return fmt.Errorf("postgres store: upsert config: %w", err)
 	}
 	// Best-effort NOTIFY to peers in cluster mode.
-	_, _ = s.db.ExecContext(ctx, "SELECT pg_notify('cliproxy_config_changed', '')")
+	if _, err := s.db.ExecContext(ctx, "SELECT pg_notify('cliproxy_config_changed', '')"); err != nil {
+		log.WithError(err).Debug("pg_notify(cliproxy_config_changed) failed")
+	}
 	return nil
 }
 

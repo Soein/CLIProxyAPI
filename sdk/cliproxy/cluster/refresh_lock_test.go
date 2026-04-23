@@ -1,33 +1,54 @@
 package cluster
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
-func TestAuthIDLockKey_Deterministic(t *testing.T) {
-	a := authIDLockKey("codex-001@example.com")
-	b := authIDLockKey("codex-001@example.com")
-	if a != b {
-		t.Fatalf("expected deterministic key, got %d vs %d", a, b)
+func TestAuthIDLockKeys_Deterministic(t *testing.T) {
+	c1, i1 := authIDLockKeys("codex-001@example.com")
+	c2, i2 := authIDLockKeys("codex-001@example.com")
+	if c1 != c2 || i1 != i2 {
+		t.Fatalf("expected deterministic keys, got (%d,%d) vs (%d,%d)", c1, i1, c2, i2)
+	}
+	if c1 != authRefreshLockClass {
+		t.Fatalf("class must be authRefreshLockClass=%d, got %d", authRefreshLockClass, c1)
 	}
 }
 
-func TestAuthIDLockKey_Distinct(t *testing.T) {
-	a := authIDLockKey("codex-001")
-	b := authIDLockKey("codex-002")
+func TestAuthIDLockKeys_Distinct(t *testing.T) {
+	_, a := authIDLockKeys("codex-001")
+	_, b := authIDLockKeys("codex-002")
 	if a == b {
-		t.Fatalf("expected distinct keys for distinct ids, both were %d", a)
+		t.Fatalf("expected distinct id keys, both were %d", a)
 	}
 }
 
-func TestPgAuthRefreshLocker_NilDB_NoOp(t *testing.T) {
-	// Zero-value locker (no DB) should succeed and return a harmless release,
-	// so single-instance callers need not branch on the field.
+// Per review feedback, nil locker must surface an explicit error rather than
+// silently pretending a lock was acquired — otherwise a misconfigured cluster
+// would race with no protection at all.
+func TestPgAuthRefreshLocker_NilReceiver_ReturnsError(t *testing.T) {
 	var l *PgAuthRefreshLocker
-	release, ok, err := l.TryLock(nil, "any")
-	if err != nil {
-		t.Fatalf("nil locker should not error: %v", err)
+	release, ok, err := l.TryLock(context.Background(), "any")
+	if !errors.Is(err, ErrNilDB) {
+		t.Fatalf("expected ErrNilDB, got %v", err)
 	}
-	if !ok {
-		t.Fatal("nil locker should succeed")
+	if ok {
+		t.Fatal("nil locker must not report ok=true")
 	}
-	release() // must not panic
+	if release != nil {
+		t.Fatal("nil locker must not return a release func")
+	}
+}
+
+func TestPgAuthRefreshLocker_ZeroValue_ReturnsError(t *testing.T) {
+	l := &PgAuthRefreshLocker{}
+	_, ok, err := l.TryLock(context.Background(), "any")
+	if !errors.Is(err, ErrNilDB) {
+		t.Fatalf("expected ErrNilDB, got %v", err)
+	}
+	if ok {
+		t.Fatal("zero-value locker must not report ok=true")
+	}
 }
