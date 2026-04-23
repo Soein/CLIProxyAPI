@@ -31,7 +31,12 @@ type nodeIDSetter interface {
 // bootstrapCluster wires LeaderElector + PgAuthRefreshLocker + ChangeSubscriber
 // into the coreManager when cfg.Cluster.Enabled and the backing store is
 // Postgres. On any failure the caller falls back to single-instance mode.
+// Idempotent guard: calling twice returns an error instead of leaking the
+// previous cluster goroutines.
 func (s *Service) bootstrapCluster(ctx context.Context) error {
+	if s.clusterCancel != nil {
+		return errors.New("cluster mode: bootstrapCluster already called; would leak goroutines")
+	}
 	store := s.coreManager.GetStore()
 	if store == nil {
 		return errors.New("cluster mode: coreManager has no store wired")
@@ -58,12 +63,15 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 		}
 	}
 
-	var probeInterval time.Duration
+	// Default matches cluster.LeaderElector's own fallback; we resolve it
+	// here so the startup log is truthful ("probe_interval=5s") even when
+	// the user left the field empty.
+	probeInterval := 5 * time.Second
 	if v := strings.TrimSpace(s.cfg.Cluster.ProbeInterval); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			probeInterval = d
 		} else {
-			log.Warnf("cluster: invalid probe-interval %q; using default", v)
+			log.Warnf("cluster: invalid probe-interval %q; using default %s", v, probeInterval)
 		}
 	}
 

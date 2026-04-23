@@ -513,12 +513,15 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
-	// Wire cluster-mode coordination (opt-in). Failure here is logged and
-	// degraded to single-instance behavior rather than aborting startup, so
-	// misconfigured cluster fields can't brick an otherwise-working node.
+	// Wire cluster-mode coordination (opt-in). Failure here is logged at
+	// ERROR level (not warn) because a misconfigured cluster that silently
+	// falls back to single-instance mode on multiple replicas will race on
+	// OAuth token rotation — far more damaging than failing fast. Startup
+	// still continues so a single surviving node can serve reads while ops
+	// investigates.
 	if s.cfg != nil && s.cfg.Cluster.Enabled && s.coreManager != nil {
 		if err := s.bootstrapCluster(ctx); err != nil {
-			log.WithError(err).Warn("cluster bootstrap failed; running in single-instance mode")
+			log.WithError(err).Error("cluster.enabled=true but bootstrap failed; running single-instance — DO NOT start additional replicas until fixed")
 		}
 	}
 
