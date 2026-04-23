@@ -166,6 +166,9 @@ func (le *LeaderElector) demote(reason string, err error) {
 }
 
 func (le *LeaderElector) probe(ctx context.Context, conn *sql.Conn) error {
+	// Step 1: the authoritative signal — advisory lock. Any failure here is
+	// treated as a connection-level problem and bubbles up to Run() which
+	// will demote and rebuild the conn.
 	var got bool
 	if err := conn.QueryRowContext(ctx,
 		"SELECT pg_try_advisory_lock($1, $2)", leaderLockClass, leaderLockID,
@@ -175,6 +178,10 @@ func (le *LeaderElector) probe(ctx context.Context, conn *sql.Conn) error {
 
 	was := le.isLeader.Swap(got)
 
+	// Step 2: best-effort heartbeat row. The heartbeat is auxiliary (operator
+	// visibility only); a failure here must NOT cause us to demote and drop
+	// the conn, because that would release the advisory lock we just took
+	// and cause a spurious cluster-wide failover. Log and carry on.
 	role := "follower"
 	if got {
 		role = "leader"
@@ -190,15 +197,16 @@ func (le *LeaderElector) probe(ctx context.Context, conn *sql.Conn) error {
 			last_heartbeat = NOW(),
 			metadata = EXCLUDED.metadata
 	`, le.nodeID, role, le.region, meta); err != nil {
-		return err
+		log.WithError(err).Warnf("cluster_nodes heartbeat upsert failed (keeping leader state); node=%s", le.nodeID)
 	}
 
 	switch {
 	case got && !was:
 		log.Infof("became leader: node=%s region=%s", le.nodeID, le.region)
 	case !got && was:
-		// Lost lock but the query itself succeeded (e.g. another node stole
-		// it after our conn was idle too long). Fire onLoss out of band.
+		// Advisory lock was taken by someone else (e.g. we were idle too
+		// long and the server released our session-level lock). Fire
+		// onLoss out of band so a slow callback does not block the probe.
 		log.Warnf("lost leadership to another node; node=%s", le.nodeID)
 		go le.onLoss()
 	}
