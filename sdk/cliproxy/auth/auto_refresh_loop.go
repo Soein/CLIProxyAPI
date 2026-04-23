@@ -84,6 +84,16 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 			if authID == "" {
 				continue
 			}
+			// In cluster mode only the leader runs scheduled refreshes; other
+			// replicas push the item back into the heap at a future time. We
+			// deliberately upsert with a forward timestamp instead of calling
+			// queueReschedule, because queueReschedule immediately re-evaluates
+			// shouldRefresh and would busy-loop on followers whose auths have
+			// NextRefreshAfter in the past.
+			if !l.manager.IsLeader() {
+				l.upsert(authID, time.Now().Add(l.interval))
+				continue
+			}
 			l.manager.refreshAuth(ctx, authID)
 			l.queueReschedule(authID)
 		}
@@ -220,6 +230,14 @@ func (l *authAutoRefreshLoop) popDue(now time.Time) []string {
 
 func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, authID string) {
 	if authID == "" {
+		return
+	}
+
+	// Early gate: follower replicas should never dispatch refresh jobs. Put the
+	// item back in the heap at a future time so the worker pool stays idle.
+	// Dual-layer with worker() below prevents races during failover.
+	if !l.manager.IsLeader() {
+		l.upsert(authID, now.Add(l.interval))
 		return
 	}
 

@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -176,6 +177,81 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+
+	// In-process refresh deduplication: when multiple goroutines ask for the
+	// same auth to be refreshed concurrently within one process, only one call
+	// hits the OAuth provider. Paired with an optional AuthRefreshLocker that
+	// extends this invariant across replicas in cluster mode.
+	refreshSF singleflight.Group
+
+	// clusterMu guards the optional cluster-mode hooks below. A plain RWMutex
+	// is used instead of atomic.Value because atomic.Value panics on Store(nil)
+	// and cannot safely roundtrip a nil interface value.
+	clusterMu         sync.RWMutex
+	authRefreshLocker AuthRefreshLocker // nil = single-instance (no cross-node lock)
+	leaderGate        LeaderGate        // nil = always "leader"
+}
+
+// LeaderGate reports whether this process should run singleton background
+// loops. Implementations back this via a DCS (e.g. pg advisory lock).
+type LeaderGate interface {
+	IsLeader() bool
+}
+
+// SetLeaderGate installs a cluster leader detector. Pass nil to disable.
+func (m *Manager) SetLeaderGate(g LeaderGate) {
+	if m == nil {
+		return
+	}
+	m.clusterMu.Lock()
+	m.leaderGate = g
+	m.clusterMu.Unlock()
+}
+
+// IsLeader returns true when the optional gate reports leadership, or when no
+// gate is installed (single-instance mode).
+func (m *Manager) IsLeader() bool {
+	if m == nil {
+		return true
+	}
+	m.clusterMu.RLock()
+	g := m.leaderGate
+	m.clusterMu.RUnlock()
+	if g == nil {
+		return true
+	}
+	return g.IsLeader()
+}
+
+// AuthRefreshLocker coordinates auth refresh across cluster replicas.
+// Implementations typically wrap Postgres pg_try_advisory_lock and return a
+// release callback that unlocks on the same dedicated connection.
+//
+// TryLock must be non-blocking: if another node holds the lock it should return
+// ok=false so the caller can skip this round. A successful lock MUST be paired
+// with a call to the returned release function.
+type AuthRefreshLocker interface {
+	TryLock(ctx context.Context, authID string) (release func(), ok bool, err error)
+}
+
+// SetAuthRefreshLocker installs an optional cross-instance advisory lock used
+// by refreshAuth. Pass nil to disable (default in single-instance mode).
+func (m *Manager) SetAuthRefreshLocker(l AuthRefreshLocker) {
+	if m == nil {
+		return
+	}
+	m.clusterMu.Lock()
+	m.authRefreshLocker = l
+	m.clusterMu.Unlock()
+}
+
+func (m *Manager) currentAuthRefreshLocker() AuthRefreshLocker {
+	if m == nil {
+		return nil
+	}
+	m.clusterMu.RLock()
+	defer m.clusterMu.RUnlock()
+	return m.authRefreshLocker
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -3212,6 +3288,30 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Process-level dedup: same auth refreshed by many goroutines → one call.
+	_, _, _ = m.refreshSF.Do("refresh:"+id, func() (any, error) {
+		m.refreshAuthOnce(ctx, id)
+		return nil, nil
+	})
+}
+
+// refreshAuthOnce holds the previous refreshAuth body. In cluster mode it is
+// additionally gated by AuthRefreshLocker so only one replica per auth runs
+// through OAuth at a time.
+func (m *Manager) refreshAuthOnce(ctx context.Context, id string) {
+	// Cross-instance advisory lock (no-op in single-instance mode).
+	if locker := m.currentAuthRefreshLocker(); locker != nil {
+		release, ok, err := locker.TryLock(ctx, id)
+		if err != nil {
+			log.WithError(err).Warnf("auth refresh lock failed for %s; proceeding without cluster lock", id)
+		} else if !ok {
+			log.Debugf("auth %s refresh held by another node; skipping", id)
+			return
+		} else {
+			defer release()
+		}
+	}
+
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor
