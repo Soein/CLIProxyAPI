@@ -23,6 +23,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/cluster"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
@@ -101,6 +102,17 @@ type Service struct {
 	// clusterCancel stops the cluster-mode goroutines (leader elector +
 	// change subscriber). nil when cluster mode is disabled.
 	clusterCancel context.CancelFunc
+
+	// clusterRegistrar publishes this replica's routing metadata to the
+	// shared cluster_nodes table so the front-door (new-api) can consistent-
+	// hash account requests to a specific instance. nil when cluster mode
+	// is disabled or endpoint is not configured.
+	clusterRegistrar *cluster.InstanceRegistrar
+
+	// clusterAuthRing is the Phase 4 Sprint 2 per-auth consistent hash ring.
+	// It is kept on Service so admin endpoints and tests can inspect
+	// current membership. nil when cluster mode is disabled.
+	clusterAuthRing *cluster.AuthRing
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -804,6 +816,18 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		if s.watcherCancel != nil {
 			s.watcherCancel()
+		}
+		// Phase 4: mark this replica 'draining' BEFORE cancelling the
+		// cluster goroutines so new-api removes us from the routing ring
+		// while we still have a live DB connection. Best-effort — a failed
+		// write just means new-api waits for the staleness threshold. Use a
+		// short timeout so a hung Postgres does not block Shutdown.
+		if s.clusterRegistrar != nil {
+			drainCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			if err := s.clusterRegistrar.Drain(drainCtx); err != nil {
+				log.WithError(err).Warn("cluster: drain notification failed; front-door will wait for staleness threshold")
+			}
+			cancel()
 		}
 		if s.clusterCancel != nil {
 			s.clusterCancel()

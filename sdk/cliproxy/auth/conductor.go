@@ -190,6 +190,15 @@ type Manager struct {
 	clusterMu         sync.RWMutex
 	authRefreshLocker AuthRefreshLocker // nil = single-instance (no cross-node lock)
 	leaderGate        LeaderGate        // nil = always "leader"
+
+	// authRing and authShardingEnabled together implement Phase 4 Sprint 2
+	// per-auth sharding. authRing is consulted only when
+	// authShardingEnabled is true — otherwise the Manager behaves exactly
+	// as in Phase 1-3 (all replicas use all auths). Both are guarded by
+	// clusterMu above so flipping the flag at runtime (hot-reload) is
+	// safe. See sdk/cliproxy/auth/ring.go for degradation semantics.
+	authRing            AuthRingView // nil = sharding effectively disabled
+	authShardingEnabled bool         // feature flag; false preserves pre-P4 behavior
 }
 
 // LeaderGate reports whether this process should run singleton background
@@ -254,6 +263,101 @@ func (m *Manager) currentAuthRefreshLocker() AuthRefreshLocker {
 	return m.authRefreshLocker
 }
 
+// SetAuthRing installs or removes the cluster-wide auth ring. Pass nil to
+// clear. Safe to call at any time — subsequent syncScheduler calls will
+// reflect the new ring. Does NOT trigger an immediate re-sync; callers
+// that want immediate re-sharding should follow with SyncScheduler().
+func (m *Manager) SetAuthRing(ring AuthRingView) {
+	if m == nil {
+		return
+	}
+	m.clusterMu.Lock()
+	m.authRing = ring
+	m.clusterMu.Unlock()
+}
+
+// SetAuthShardingEnabled flips the sharding feature flag. When flipped on,
+// auths whose ring owner is not this replica will be dropped from the
+// scheduler on the next sync cycle. When flipped off, all auths become
+// eligible again (pre-P4 behavior).
+func (m *Manager) SetAuthShardingEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.clusterMu.Lock()
+	m.authShardingEnabled = enabled
+	m.clusterMu.Unlock()
+}
+
+// IsAuthShardingEnabled reports whether sharding is currently active.
+// Primarily used by tests and observability endpoints.
+func (m *Manager) IsAuthShardingEnabled() bool {
+	if m == nil {
+		return false
+	}
+	m.clusterMu.RLock()
+	defer m.clusterMu.RUnlock()
+	return m.authShardingEnabled
+}
+
+// OwnsAuth reports whether this replica should dispatch / refresh the
+// given auth_id under the current sharding config. Returns true when
+// sharding is disabled (pre-P4 behavior) or the ring degrades to "not
+// ready". Used by scheduler sync and auto_refresh_loop to skip auths they
+// don't own.
+func (m *Manager) OwnsAuth(authID string) bool {
+	if m == nil {
+		return true
+	}
+	m.clusterMu.RLock()
+	enabled := m.authShardingEnabled
+	ring := m.authRing
+	m.clusterMu.RUnlock()
+	if !enabled || ring == nil {
+		return true
+	}
+	return ring.IsMine(authID)
+}
+
+// SyncScheduler exposes syncScheduler to external callers — notably the
+// RingWatcher OnChange callback, which needs to trigger a re-sync after
+// membership changes without waiting for the next mutation.
+func (m *Manager) SyncScheduler() {
+	if m == nil {
+		return
+	}
+	m.syncScheduler()
+}
+
+// ShouldRefreshLocally reports whether the auto-refresh loop on this
+// replica should attempt to refresh the given auth.
+//
+//   - AuthSharding ON + ring Ready: only the ring-owner replica refreshes
+//     (distributes refresh work across replicas, matching dispatch).
+//   - AuthSharding OFF (or ring not ready): only the leader refreshes
+//     (pre-Phase-4 behavior).
+//
+// Even when this returns true, refreshAuth still takes the per-auth
+// advisory lock — so the transition between these two modes is always
+// safe: at worst two replicas race the lock and one wastes one RTT.
+func (m *Manager) ShouldRefreshLocally(authID string) bool {
+	if m == nil {
+		return true
+	}
+	m.clusterMu.RLock()
+	enabled := m.authShardingEnabled
+	ring := m.authRing
+	gate := m.leaderGate
+	m.clusterMu.RUnlock()
+	if enabled && ring != nil && ring.Ready() {
+		return ring.IsMine(authID)
+	}
+	if gate == nil {
+		return true
+	}
+	return gate.IsLeader()
+}
+
 // NewManager constructs a manager with optional custom selector and hook.
 func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	if selector == nil {
@@ -291,7 +395,65 @@ func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {
 	if m == nil || m.scheduler == nil {
 		return
 	}
-	m.scheduler.rebuild(auths)
+	// Phase 4 Sprint 2: when sharding is enabled, only include auths whose
+	// ring owner is this replica. OwnsAuth degrades to true when the ring
+	// is not yet populated, so this is a safe no-op during bootstrap.
+	// When sharding is disabled the filter short-circuits to the full set.
+	filtered := m.filterOwnedAuths(auths)
+	m.scheduler.rebuild(filtered)
+}
+
+// schedulerUpsert is the sharding-aware wrapper around
+// m.scheduler.upsertAuth. All direct inserts MUST go through this so a
+// non-owned auth never ends up in the scheduler. If an auth was previously
+// in the scheduler but this replica no longer owns it (ring membership
+// changed), we proactively remove it here rather than wait for the next
+// full sync.
+func (m *Manager) schedulerUpsert(a *Auth) {
+	if m == nil || m.scheduler == nil || a == nil {
+		return
+	}
+	if !m.OwnsAuth(a.ID) {
+		m.scheduler.removeAuth(a.ID)
+		return
+	}
+	m.scheduler.upsertAuth(a)
+}
+
+// filterOwnedAuths returns auths whose ring owner is this replica. When
+// sharding is disabled or the ring is not ready, returns the input
+// unchanged so no allocation is wasted. Allocates only when the filter
+// would actually drop something.
+func (m *Manager) filterOwnedAuths(auths []*Auth) []*Auth {
+	if m == nil || len(auths) == 0 {
+		return auths
+	}
+	m.clusterMu.RLock()
+	enabled := m.authShardingEnabled
+	ring := m.authRing
+	m.clusterMu.RUnlock()
+	if !enabled || ring == nil {
+		return auths
+	}
+	// First pass: count the number of auths that would be dropped so we
+	// can avoid the allocation when sharding has nothing to do (e.g.
+	// ring.IsMine=true for all — common in small clusters).
+	kept := 0
+	for _, a := range auths {
+		if a != nil && ring.IsMine(a.ID) {
+			kept++
+		}
+	}
+	if kept == len(auths) {
+		return auths
+	}
+	out := make([]*Auth, 0, kept)
+	for _, a := range auths {
+		if a != nil && ring.IsMine(a.ID) {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func (m *Manager) syncScheduler() {
@@ -328,7 +490,7 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	}
 	snapshot := auth.Clone()
 	m.mu.RUnlock()
-	m.scheduler.upsertAuth(snapshot)
+	m.schedulerUpsert(snapshot)
 }
 
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
@@ -405,7 +567,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	m.mu.Unlock()
 
 	if m.scheduler != nil && snapshot != nil {
-		m.scheduler.upsertAuth(snapshot)
+		m.schedulerUpsert(snapshot)
 	}
 }
 
@@ -1183,7 +1345,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.schedulerUpsert(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
@@ -1214,7 +1376,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.schedulerUpsert(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
@@ -1281,7 +1443,7 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 	// locking discipline (scheduler takes its own mutex).
 	if m.scheduler != nil {
 		if schedulerCopy != nil {
-			m.scheduler.upsertAuth(schedulerCopy)
+			m.schedulerUpsert(schedulerCopy)
 		} else {
 			m.scheduler.removeAuth(id)
 		}
@@ -2261,7 +2423,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+		m.schedulerUpsert(authSnapshot)
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -3592,7 +3754,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id string) {
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.schedulerUpsert(current.Clone())
 			}
 		}
 		m.mu.Unlock()

@@ -222,22 +222,90 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		return fmt.Errorf("postgres store: add last_writer col to auth table: %w", err)
 	}
 
-	// cluster_nodes: leader election heartbeat visibility (HA mode only).
+	// cluster_nodes serves two roles in cluster mode:
+	//   (1) LeaderElector heartbeat (role/metadata)
+	//   (2) InstanceRegistrar routing metadata (endpoint/weight/status) —
+	//       consumed by new-api's consistent-hash router (Phase 4).
+	// Each writer owns its own columns via ON CONFLICT DO UPDATE SET so the
+	// two goroutines do not clobber each other.
 	if _, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS cluster_nodes (
 			node_id         TEXT PRIMARY KEY,
-			role            TEXT NOT NULL,
+			role            TEXT,
 			region          TEXT,
 			last_heartbeat  TIMESTAMPTZ NOT NULL,
-			metadata        JSONB
+			metadata        JSONB,
+			endpoint        TEXT,
+			weight          INT  NOT NULL DEFAULT 100,
+			status          TEXT NOT NULL DEFAULT 'active'
 		)
 	`); err != nil {
 		return fmt.Errorf("postgres store: create cluster_nodes: %w", err)
+	}
+	// Upgrade path for clusters initialized pre-Phase-4 (role NOT NULL,
+	// no endpoint/weight/status). ALTER ... DROP NOT NULL is idempotent and
+	// no-op when the column is already nullable.
+	for _, stmt := range []string{
+		"ALTER TABLE cluster_nodes ALTER COLUMN role DROP NOT NULL",
+		"ALTER TABLE cluster_nodes ADD COLUMN IF NOT EXISTS endpoint TEXT",
+		"ALTER TABLE cluster_nodes ADD COLUMN IF NOT EXISTS weight INT NOT NULL DEFAULT 100",
+		"ALTER TABLE cluster_nodes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("postgres store: alter cluster_nodes: %w", err)
+		}
 	}
 	if _, err := s.db.ExecContext(ctx,
 		"CREATE INDEX IF NOT EXISTS idx_cluster_nodes_heartbeat ON cluster_nodes(last_heartbeat DESC)",
 	); err != nil {
 		return fmt.Errorf("postgres store: create cluster_nodes index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		"CREATE INDEX IF NOT EXISTS idx_cluster_nodes_status ON cluster_nodes(status, last_heartbeat DESC)",
+	); err != nil {
+		return fmt.Errorf("postgres store: create cluster_nodes status index: %w", err)
+	}
+	// Phase 4: NOTIFY channel consumed by new-api's HashRing watcher. Fires
+	// on routing-relevant column changes only (endpoint/weight/status) plus
+	// DELETE — we deliberately skip UPDATE of role/last_heartbeat to avoid
+	// flooding the channel with every 5s leader heartbeat.
+	// The function suppresses no-op UPDATE notifies: InstanceRegistrar
+	// re-writes identical endpoint/weight/status every 10s, and without
+	// this guard each heartbeat would fire a NOTIFY and every replica
+	// would execute a full refresh query (N² behavior). INSERT/DELETE
+	// still notify unconditionally. A trigger-level WHEN can't express
+	// this because WHEN can only reference OLD on UPDATE/DELETE and NEW
+	// on INSERT/UPDATE — mixed INSERT OR UPDATE OR DELETE triggers can't
+	// reference both.
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE OR REPLACE FUNCTION notify_cpa_instance_changed()
+		RETURNS TRIGGER AS $BODY$
+		BEGIN
+			IF TG_OP = 'UPDATE'
+			   AND OLD.endpoint IS NOT DISTINCT FROM NEW.endpoint
+			   AND OLD.weight   IS NOT DISTINCT FROM NEW.weight
+			   AND OLD.status   IS NOT DISTINCT FROM NEW.status THEN
+				RETURN NULL;
+			END IF;
+			PERFORM pg_notify('cpa_instance_changed', COALESCE(NEW.node_id, OLD.node_id));
+			RETURN COALESCE(NEW, OLD);
+		END;
+		$BODY$ LANGUAGE plpgsql
+	`); err != nil {
+		return fmt.Errorf("postgres store: create notify_cpa_instance_changed function: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		"DROP TRIGGER IF EXISTS trg_cpa_instance_changed ON cluster_nodes",
+	); err != nil {
+		return fmt.Errorf("postgres store: drop old trg_cpa_instance_changed: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TRIGGER trg_cpa_instance_changed
+			AFTER INSERT OR UPDATE OF endpoint, weight, status OR DELETE
+			ON cluster_nodes
+			FOR EACH ROW EXECUTE FUNCTION notify_cpa_instance_changed()
+	`); err != nil {
+		return fmt.Errorf("postgres store: create trg_cpa_instance_changed: %w", err)
 	}
 	return nil
 }

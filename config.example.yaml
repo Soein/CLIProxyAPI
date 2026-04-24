@@ -138,6 +138,27 @@ routing:
 #   node-id: ""              # default: machine hostname
 #   region: ""               # free-form label for cluster_nodes heartbeat
 #   probe-interval: "5s"     # advisory-lock probe cadence
+#
+#   # Phase 4: instance-routing metadata consumed by new-api's consistent-
+#   # hash router. Absent endpoint disables routing but leader election
+#   # still works. Weight defaults to 100; use smaller for weaker machines.
+#   endpoint: ""             # e.g. "http://100.64.1.10:7860" (Tailscale)
+#   weight: 100              # relative share (4C4G=50, 8C8G=100)
+#   registrar-interval: "10s"  # heartbeat cadence for cluster_nodes row
+#
+#   # Phase 4 Sprint 2: auth (OAuth account) sharding. Each auth hashes to
+#   # exactly one replica; only that replica dispatches and refreshes it.
+#   # Keep FALSE until all replicas in the cluster are on Phase-4 code —
+#   # mixing sharding-on and sharding-off replicas causes accounts to be
+#   # double-used. Flip to true AFTER all replicas are upgraded.
+#   #
+#   # IMPORTANT: this flag is read once during cluster bootstrap. Changing
+#   # it via config hot-reload does NOT take effect — every replica must
+#   # be restarted (docker restart / systemctl restart) after flipping.
+#   auth-sharding: false
+#   spillover: true            # fall back to full pool when local shard is all limited
+#   ring-staleness: "30s"      # treat cluster_nodes row older than this as dead
+#   ring-poll-interval: "30s"  # safety-net re-query in case NOTIFY drops
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

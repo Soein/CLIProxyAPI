@@ -175,6 +175,55 @@ type ClusterConfig struct {
 	// lock and refreshes its heartbeat. Parsed as a Go duration string
 	// (e.g. "5s"). Empty/invalid means use the elector's default (5s).
 	ProbeInterval string `yaml:"probe-interval,omitempty" json:"probe-interval,omitempty"`
+
+	// Endpoint is the URL at which this replica serves API traffic, exposed
+	// in cluster_nodes so the front-door router (new-api) can consistent-hash
+	// account requests to a specific instance. Use the Tailscale/overlay IP
+	// in NAT'd deployments (e.g. "http://100.64.1.10:7860"). Empty disables
+	// registrar-driven routing; the replica still participates in leader
+	// election but is invisible to cross-instance routers.
+	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
+
+	// Weight is the relative share of accounts routed to this node. Used by
+	// the front-door's weighted-hash algorithm. Defaults to 100 when
+	// zero/unset. Tune proportional to machine capacity (e.g. 4C4G=50,
+	// 8C8G=100).
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
+	// RegistrarInterval is how often InstanceRegistrar refreshes the row in
+	// cluster_nodes. Parsed as a Go duration; empty/invalid means 10s.
+	// Should be smaller than new-api's staleness threshold (default 30s).
+	RegistrarInterval string `yaml:"registrar-interval,omitempty" json:"registrar-interval,omitempty"`
+
+	// AuthSharding, when true, routes each auth (OAuth account) to exactly
+	// one replica using weighted rendezvous hashing on cluster_nodes
+	// membership. Each replica only dispatches / refreshes auths that hash
+	// to its NodeID, ensuring cross-instance rate-limit, usage and
+	// cooldown tracking stay consistent.
+	//
+	// Default false preserves Phase 1-3 behavior (all replicas use all
+	// auths). Safe to flip at runtime via config hot-reload: the scheduler
+	// resyncs on the next sync cycle and auths not in the local shard stop
+	// being picked.
+	AuthSharding bool `yaml:"auth-sharding,omitempty" json:"auth-sharding,omitempty"`
+
+	// Spillover, when true (and AuthSharding=true), lets a replica fall
+	// back to the full auth pool when its local shard is entirely limited /
+	// blocked. Prevents localized saturation from turning into request
+	// failure. Disable only if strict per-account isolation is required.
+	Spillover bool `yaml:"spillover,omitempty" json:"spillover,omitempty"`
+
+	// RingStalenessThreshold is how old a cluster_nodes row may be before
+	// the RingWatcher treats it as dead and excludes it from the ring.
+	// Parsed as a Go duration; empty/invalid means 30s. Must be greater
+	// than RegistrarInterval × 2 or instances will flap out of the ring
+	// during normal heartbeats.
+	RingStalenessThreshold string `yaml:"ring-staleness,omitempty" json:"ring-staleness,omitempty"`
+
+	// RingPollInterval is how often the RingWatcher re-queries
+	// cluster_nodes as a safety net in case LISTEN/NOTIFY drops a message.
+	// Parsed as a Go duration; empty/invalid means 30s.
+	RingPollInterval string `yaml:"ring-poll-interval,omitempty" json:"ring-poll-interval,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.

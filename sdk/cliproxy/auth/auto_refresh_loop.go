@@ -84,13 +84,15 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 			if authID == "" {
 				continue
 			}
-			// In cluster mode only the leader runs scheduled refreshes; other
-			// replicas push the item back into the heap at a future time. We
-			// deliberately upsert with a forward timestamp instead of calling
-			// queueReschedule, because queueReschedule immediately re-evaluates
-			// shouldRefresh and would busy-loop on followers whose auths have
-			// NextRefreshAfter in the past.
-			if !l.manager.IsLeader() {
+			// Phase 4 Sprint 2: eligibility is "ShouldRefreshLocally" rather
+			// than "IsLeader". When AuthSharding is on, each replica
+			// refreshes only its own shard; when off, only the leader
+			// refreshes (legacy behavior). Either way non-eligible replicas
+			// re-queue the item at a future time instead of calling
+			// queueReschedule — queueReschedule immediately re-evaluates
+			// shouldRefresh and would busy-loop on non-owners whose auths
+			// have NextRefreshAfter in the past.
+			if !l.manager.ShouldRefreshLocally(authID) {
 				l.upsert(authID, time.Now().Add(l.interval))
 				continue
 			}
@@ -233,10 +235,11 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		return
 	}
 
-	// Early gate: follower replicas should never dispatch refresh jobs. Put the
-	// item back in the heap at a future time so the worker pool stays idle.
-	// Dual-layer with worker() below prevents races during failover.
-	if !l.manager.IsLeader() {
+	// Early gate: non-owner replicas should never dispatch refresh jobs. Put
+	// the item back in the heap at a future time so the worker pool stays
+	// idle. Dual-layer with worker() below prevents races during failover
+	// or ring rebalance.
+	if !l.manager.ShouldRefreshLocally(authID) {
 		l.upsert(authID, now.Add(l.interval))
 		return
 	}

@@ -102,6 +102,79 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	// Per-auth advisory lock — serializes token refresh cross-replica.
 	s.coreManager.SetAuthRefreshLocker(cluster.NewPgAuthRefreshLocker(db))
 
+	// Phase 4: publish routing metadata to cluster_nodes. Absent endpoint is
+	// treated as "opt out of cross-instance routing" — the node still
+	// participates in leader election and refresh locks, it is just
+	// invisible to new-api's consistent-hash router.
+	regInterval := parseDurationOr(s.cfg.Cluster.RegistrarInterval, 10*time.Second, "registrar-interval")
+	if strings.TrimSpace(s.cfg.Cluster.Endpoint) == "" {
+		log.Warn("cluster: endpoint not configured; node will not be routable by front-door (Phase 4 routing disabled for this replica)")
+	} else {
+		registrar, err := cluster.NewRegistrar(cluster.RegistrarConfig{
+			DB:       db,
+			NodeID:   nodeID,
+			Region:   s.cfg.Cluster.Region,
+			Endpoint: s.cfg.Cluster.Endpoint,
+			Weight:   s.cfg.Cluster.Weight,
+			Interval: regInterval,
+		})
+		if err != nil {
+			return fmt.Errorf("cluster mode: instance registrar: %w", err)
+		}
+		s.clusterRegistrar = registrar
+		go registrar.Run(clusterCtx)
+	}
+
+	// Phase 4 Sprint 2: auth ring + watcher. We ALWAYS create the ring and
+	// watcher, even when AuthSharding is off in config, so ring membership
+	// observability is always available and flipping the flag later needs
+	// only a restart (not a redeploy). The watcher is cheap: one LISTEN
+	// connection + a 30s safety-net poll.
+	//
+	// Crucially, SetAuthShardingEnabled is driven by config and read ONCE
+	// at bootstrap. A config hot-reload does NOT re-invoke these setters;
+	// operators must restart the process to flip the flag. The config.yaml
+	// comment spells this out, but enforcement via code watcher is a
+	// follow-up (out of scope for Sprint 2).
+	//
+	// Bootstrap ordering: coreManager.Load() ran synchronously before
+	// bootstrapCluster() — so the scheduler holds ALL auths when we
+	// reach this point, while the ring is empty. That "full scheduler +
+	// empty ring" state is correct, not a bug:
+	//   - AuthSharding=false: ring membership doesn't matter, scheduler
+	//     serves everything (legacy behavior).
+	//   - AuthSharding=true:  ring.Ready()==false makes IsMine=true (the
+	//     deliberate bootstrap-window degradation), so the scheduler
+	//     still serves everything until the watcher completes its first
+	//     refresh and fires OnChange → SyncScheduler rebuilds with the
+	//     real membership. The window is ~goroutine-schedule + one PG
+	//     RTT = low milliseconds on a healthy system.
+	ring := cluster.NewAuthRing(nodeID)
+	s.clusterAuthRing = ring
+	s.coreManager.SetAuthRing(ring)
+	s.coreManager.SetAuthShardingEnabled(s.cfg.Cluster.AuthSharding)
+
+	ringStaleness := parseDurationOr(s.cfg.Cluster.RingStalenessThreshold, 30*time.Second, "ring-staleness")
+	ringPoll := parseDurationOr(s.cfg.Cluster.RingPollInterval, 30*time.Second, "ring-poll-interval")
+	if ringStaleness <= regInterval*2 {
+		log.Warnf("cluster: ring-staleness=%s is <= 2×registrar-interval=%s; instances may flap out of the ring during heartbeats",
+			ringStaleness, regInterval*2)
+	}
+	watcher := &cluster.RingWatcher{
+		DB:                 db,
+		DSN:                dsn,
+		Ring:               ring,
+		StalenessThreshold: ringStaleness,
+		PollInterval:       ringPoll,
+		OnChange: func() {
+			// Kick the scheduler so newly-owned auths pick up traffic and
+			// newly-lost auths stop receiving it. Cheap: runs under the
+			// scheduler mutex, no network calls.
+			s.coreManager.SyncScheduler()
+		},
+	}
+	go watcher.Run(clusterCtx)
+
 	// LISTEN/NOTIFY subscriber — peers reload changed rows.
 	// Phase 3 initial integration: trigger a full Load on any auth change.
 	// This is pragmatic (O(all auths) per notify) but correct; switching to
@@ -129,9 +202,28 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	go subscriber.Run(clusterCtx)
 
 	log.WithFields(log.Fields{
-		"node_id":        nodeID,
-		"region":         s.cfg.Cluster.Region,
-		"probe_interval": probeInterval,
+		"node_id":         nodeID,
+		"region":          s.cfg.Cluster.Region,
+		"probe_interval":  probeInterval,
+		"auth_sharding":   s.cfg.Cluster.AuthSharding,
+		"ring_staleness":  ringStaleness,
+		"ring_poll":       ringPoll,
 	}).Info("cluster mode enabled")
 	return nil
+}
+
+// parseDurationOr parses a Go duration string; on empty/invalid input it
+// returns defaultValue and logs a warning naming fieldName so operators can
+// grep the startup log for "invalid <field>".
+func parseDurationOr(raw string, defaultValue time.Duration, fieldName string) time.Duration {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return defaultValue
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil || d <= 0 {
+		log.Warnf("cluster: invalid %s %q; using default %s", fieldName, raw, defaultValue)
+		return defaultValue
+	}
+	return d
 }
