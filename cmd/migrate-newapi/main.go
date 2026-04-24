@@ -204,6 +204,31 @@ func listColumns(ctx context.Context, db *sql.DB, table string) ([]string, error
 	return cols, rows.Err()
 }
 
+// boolColumnsFor queries information_schema to find which columns of the
+// target PG table are of type 'boolean'. GORM maps Go `bool` struct fields
+// to PG BOOLEAN, but SQLite stores them as INTEGER 0/1. Without this
+// conversion pgx CopyFrom fails with "unable to encode 1 into binary
+// format for bool (OID 16)".
+func boolColumnsFor(ctx context.Context, pgPool *pgxpool.Pool, table string) (map[string]bool, error) {
+	rows, err := pgPool.Query(ctx, `
+		SELECT column_name FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = $1 AND data_type = 'boolean'
+	`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out[c] = true
+	}
+	return out, rows.Err()
+}
+
 // copyTable streams rows from sqlite into the PG table via pgx CopyFrom,
 // which uses the PostgreSQL COPY protocol for maximum throughput.
 func copyTable(ctx context.Context, sqliteDB *sql.DB, pgPool *pgxpool.Pool, table string, batchSize int) error {
@@ -213,6 +238,11 @@ func copyTable(ctx context.Context, sqliteDB *sql.DB, pgPool *pgxpool.Pool, tabl
 	}
 	if len(cols) == 0 {
 		return nil // empty table definition, nothing to copy
+	}
+
+	boolCols, err := boolColumnsFor(ctx, pgPool, table)
+	if err != nil {
+		return fmt.Errorf("fetch bool cols: %w", err)
 	}
 
 	quoted := make([]string, len(cols))
@@ -269,6 +299,28 @@ func copyTable(ctx context.Context, sqliteDB *sql.DB, pgPool *pgxpool.Pool, tabl
 		// NUMERIC (e.g. balance) pgx needs the Go value to be a string or
 		// *big.Rat or similar; the sqlite driver returns int64/float64
 		// which pgx serializes fine for NUMERIC if no digit overflow.
+		//
+		// BOOLEAN columns need an explicit int64→bool coercion because
+		// SQLite stored them as 0/1. nil (NULL) values pass through.
+		if len(boolCols) > 0 {
+			for i, col := range cols {
+				if !boolCols[col] {
+					continue
+				}
+				switch v := vals[i].(type) {
+				case int64:
+					vals[i] = v != 0
+				case []byte:
+					vals[i] = string(v) != "0" && string(v) != ""
+				case string:
+					vals[i] = v != "0" && v != ""
+				case bool:
+					// already bool — no-op
+				case nil:
+					// preserve NULL
+				}
+			}
+		}
 		batch = append(batch, vals)
 		if len(batch) >= batchSize {
 			if err := flush(); err != nil {
