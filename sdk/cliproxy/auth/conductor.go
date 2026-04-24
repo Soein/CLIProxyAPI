@@ -199,6 +199,15 @@ type Manager struct {
 	// safe. See sdk/cliproxy/auth/ring.go for degradation semantics.
 	authRing            AuthRingView // nil = sharding effectively disabled
 	authShardingEnabled bool         // feature flag; false preserves pre-P4 behavior
+
+	// spilloverEnabled, when true AND authShardingEnabled is also true,
+	// permits pickNext to fall back to the full auth pool when every
+	// locally-owned auth is cooled-down/unavailable. Without spillover the
+	// request returns auth_not_found and the caller sees a 503 —
+	// operationally unsafe for small shards. The fallback is intentionally
+	// rare: local-shard pick is cheap and always tried first. Guarded by
+	// clusterMu.
+	spilloverEnabled bool
 }
 
 // LeaderGate reports whether this process should run singleton background
@@ -300,6 +309,32 @@ func (m *Manager) IsAuthShardingEnabled() bool {
 	return m.authShardingEnabled
 }
 
+// SetSpilloverEnabled toggles Phase 4 Sprint 3 spillover behaviour. When
+// true (and auth-sharding is also true), pickNext will fall back to the
+// full pool if every auth owned by this replica is unavailable. Safe to
+// flip at runtime; the next pick observes the new value.
+func (m *Manager) SetSpilloverEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.clusterMu.Lock()
+	m.spilloverEnabled = enabled
+	m.clusterMu.Unlock()
+}
+
+// IsSpilloverEnabled reports the current spillover flag. Independent from
+// IsAuthShardingEnabled — operators can turn on spillover without
+// sharding to make the flag combinatorially explicit in
+// /admin/cluster/state dumps.
+func (m *Manager) IsSpilloverEnabled() bool {
+	if m == nil {
+		return false
+	}
+	m.clusterMu.RLock()
+	defer m.clusterMu.RUnlock()
+	return m.spilloverEnabled
+}
+
 // OwnsAuth reports whether this replica should dispatch / refresh the
 // given auth_id under the current sharding config. Returns true when
 // sharding is disabled (pre-P4 behavior) or the ring degrades to "not
@@ -395,65 +430,27 @@ func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {
 	if m == nil || m.scheduler == nil {
 		return
 	}
-	// Phase 4 Sprint 2: when sharding is enabled, only include auths whose
-	// ring owner is this replica. OwnsAuth degrades to true when the ring
-	// is not yet populated, so this is a safe no-op during bootstrap.
-	// When sharding is disabled the filter short-circuits to the full set.
-	filtered := m.filterOwnedAuths(auths)
-	m.scheduler.rebuild(filtered)
+	// Phase 4 Sprint 3: scheduler carries the FULL auth set on every replica.
+	// Sharding (filtering to "auths this replica owns") happens at pick
+	// time in pickNext / pickNextMixed — not at scheduler sync time. This
+	// is the precondition for Spillover: when a replica's shard is all
+	// cooled-down, pickNext can fall back to the full pool which is
+	// already loaded in the scheduler. Previously (Sprint 2) we pre-
+	// filtered here and Spillover would have required a full scheduler
+	// rebuild to recover, which is expensive under load.
+	m.scheduler.rebuild(auths)
 }
 
-// schedulerUpsert is the sharding-aware wrapper around
-// m.scheduler.upsertAuth. All direct inserts MUST go through this so a
-// non-owned auth never ends up in the scheduler. If an auth was previously
-// in the scheduler but this replica no longer owns it (ring membership
-// changed), we proactively remove it here rather than wait for the next
-// full sync.
+// schedulerUpsert wraps scheduler.upsertAuth. In Phase 4 Sprint 3 it is a
+// thin pass-through — sharding is enforced at pick time, not insertion
+// time, so every replica keeps the full auth set in its scheduler. The
+// wrapper is kept so callers have a single entry point we can extend
+// later (e.g. metrics, hook).
 func (m *Manager) schedulerUpsert(a *Auth) {
 	if m == nil || m.scheduler == nil || a == nil {
 		return
 	}
-	if !m.OwnsAuth(a.ID) {
-		m.scheduler.removeAuth(a.ID)
-		return
-	}
 	m.scheduler.upsertAuth(a)
-}
-
-// filterOwnedAuths returns auths whose ring owner is this replica. When
-// sharding is disabled or the ring is not ready, returns the input
-// unchanged so no allocation is wasted. Allocates only when the filter
-// would actually drop something.
-func (m *Manager) filterOwnedAuths(auths []*Auth) []*Auth {
-	if m == nil || len(auths) == 0 {
-		return auths
-	}
-	m.clusterMu.RLock()
-	enabled := m.authShardingEnabled
-	ring := m.authRing
-	m.clusterMu.RUnlock()
-	if !enabled || ring == nil {
-		return auths
-	}
-	// First pass: count the number of auths that would be dropped so we
-	// can avoid the allocation when sharding has nothing to do (e.g.
-	// ring.IsMine=true for all — common in small clusters).
-	kept := 0
-	for _, a := range auths {
-		if a != nil && ring.IsMine(a.ID) {
-			kept++
-		}
-	}
-	if kept == len(auths) {
-		return auths
-	}
-	out := make([]*Auth, 0, kept)
-	for _, a := range auths {
-		if a != nil && ring.IsMine(a.ID) {
-			out = append(out, a)
-		}
-	}
-	return out
 }
 
 func (m *Manager) syncScheduler() {
@@ -3012,6 +3009,157 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	return authCopy, executor, nil
 }
 
+// maxShardPickAttempts caps the non-owned-skip loop inside
+// pickWithShardFilter. In the pathological case where every auth is
+// non-owned (e.g. ring returned empty and sharding still on), we bail out
+// and let spillover (or the auth_not_found error) handle it rather than
+// spinning forever.
+const maxShardPickAttempts = 64
+
+// pickWithShardFilter is the single-provider scheduler pick with Phase 4
+// sharding + spillover applied. Control flow:
+//
+//  1. If sharding is off: call scheduler.pickSingle once (pre-P4 behaviour).
+//  2. If sharding is on: loop scheduler.pickSingle, skipping candidates
+//     that don't hash to this replica (by adding them to a LOCAL tried
+//     map copy so the caller's retry state stays clean).
+//  3. If the loop exhausts without an owned candidate AND spillover is
+//     on: retry once with the caller's ORIGINAL tried map, allowing any
+//     auth (including non-owned). Logs a warning so operators can see
+//     spillover is being triggered — sustained spillover indicates the
+//     shard weights are wrong or a node is down.
+//
+// The stale-model retry (`shouldRetrySchedulerPick`) happens only on the
+// first attempt — re-syncing the scheduler for every non-owned skip would
+// be pointlessly expensive.
+func (m *Manager) pickWithShardFilter(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+	shardingOn := m.IsAuthShardingEnabled()
+	if !shardingOn {
+		// Fast path: no sharding, behave exactly as pre-Sprint-3.
+		selected, err := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
+		if err != nil && model != "" && shouldRetrySchedulerPick(err) {
+			m.syncScheduler()
+			selected, err = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
+		}
+		return selected, err
+	}
+
+	// Sharded path: use a local tried map so "skipped because non-owned"
+	// entries don't leak back to the caller. The caller's map may later
+	// be reused by spillover.
+	shardTried := cloneTriedMap(tried)
+
+	var (
+		selected    *Auth
+		errPick     error
+		didModelSync bool
+	)
+	for attempt := 0; attempt < maxShardPickAttempts; attempt++ {
+		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, shardTried)
+		if errPick != nil && model != "" && !didModelSync && shouldRetrySchedulerPick(errPick) {
+			m.syncScheduler()
+			didModelSync = true
+			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, shardTried)
+		}
+		if errPick != nil {
+			break
+		}
+		if selected == nil {
+			break
+		}
+		if m.OwnsAuth(selected.ID) {
+			return selected, nil
+		}
+		shardTried[selected.ID] = struct{}{}
+		selected = nil
+	}
+
+	// Spillover: local shard exhausted. Fall back to global pool using
+	// the caller's ORIGINAL tried map so we give every auth (including
+	// ones we just skipped for sharding) a fair chance.
+	if m.IsSpilloverEnabled() {
+		globalSelected, globalErr := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
+		if globalErr == nil && globalSelected != nil {
+			log.Warnf("cluster: spillover — local shard exhausted for provider=%s model=%s, using auth %s",
+				provider, model, globalSelected.ID)
+			return globalSelected, nil
+		}
+		// Global pick also failed — return the global error which is
+		// the most accurate representation of "no auth anywhere".
+		return nil, globalErr
+	}
+
+	return selected, errPick
+}
+
+// cloneTriedMap returns a shallow copy of a tried-auth map so that
+// mutations (e.g. sharding skip-list) don't leak back to the caller.
+// A nil input produces a fresh empty map; callers never need to nil-check.
+func cloneTriedMap(src map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(src)+4)
+	for k := range src {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// pickMixedWithShardFilter is the multi-provider analogue of
+// pickWithShardFilter. Same three-phase control flow (fast-path when
+// sharding off / shard-filter loop / spillover fallback). Returns the
+// chosen auth and the provider key the scheduler settled on, because
+// providers are discovered during the pick rather than fixed up front.
+func (m *Manager) pickMixedWithShardFilter(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
+	shardingOn := m.IsAuthShardingEnabled()
+	if !shardingOn {
+		selected, providerKey, err := m.scheduler.pickMixed(ctx, providers, model, opts, tried)
+		if err != nil && model != "" && shouldRetrySchedulerPick(err) {
+			m.syncScheduler()
+			selected, providerKey, err = m.scheduler.pickMixed(ctx, providers, model, opts, tried)
+		}
+		return selected, providerKey, err
+	}
+
+	shardTried := cloneTriedMap(tried)
+	var (
+		selected     *Auth
+		providerKey  string
+		errPick      error
+		didModelSync bool
+	)
+	for attempt := 0; attempt < maxShardPickAttempts; attempt++ {
+		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, providers, model, opts, shardTried)
+		if errPick != nil && model != "" && !didModelSync && shouldRetrySchedulerPick(errPick) {
+			m.syncScheduler()
+			didModelSync = true
+			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, providers, model, opts, shardTried)
+		}
+		if errPick != nil {
+			break
+		}
+		if selected == nil {
+			break
+		}
+		if m.OwnsAuth(selected.ID) {
+			return selected, providerKey, nil
+		}
+		shardTried[selected.ID] = struct{}{}
+		selected = nil
+		providerKey = ""
+	}
+
+	if m.IsSpilloverEnabled() {
+		globalSelected, globalProvider, globalErr := m.scheduler.pickMixed(ctx, providers, model, opts, tried)
+		if globalErr == nil && globalSelected != nil {
+			log.Warnf("cluster: spillover (mixed) — local shard exhausted for providers=%v model=%s, using auth %s",
+				providers, model, globalSelected.ID)
+			return globalSelected, globalProvider, nil
+		}
+		return nil, "", globalErr
+	}
+
+	return selected, providerKey, errPick
+}
+
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
@@ -3036,11 +3184,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if !okExecutor {
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
-	selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-		m.syncScheduler()
-		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-	}
+	selected, errPick := m.pickWithShardFilter(ctx, provider, model, opts, tried)
 	if errPick != nil {
 		return nil, nil, errPick
 	}
@@ -3195,11 +3339,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		m.mu.RUnlock()
 	}
 
-	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
-	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-		m.syncScheduler()
-		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
-	}
+	selected, providerKey, errPick := m.pickMixedWithShardFilter(ctx, eligibleProviders, model, opts, tried)
 	if errPick != nil {
 		return nil, nil, "", errPick
 	}

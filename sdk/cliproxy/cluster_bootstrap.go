@@ -153,6 +153,7 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	s.clusterAuthRing = ring
 	s.coreManager.SetAuthRing(ring)
 	s.coreManager.SetAuthShardingEnabled(s.cfg.Cluster.AuthSharding)
+	s.coreManager.SetSpilloverEnabled(s.cfg.Cluster.Spillover)
 
 	ringStaleness := parseDurationOr(s.cfg.Cluster.RingStalenessThreshold, 30*time.Second, "ring-staleness")
 	ringPoll := parseDurationOr(s.cfg.Cluster.RingPollInterval, 30*time.Second, "ring-poll-interval")
