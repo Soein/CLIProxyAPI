@@ -417,6 +417,11 @@ func main() {
 			configFileExists = true
 		}
 	}
+	// Phase 4: CLUSTER_* environment variables override cfg.Cluster fields
+	// so per-replica identity (node-id/endpoint/weight) stays local even
+	// when config.yaml is sourced from a shared PG config_store.
+	config.ApplyClusterEnvOverrides(cfg)
+
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 
