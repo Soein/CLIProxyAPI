@@ -50,3 +50,7 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+
+# Python bytecode caches
+__pycache__/
+*.pyc
