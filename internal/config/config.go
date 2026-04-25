@@ -150,6 +150,11 @@ type Config struct {
 	// LISTEN/NOTIFY subscriber are wired up in sdk/cliproxy/service.go.
 	Cluster ClusterConfig `yaml:"cluster,omitempty" json:"cluster,omitempty"`
 
+	// Usage configures usage-statistics persistence: in-memory only (default),
+	// dual-write to PG (rollout safety), or PG-authoritative (cluster
+	// aggregated, restart-survivable).
+	Usage UsageConfig `yaml:"usage,omitempty" json:"usage,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -224,6 +229,48 @@ type ClusterConfig struct {
 	// cluster_nodes as a safety net in case LISTEN/NOTIFY drops a message.
 	// Parsed as a Go duration; empty/invalid means 30s.
 	RingPollInterval string `yaml:"ring-poll-interval,omitempty" json:"ring-poll-interval,omitempty"`
+}
+
+// UsageConfig governs usage-statistics persistence.
+//
+// Backend selects the storage layer:
+//   - "memory" (default): legacy in-memory RequestStatistics only
+//   - "dual":             writes to memory AND PG; reads from memory (safe rollout)
+//   - "pg":               PG is authoritative; in-memory becomes hot cache only
+//
+// All other fields apply only when Backend != "memory".
+type UsageConfig struct {
+	Backend             string `yaml:"backend,omitempty" json:"backend,omitempty"`
+	FlushInterval       string `yaml:"flush-interval,omitempty" json:"flush-interval,omitempty"`
+	FlushBatchSize      int    `yaml:"flush-batch-size,omitempty" json:"flush-batch-size,omitempty"`
+	EventRetentionDays  int    `yaml:"event-retention-days,omitempty" json:"event-retention-days,omitempty"`
+	RollupRetentionDays int    `yaml:"rollup-retention-days,omitempty" json:"rollup-retention-days,omitempty"`
+	QueryCacheTTL       string `yaml:"query-cache-ttl,omitempty" json:"query-cache-ttl,omitempty"`
+}
+
+// WithDefaults returns a copy with zero-value fields filled with defaults.
+// Callers should always pass cfg.Usage.WithDefaults() rather than the raw
+// struct so that omitted YAML keys behave predictably.
+func (u UsageConfig) WithDefaults() UsageConfig {
+	if u.Backend == "" {
+		u.Backend = "memory"
+	}
+	if u.FlushInterval == "" {
+		u.FlushInterval = "10s"
+	}
+	if u.FlushBatchSize == 0 {
+		u.FlushBatchSize = 1000
+	}
+	if u.EventRetentionDays == 0 {
+		u.EventRetentionDays = 7
+	}
+	if u.RollupRetentionDays == 0 {
+		u.RollupRetentionDays = 90
+	}
+	if u.QueryCacheTTL == "" {
+		u.QueryCacheTTL = "5s"
+	}
+	return u
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
