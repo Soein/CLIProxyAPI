@@ -99,6 +99,49 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 }
 
+// TestDeleteAuthFile_ClusterModeMissingLocalFile covers the bug where a
+// node in cluster mode receives a DELETE for an auth that was uploaded on
+// a different node — the local file therefore doesn't exist, but the
+// authManager (synced via PG NOTIFY) and the token store both have the
+// record. Before the fix, os.Remove ENOENT short-circuited to 404; after
+// the fix the handler falls through to the PG-layer delete.
+func TestDeleteAuthFile_ClusterModeMissingLocalFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "codex-cluster@example.com-plus.json"
+	// IMPORTANT: do NOT create the local file — simulate the "uploaded on
+	// another node" scenario.
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	// memoryAuthStore.Delete on a non-existent ID returns nil — the test
+	// proves the handler reaches PG-layer delete despite ENOENT, which is
+	// the cluster-mode invariant.
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on cluster-mode delete (file missing locally), got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

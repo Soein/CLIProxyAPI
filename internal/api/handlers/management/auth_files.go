@@ -901,7 +901,8 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 
 	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	targetID := ""
-	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
+	targetAuth := h.findAuthForDelete(name)
+	if targetAuth != nil {
 		targetID = strings.TrimSpace(targetAuth.ID)
 		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
 			targetPath = path
@@ -912,15 +913,32 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 			targetPath = abs
 		}
 	}
+
+	// Cluster mode (PG-backed token store) uploads land on whichever node
+	// served the upload request, but DELETE requests can hit any node via
+	// the load balancer. Tolerate ENOENT here so the request can still
+	// reach the PG-layer delete below — that is the source of truth.
+	fileExisted := true
 	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
+		if !os.IsNotExist(errRemove) {
+			return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
+		}
+		fileExisted = false
+	}
+
+	// Always run the PG delete; in cluster mode it is the cross-node truth.
+	// store.Delete on a non-existent row returns nil, so this is safe even
+	// when fileExisted == true and the prior os.Remove already triggered
+	// the watcher's own cleanup.
+	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+		// Genuine 404 only when none of the layers (file / authManager /
+		// token store) had the record.
+		if !fileExisted && targetAuth == nil {
 			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
 		}
-		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
-	}
-	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
+
 	if targetID != "" {
 		h.disableAuth(ctx, targetID)
 	} else {
