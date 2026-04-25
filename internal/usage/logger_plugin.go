@@ -380,23 +380,12 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.tokensByHour[hourKey] += totalTokens
 }
 
+// dedupKey returns the legacy string form. Kept for in-memory MergeSnapshot
+// (used as a map key). New code (PG persistence) should call DedupHash to
+// get the SHA-256 bytes used by the unique index uq_usage_events_dedup. Both
+// helpers share dedupSourceString so they stay byte-equivalent.
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
-	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
-	tokens := normaliseTokenStats(detail.Tokens)
-	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
-		apiName,
-		modelName,
-		timestamp,
-		detail.Source,
-		detail.AuthIndex,
-		detail.Failed,
-		tokens.InputTokens,
-		tokens.OutputTokens,
-		tokens.ReasoningTokens,
-		tokens.CachedTokens,
-		tokens.TotalTokens,
-	)
+	return dedupSourceString(apiName, modelName, detail)
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
