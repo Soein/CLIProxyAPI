@@ -307,6 +307,83 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`); err != nil {
 		return fmt.Errorf("postgres store: create trg_cpa_instance_changed: %w", err)
 	}
+
+	// usage_events: raw per-request rows. Drives the detail panel and
+	// /usage/export when usage.backend=pg. Pruned by the leader-gated cleanup
+	// goroutine to UsageConfig.EventRetentionDays (default 7d).
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS usage_events (
+			id               BIGSERIAL PRIMARY KEY,
+			occurred_at      TIMESTAMPTZ NOT NULL,
+			node_id          TEXT NOT NULL,
+			api_key          TEXT NOT NULL,
+			provider         TEXT NOT NULL DEFAULT '',
+			model            TEXT NOT NULL DEFAULT 'unknown',
+			source           TEXT NOT NULL DEFAULT '',
+			auth_id          TEXT NOT NULL DEFAULT '',
+			auth_index       TEXT NOT NULL DEFAULT '',
+			auth_type        TEXT NOT NULL DEFAULT '',
+			failed           BOOLEAN NOT NULL,
+			latency_ms       BIGINT NOT NULL DEFAULT 0,
+			input_tokens     BIGINT NOT NULL DEFAULT 0,
+			output_tokens    BIGINT NOT NULL DEFAULT 0,
+			reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+			cached_tokens    BIGINT NOT NULL DEFAULT 0,
+			total_tokens     BIGINT NOT NULL DEFAULT 0,
+			dedup_hash       BYTEA NOT NULL,
+			inserted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`); err != nil {
+		return fmt.Errorf("postgres store: create usage_events: %w", err)
+	}
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_usage_events_occurred_at ON usage_events(occurred_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_events_api_model   ON usage_events(api_key, model, occurred_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_events_node        ON usage_events(node_id, occurred_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_events_source      ON usage_events(source, occurred_at DESC)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_events_dedup ON usage_events(dedup_hash)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("postgres store: create usage_events index: %w", err)
+		}
+	}
+
+	// usage_minute_rollup: per-(minute, node, api, model). Drives the totals,
+	// trend, sparkline, service-health-grid, and breakdown queries powering
+	// the management UI. PK avoids cross-node UPSERT contention because each
+	// node only writes its own node_id rows; cluster aggregation is a SUM at
+	// read time.
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS usage_minute_rollup (
+			bucket_start     TIMESTAMPTZ NOT NULL,
+			node_id          TEXT NOT NULL,
+			api_key          TEXT NOT NULL,
+			model            TEXT NOT NULL,
+			request_count    BIGINT NOT NULL DEFAULT 0,
+			success_count    BIGINT NOT NULL DEFAULT 0,
+			failure_count    BIGINT NOT NULL DEFAULT 0,
+			input_tokens     BIGINT NOT NULL DEFAULT 0,
+			output_tokens    BIGINT NOT NULL DEFAULT 0,
+			reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+			cached_tokens    BIGINT NOT NULL DEFAULT 0,
+			total_tokens     BIGINT NOT NULL DEFAULT 0,
+			latency_ms_sum   BIGINT NOT NULL DEFAULT 0,
+			updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (bucket_start, node_id, api_key, model)
+		)
+	`); err != nil {
+		return fmt.Errorf("postgres store: create usage_minute_rollup: %w", err)
+	}
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_usage_rollup_bucket ON usage_minute_rollup(bucket_start DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_rollup_api    ON usage_minute_rollup(api_key, bucket_start DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_rollup_model  ON usage_minute_rollup(model, bucket_start DESC)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("postgres store: create usage_rollup index: %w", err)
+		}
+	}
+
 	return nil
 }
 
