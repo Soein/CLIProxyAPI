@@ -109,3 +109,35 @@ func TestApplyClusterEnvOverrides_EmptyStringApplied(t *testing.T) {
 		t.Errorf("empty env should be applied, got %q", cfg.Cluster.NodeID)
 	}
 }
+
+func TestApplyUsageEnvOverrides_AllFields(t *testing.T) {
+	t.Setenv("USAGE_BACKEND", "dual")
+	t.Setenv("USAGE_FLUSH_INTERVAL", "5s")
+
+	cfg := &Config{}
+	ApplyUsageEnvOverrides(cfg)
+
+	if cfg.Usage.Backend != "dual" {
+		t.Errorf("Backend=%q want dual", cfg.Usage.Backend)
+	}
+	if cfg.Usage.FlushInterval != "5s" {
+		t.Errorf("FlushInterval=%q want 5s", cfg.Usage.FlushInterval)
+	}
+}
+
+func TestApplyUsageEnvOverrides_NilCfgSafe(t *testing.T) {
+	ApplyUsageEnvOverrides(nil) // must not panic
+}
+
+func TestApplyUsageEnvOverrides_PreservesWhenAbsent(t *testing.T) {
+	cfg := &Config{}
+	cfg.Usage.Backend = "pg"
+	cfg.Usage.FlushInterval = "30s"
+	ApplyUsageEnvOverrides(cfg)
+	if cfg.Usage.Backend != "pg" {
+		t.Errorf("Backend was clobbered: %q", cfg.Usage.Backend)
+	}
+	if cfg.Usage.FlushInterval != "30s" {
+		t.Errorf("FlushInterval was clobbered: %q", cfg.Usage.FlushInterval)
+	}
+}

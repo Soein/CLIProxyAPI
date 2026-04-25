@@ -421,6 +421,9 @@ func main() {
 	// so per-replica identity (node-id/endpoint/weight) stays local even
 	// when config.yaml is sourced from a shared PG config_store.
 	config.ApplyClusterEnvOverrides(cfg)
+	// USAGE_* environment variables override cfg.Usage so each node can
+	// independently enable PG-backed stats during staged rollout.
+	config.ApplyUsageEnvOverrides(cfg)
 
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)

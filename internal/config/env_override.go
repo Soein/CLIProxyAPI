@@ -51,6 +51,25 @@ func ApplyClusterEnvOverrides(cfg *Config) {
 	applyString("CLUSTER_RING_POLL", &cfg.Cluster.RingPollInterval)
 }
 
+// ApplyUsageEnvOverrides merges USAGE_* environment variables into
+// cfg.Usage, taking precedence over any value loaded from config.yaml.
+// Same motivation as ApplyClusterEnvOverrides: when PG-backed config
+// store ships a single shared YAML, per-replica usage knobs must come
+// from env to allow staged rollout (one node on dual, three on memory,
+// etc.).
+//
+// Environment variables (all optional):
+//
+//	USAGE_BACKEND        string  ("memory" | "dual" | "pg")
+//	USAGE_FLUSH_INTERVAL duration string (e.g. "10s")
+func ApplyUsageEnvOverrides(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	applyString("USAGE_BACKEND", &cfg.Usage.Backend)
+	applyString("USAGE_FLUSH_INTERVAL", &cfg.Usage.FlushInterval)
+}
+
 func applyString(env string, dst *string) {
 	if v, ok := os.LookupEnv(env); ok {
 		*dst = v
