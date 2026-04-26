@@ -270,10 +270,19 @@ func (s *PGStore) QueryClusterTotals(ctx context.Context, from, to time.Time) (C
 
 // TrendPoint is one bucket on the requests/tokens trend chart. Granularity
 // is parameterised by the caller (date_trunc('hour'|'day', bucket_start)).
+//
+// InputTokens/OutputTokens/CachedTokens/ReasoningTokens flow through so
+// the front-end TokenBreakdownChart can stack 4 categories per bucket
+// in PG mode (without these the chart would have no data because PG
+// payload's details[] is empty).
 type TrendPoint struct {
-	Bucket   time.Time `json:"bucket"`
-	Requests int64     `json:"requests"`
-	Tokens   int64     `json:"tokens"`
+	Bucket          time.Time `json:"bucket"`
+	Requests        int64     `json:"requests"`
+	Tokens          int64     `json:"tokens"`
+	InputTokens     int64     `json:"input_tokens"`
+	OutputTokens    int64     `json:"output_tokens"`
+	CachedTokens    int64     `json:"cached_tokens"`
+	ReasoningTokens int64     `json:"reasoning_tokens"`
 }
 
 // QueryClusterTrend returns one TrendPoint per bucket in [from, to). The
@@ -287,7 +296,11 @@ func (s *PGStore) QueryClusterTrend(ctx context.Context, from, to time.Time, gra
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT date_trunc('%s', bucket_start) AS bucket,
 		       COALESCE(SUM(request_count),0),
-		       COALESCE(SUM(total_tokens),0)
+		       COALESCE(SUM(total_tokens),0),
+		       COALESCE(SUM(input_tokens),0),
+		       COALESCE(SUM(output_tokens),0),
+		       COALESCE(SUM(cached_tokens),0),
+		       COALESCE(SUM(reasoning_tokens),0)
 		FROM usage_minute_rollup
 		WHERE bucket_start >= $1 AND bucket_start < $2
 		GROUP BY bucket
@@ -299,7 +312,8 @@ func (s *PGStore) QueryClusterTrend(ctx context.Context, from, to time.Time, gra
 	var out []TrendPoint
 	for rows.Next() {
 		var p TrendPoint
-		if err := rows.Scan(&p.Bucket, &p.Requests, &p.Tokens); err != nil {
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.Tokens,
+			&p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.ReasoningTokens); err != nil {
 			return nil, fmt.Errorf("usage QueryClusterTrend scan: %w", err)
 		}
 		out = append(out, p)
