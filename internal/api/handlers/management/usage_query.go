@@ -109,11 +109,15 @@ func buildLegacyAPIs(breakdown []usage.APIBreakdown, details []usage.UsageEventR
 		api.SuccessCount += b.SuccessCount
 		api.FailureCount += b.FailureCount
 		api.TotalTokens += b.Tokens
+		api.LatencyMsSum += b.LatencyMsSum
+		api.LatencySamples += b.LatencySamples
 		model := api.Models[b.Model]
 		model.TotalRequests += b.Requests
 		model.SuccessCount += b.SuccessCount
 		model.FailureCount += b.FailureCount
 		model.TotalTokens += b.Tokens
+		model.LatencyMsSum += b.LatencyMsSum
+		model.LatencySamples += b.LatencySamples
 		api.Models[b.Model] = model
 		apis[b.APIKey] = api
 	}

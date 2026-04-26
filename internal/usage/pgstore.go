@@ -325,13 +325,17 @@ func (s *PGStore) QueryClusterTrend(ctx context.Context, from, to time.Time, gra
 // SuccessCount/FailureCount are needed because the legacy frontend
 // derives them from the (now-empty in PG mode) details[] array — without
 // them, ApiDetailsCard / ModelStatsCard would show 0/0 for every row.
+// LatencyMsSum / LatencySamples lets the frontend compute avg latency
+// per (api, model) without having to lazy-load details.
 type APIBreakdown struct {
-	APIKey       string `json:"api_key"`
-	Model        string `json:"model"`
-	Requests     int64  `json:"requests"`
-	SuccessCount int64  `json:"success_count"`
-	FailureCount int64  `json:"failure_count"`
-	Tokens       int64  `json:"tokens"`
+	APIKey         string `json:"api_key"`
+	Model          string `json:"model"`
+	Requests       int64  `json:"requests"`
+	SuccessCount   int64  `json:"success_count"`
+	FailureCount   int64  `json:"failure_count"`
+	Tokens         int64  `json:"tokens"`
+	LatencyMsSum   int64  `json:"latency_ms_sum"`
+	LatencySamples int64  `json:"latency_samples"` // = Requests; named separately so frontend can compute avg = sum/samples
 }
 
 // QueryAPIBreakdown returns the top-200 (api,model) pairs ordered by total
@@ -343,7 +347,8 @@ func (s *PGStore) QueryAPIBreakdown(ctx context.Context, from, to time.Time) ([]
 		       COALESCE(SUM(request_count),0),
 		       COALESCE(SUM(success_count),0),
 		       COALESCE(SUM(failure_count),0),
-		       COALESCE(SUM(total_tokens),0)
+		       COALESCE(SUM(total_tokens),0),
+		       COALESCE(SUM(latency_ms_sum),0)
 		FROM usage_minute_rollup
 		WHERE bucket_start >= $1 AND bucket_start < $2
 		GROUP BY api_key, model
@@ -357,9 +362,12 @@ func (s *PGStore) QueryAPIBreakdown(ctx context.Context, from, to time.Time) ([]
 	for rows.Next() {
 		var a APIBreakdown
 		if err := rows.Scan(&a.APIKey, &a.Model, &a.Requests,
-			&a.SuccessCount, &a.FailureCount, &a.Tokens); err != nil {
+			&a.SuccessCount, &a.FailureCount, &a.Tokens, &a.LatencyMsSum); err != nil {
 			return nil, fmt.Errorf("usage QueryAPIBreakdown scan: %w", err)
 		}
+		// LatencySamples mirrors Requests so frontend has explicit
+		// denominator field (avoids mistaken / by 0 if Requests is 0).
+		a.LatencySamples = a.Requests
 		out = append(out, a)
 	}
 	return out, rows.Err()

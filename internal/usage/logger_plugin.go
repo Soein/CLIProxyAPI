@@ -128,21 +128,30 @@ type StatisticsSnapshot struct {
 // QueryAPIBreakdown's success_count/failure_count rollup columns) so the
 // frontend's existing `hasExplicitCounts` branch in getApiStats sees a
 // consistent shape regardless of backend.
+//
+// LatencyMsSum/LatencySamples expose the two values frontend needs to
+// compute avg latency per API without having to iterate details[]. In
+// memory mode both are derived from Details on Snapshot(); in PG mode
+// pulled from cluster.api_breakdown.
 type APISnapshot struct {
-	TotalRequests int64                    `json:"total_requests"`
-	SuccessCount  int64                    `json:"success_count"`
-	FailureCount  int64                    `json:"failure_count"`
-	TotalTokens   int64                    `json:"total_tokens"`
-	Models        map[string]ModelSnapshot `json:"models"`
+	TotalRequests  int64                    `json:"total_requests"`
+	SuccessCount   int64                    `json:"success_count"`
+	FailureCount   int64                    `json:"failure_count"`
+	TotalTokens    int64                    `json:"total_tokens"`
+	LatencyMsSum   int64                    `json:"latency_ms_sum,omitempty"`
+	LatencySamples int64                    `json:"latency_samples,omitempty"`
+	Models         map[string]ModelSnapshot `json:"models"`
 }
 
 // ModelSnapshot summarises metrics for a specific model.
 type ModelSnapshot struct {
-	TotalRequests int64           `json:"total_requests"`
-	SuccessCount  int64           `json:"success_count"`
-	FailureCount  int64           `json:"failure_count"`
-	TotalTokens   int64           `json:"total_tokens"`
-	Details       []RequestDetail `json:"details"`
+	TotalRequests  int64           `json:"total_requests"`
+	SuccessCount   int64           `json:"success_count"`
+	FailureCount   int64           `json:"failure_count"`
+	TotalTokens    int64           `json:"total_tokens"`
+	LatencyMsSum   int64           `json:"latency_ms_sum,omitempty"`
+	LatencySamples int64           `json:"latency_samples,omitempty"`
+	Details        []RequestDetail `json:"details"`
 }
 
 var defaultRequestStatistics = NewRequestStatistics()
@@ -257,33 +266,44 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			TotalTokens:   stats.TotalTokens,
 			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
 		}
-		var apiSucc, apiFail int64
+		var apiSucc, apiFail, apiLatencySum, apiLatencySamples int64
 		for modelName, modelStatsValue := range stats.Models {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
 			copy(requestDetails, modelStatsValue.Details)
-			// Derive per-model success/failure from Details so PG-mode
-			// and memory-mode payloads share the same shape (frontend
-			// `hasExplicitCounts` branch picks them up uniformly).
-			var mSucc, mFail int64
+			// Derive per-model success/failure/latency from Details so
+			// PG-mode and memory-mode payloads share the same shape
+			// (frontend `hasExplicitCounts` branch picks them up
+			// uniformly without having to iterate details[]).
+			var mSucc, mFail, mLatencySum, mLatencySamples int64
 			for _, d := range requestDetails {
 				if d.Failed {
 					mFail++
 				} else {
 					mSucc++
 				}
+				if d.LatencyMs > 0 {
+					mLatencySum += d.LatencyMs
+					mLatencySamples++
+				}
 			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
-				TotalRequests: modelStatsValue.TotalRequests,
-				SuccessCount:  mSucc,
-				FailureCount:  mFail,
-				TotalTokens:   modelStatsValue.TotalTokens,
-				Details:       requestDetails,
+				TotalRequests:  modelStatsValue.TotalRequests,
+				SuccessCount:   mSucc,
+				FailureCount:   mFail,
+				TotalTokens:    modelStatsValue.TotalTokens,
+				LatencyMsSum:   mLatencySum,
+				LatencySamples: mLatencySamples,
+				Details:        requestDetails,
 			}
 			apiSucc += mSucc
 			apiFail += mFail
+			apiLatencySum += mLatencySum
+			apiLatencySamples += mLatencySamples
 		}
 		apiSnapshot.SuccessCount = apiSucc
 		apiSnapshot.FailureCount = apiFail
+		apiSnapshot.LatencyMsSum = apiLatencySum
+		apiSnapshot.LatencySamples = apiLatencySamples
 		result.APIs[apiName] = apiSnapshot
 	}
 
