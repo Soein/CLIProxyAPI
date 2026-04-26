@@ -148,6 +148,8 @@ func (h *Handler) serveClusterUsage(c *gin.Context) {
 			"success_count":    totals.SuccessCount,
 			"failure_count":    totals.FailureCount,
 			"total_tokens":     totals.TotalTokens,
+			"cached_tokens":    totals.CachedTokens,
+			"reasoning_tokens": totals.ReasoningTokens,
 			"apis":             buildLegacyAPIs(apiBreakdown, details),
 			"requests_by_day":  buildSeriesByDay(trend, "requests"),
 			"requests_by_hour": buildSeriesByHour(trend, "requests"),
@@ -265,6 +267,9 @@ func (h *Handler) exportFromPG(c *gin.Context) {
 		SuccessCount:   totals.SuccessCount,
 		FailureCount:   totals.FailureCount,
 		TotalTokens:    totals.TotalTokens,
+		// (cached/reasoning tokens are not in the legacy snapshot top-level
+		// shape — they live inside per-detail Tokens. The cluster.* block
+		// carries the cluster sums directly.)
 		APIs:           buildLegacyAPIs(apiBreakdown, events),
 		RequestsByDay:  buildSeriesByDay(trend, "requests"),
 		RequestsByHour: buildSeriesByHour(trend, "requests"),

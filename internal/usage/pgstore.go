@@ -231,12 +231,18 @@ func (s *PGStore) CleanupRollups(ctx context.Context, olderThan time.Time) (int6
 // =============================================================================
 
 // ClusterTotals is the cluster-wide rollup of the requested range.
+// CachedTokens/ReasoningTokens flow through so the StatCards "缓存
+// Tokens / 思考 Tokens" cells in PG mode show real numbers (not 0)
+// — without these, frontend would have to dig into details[] which is
+// empty in default PG payload.
 type ClusterTotals struct {
-	TotalRequests int64
-	SuccessCount  int64
-	FailureCount  int64
-	TotalTokens   int64
-	LatencyMsSum  int64
+	TotalRequests   int64
+	SuccessCount    int64
+	FailureCount    int64
+	TotalTokens     int64
+	CachedTokens    int64
+	ReasoningTokens int64
+	LatencyMsSum    int64
 }
 
 // QueryClusterTotals sums all rollup rows in [from, to). Returns zeros (no
@@ -248,12 +254,14 @@ func (s *PGStore) QueryClusterTotals(ctx context.Context, from, to time.Time) (C
 		       COALESCE(SUM(success_count),0),
 		       COALESCE(SUM(failure_count),0),
 		       COALESCE(SUM(total_tokens),0),
+		       COALESCE(SUM(cached_tokens),0),
+		       COALESCE(SUM(reasoning_tokens),0),
 		       COALESCE(SUM(latency_ms_sum),0)
 		FROM usage_minute_rollup
 		WHERE bucket_start >= $1 AND bucket_start < $2`,
 		from.UTC(), to.UTC()).
 		Scan(&t.TotalRequests, &t.SuccessCount, &t.FailureCount,
-			&t.TotalTokens, &t.LatencyMsSum)
+			&t.TotalTokens, &t.CachedTokens, &t.ReasoningTokens, &t.LatencyMsSum)
 	if err != nil {
 		return ClusterTotals{}, fmt.Errorf("usage QueryClusterTotals: %w", err)
 	}
