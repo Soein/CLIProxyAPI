@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
@@ -277,6 +278,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	// PG-backed usage stats: when usage.backend != "memory" and the auth
+	// store is Postgres-backed, expose its connection pool to the
+	// management handler so /usage can issue cluster-aggregated queries.
+	if backend := strings.ToLower(strings.TrimSpace(cfg.Usage.Backend)); backend == "dual" || backend == "pg" {
+		if authManager != nil {
+			if store := authManager.GetStore(); store != nil {
+				if pg, ok := store.(interface{ DB() *sql.DB }); ok && pg.DB() != nil {
+					s.mgmt.SetPGUsage(usage.NewPGStore(pg.DB()))
+				}
+			}
+		}
+	}
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}

@@ -44,6 +44,11 @@ type Handler struct {
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
+	// pgUsage / usageQueryCache are wired in Sprint 1.4 but only consumed
+	// in Sprint 2 (the cluster-aggregated /usage read path). They are
+	// intentionally dead in Sprint 1; do not remove.
+	pgUsage             *usage.PGStore   // nil when usage.backend=memory
+	usageQueryCache     *usageQueryCache // 5s TTL for /usage cluster queries
 	tokenStore          coreauth.Store
 	localPassword       string
 	allowRemoteOverride bool
@@ -65,6 +70,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
 		usageStats:          usage.GetRequestStatistics(),
+		usageQueryCache:     newUsageQueryCache(),
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
@@ -130,6 +136,12 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+
+// SetPGUsage attaches the PG-backed usage store. nil disables PG-aware
+// reads (the handler falls back to the in-memory snapshot regardless of
+// cfg.Usage.Backend). Should be called once at server bootstrap when
+// usage.backend != "memory".
+func (h *Handler) SetPGUsage(s *usage.PGStore) { h.pgUsage = s }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
