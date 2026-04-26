@@ -222,6 +222,24 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 		s.usageSink = usageSink
 	}
 
+	// Leader-gated TTL cleanup. Spawned even on followers — the cleanup
+	// loop ticks everywhere but only the leader's tick performs the
+	// actual DELETE. This avoids a special-case "is this the leader?"
+	// at bootstrap when leadership can change later. Cheap when idle
+	// (one ticker + a leader gate check per hour).
+	if uc.Backend != "memory" {
+		cleanup := &internalusage.Cleanup{
+			Store:         internalusage.NewPGStore(db),
+			IsLeader:      func() bool { return s.coreManager.IsLeader() },
+			EventTTLDays:  uc.EventRetentionDays,
+			RollupTTLDays: uc.RollupRetentionDays,
+			Interval:      time.Hour,
+		}
+		go cleanup.Run(clusterCtx)
+		log.Infof("usage cleanup: leader-gated, interval=1h event_ttl=%dd rollup_ttl=%dd",
+			uc.EventRetentionDays, uc.RollupRetentionDays)
+	}
+
 	log.WithFields(log.Fields{
 		"node_id":         nodeID,
 		"region":          s.cfg.Cluster.Region,
