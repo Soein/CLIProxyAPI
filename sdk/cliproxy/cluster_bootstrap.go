@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/cluster"
 	log "github.com/sirupsen/logrus"
 )
@@ -202,6 +203,25 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	}
 	go subscriber.Run(clusterCtx)
 
+	// PG-backed usage statistics sink. Skipped when usage.backend=memory
+	// (the default). The sink registers as a coreusage.Plugin alongside
+	// the existing in-memory LoggerPlugin so writes go to both during
+	// rollout (mode=dual) before the read path flips to PG.
+	uc := s.cfg.Usage.WithDefaults()
+	if usageSink, errSink := internalusage.AttachPGSink(
+		clusterCtx, db, nodeID, uc.Backend,
+		internalusage.PGSinkOptions{
+			BatchSize:        uc.FlushBatchSize,
+			FlushInterval:    internalusage.ParseFlushInterval(uc.FlushInterval),
+			MaxBufferEvents:  50000,
+			MaxBufferRollups: 10000,
+		},
+	); errSink != nil {
+		log.Errorf("usage: AttachPGSink failed: %v", errSink)
+	} else if usageSink != nil {
+		s.usageSink = usageSink
+	}
+
 	log.WithFields(log.Fields{
 		"node_id":         nodeID,
 		"region":          s.cfg.Cluster.Region,
@@ -209,6 +229,7 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 		"auth_sharding":   s.cfg.Cluster.AuthSharding,
 		"ring_staleness":  ringStaleness,
 		"ring_poll":       ringPoll,
+		"usage_backend":   uc.Backend,
 	}).Info("cluster mode enabled")
 	return nil
 }

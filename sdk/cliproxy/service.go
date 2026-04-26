@@ -18,7 +18,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
-	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -114,6 +114,10 @@ type Service struct {
 	// It is kept on Service so admin endpoints and tests can inspect
 	// current membership. nil when cluster mode is disabled.
 	clusterAuthRing *cluster.AuthRing
+
+	// usageSink is the PG-backed usage statistics plugin (cluster mode +
+	// usage.backend != "memory"). nil when disabled. Drained on Shutdown.
+	usageSink *internalusage.PGSink
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -828,6 +832,18 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			if err := s.clusterRegistrar.Drain(drainCtx); err != nil {
 				log.WithError(err).Warn("cluster: drain notification failed; front-door will wait for staleness threshold")
 			}
+			cancel()
+		}
+		// Drain usage PG sink BEFORE clusterCancel — the sink's flushLoop
+		// runs with clusterCtx, so cancelling the cluster context first
+		// would make the final FlushBatch fail with context.Canceled and
+		// silently lose the last buffer window. Defense-in-depth: the sink
+		// also uses context.Background() for the close-path flush (see
+		// pgsink.go flushLoop), so even an out-of-order shutdown still
+		// drains, but the natural order keeps the contract obvious.
+		if s.usageSink != nil {
+			drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			s.usageSink.Stop(drainCtx)
 			cancel()
 		}
 		if s.clusterCancel != nil {
