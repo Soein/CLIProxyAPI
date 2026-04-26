@@ -160,6 +160,30 @@ routing:
 #   ring-staleness: "30s"      # treat cluster_nodes row older than this as dead
 #   ring-poll-interval: "30s"  # safety-net re-query in case NOTIFY drops
 
+# PG-backed cluster usage statistics. By default usage stats live in
+# per-node memory (memory mode), so /v0/management/usage shows only the
+# replica that received the request — fine for single-node, wrong for HA.
+#
+# Modes:
+#   memory  default; per-node memory only (read=memory, no PG)
+#   dual    write to BOTH memory AND PG, read=memory (rollout-warmup)
+#   pg      write to PG, read PG-aggregated cluster totals (cutover)
+#
+# Recommended cutover: deploy schema → flip canary to dual (verify rollup
+# rows look right) → roll dual to all replicas → flip canary to pg → roll
+# pg to all replicas. The schema is created by EnsureSchema on bootstrap.
+#
+# Usage tables auto-prune on the leader: events older than
+# event-retention-days and rollups older than rollup-retention-days are
+# DELETEd hourly. Adjust based on traffic + disk budget.
+# usage:
+#   backend: memory             # memory | dual | pg
+#   flush-interval: 10s         # PGSink batch tick
+#   flush-batch-size: 1000      # events/rollups that trigger immediate flush
+#   event-retention-days: 7     # raw usage_events TTL
+#   rollup-retention-days: 90   # usage_minute_rollup TTL
+#   query-cache-ttl: 5s         # /usage payload cache (absorbs refresh storms)
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
 
