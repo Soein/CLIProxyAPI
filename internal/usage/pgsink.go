@@ -199,6 +199,13 @@ func (s *PGSink) flushLoop(ctx context.Context) {
 			case <-tickerDone:
 				return
 			case <-ctx.Done():
+				// Wake the flusher so its predicate (ctx.Err()!=nil)
+				// can re-evaluate and exit; otherwise it sleeps in
+				// cond.Wait forever after the parent context dies
+				// without an explicit Stop() call.
+				s.mu.Lock()
+				s.cond.Broadcast()
+				s.mu.Unlock()
 				return
 			}
 		}
@@ -232,7 +239,20 @@ func (s *PGSink) flushLoop(ctx context.Context) {
 		}
 
 		if len(events) > 0 || len(deltas) > 0 {
-			if err := s.store.FlushBatch(ctx, events, deltas); err != nil {
+			// On the close path the parent ctx (typically clusterCtx)
+			// may already be cancelled. Use a fresh background ctx with
+			// a 5s deadline so the final drain still lands in PG even
+			// when shutdown is racy.
+			flushCtx := ctx
+			var flushCancel context.CancelFunc
+			if closed {
+				flushCtx, flushCancel = context.WithTimeout(context.Background(), 5*time.Second)
+			}
+			err := s.store.FlushBatch(flushCtx, events, deltas)
+			if flushCancel != nil {
+				flushCancel()
+			}
+			if err != nil {
 				log.Warnf("usage PGSink: flush failed (will retry); events=%d rollups=%d: %v",
 					len(events), len(deltas), err)
 				// Re-prepend with cap-aware eviction.
@@ -257,8 +277,8 @@ func (s *PGSink) flushLoop(ctx context.Context) {
 								break
 							}
 						}
-						copy := *d
-						s.rollup[k] = &copy
+						fresh := *d
+						s.rollup[k] = &fresh
 					}
 				}
 				s.mu.Unlock()

@@ -60,14 +60,18 @@ func ApplyClusterEnvOverrides(cfg *Config) {
 //
 // Environment variables (all optional):
 //
-//	USAGE_BACKEND        string  ("memory" | "dual" | "pg")
-//	USAGE_FLUSH_INTERVAL duration string (e.g. "10s")
+//	USAGE_BACKEND          string ("memory" | "dual" | "pg")
+//	USAGE_FLUSH_INTERVAL   duration string (e.g. "10s")
+//	USAGE_FLUSH_BATCH_SIZE int    (events/rollups that trigger an
+//	                                immediate flush; falls back to default
+//	                                when invalid)
 func ApplyUsageEnvOverrides(cfg *Config) {
 	if cfg == nil {
 		return
 	}
 	applyString("USAGE_BACKEND", &cfg.Usage.Backend)
 	applyString("USAGE_FLUSH_INTERVAL", &cfg.Usage.FlushInterval)
+	applyInt("USAGE_FLUSH_BATCH_SIZE", &cfg.Usage.FlushBatchSize)
 }
 
 func applyString(env string, dst *string) {
