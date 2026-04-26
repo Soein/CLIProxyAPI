@@ -227,3 +227,389 @@ func cleanupTestRollup(ctx context.Context, db *sql.DB, nodeID string) {
 	_, _ = db.ExecContext(ctx,
 		`DELETE FROM usage_minute_rollup WHERE node_id=$1`, nodeID)
 }
+
+// =============================================================================
+// Sprint 2 read-path tests
+// =============================================================================
+
+func TestPGStore_QueryClusterTotals(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	bucket := time.Now().UTC().Truncate(time.Minute)
+	defer cleanupTestRollup(ctx, db, "qct-n1")
+	defer cleanupTestRollup(ctx, db, "qct-n2")
+
+	seed := []UsageRollupDelta{
+		{UsageRollupKey: UsageRollupKey{BucketStart: bucket, NodeID: "qct-n1", APIKey: "k", Model: "m"},
+			RequestCount: 10, SuccessCount: 9, FailureCount: 1, TotalTokens: 100, LatencyMsSum: 1500},
+		{UsageRollupKey: UsageRollupKey{BucketStart: bucket, NodeID: "qct-n2", APIKey: "k", Model: "m"},
+			RequestCount: 5, SuccessCount: 5, TotalTokens: 50, LatencyMsSum: 500},
+	}
+	if err := s.UpsertRollupBatch(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	tot, err := s.QueryClusterTotals(ctx, bucket.Add(-time.Hour), bucket.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tot.TotalRequests != 15 || tot.TotalTokens != 150 {
+		t.Fatalf("totals: %+v", tot)
+	}
+	if tot.SuccessCount != 14 || tot.FailureCount != 1 {
+		t.Fatalf("counts: %+v", tot)
+	}
+	if tot.LatencyMsSum != 2000 {
+		t.Fatalf("latency: %d", tot.LatencyMsSum)
+	}
+}
+
+func TestPGStore_QueryClusterTrend_HourGranularity(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	defer cleanupTestRollup(ctx, db, "qctrend-n")
+
+	hourStart := time.Now().UTC().Truncate(time.Hour)
+	// 3 minutes inside the same hour — should collapse into 1 trend point.
+	var seed []UsageRollupDelta
+	for i := 0; i < 3; i++ {
+		seed = append(seed, UsageRollupDelta{
+			UsageRollupKey: UsageRollupKey{
+				BucketStart: hourStart.Add(time.Duration(i) * time.Minute),
+				NodeID:      "qctrend-n", APIKey: "k", Model: "m",
+			},
+			RequestCount: int64(i + 1), TotalTokens: int64((i + 1) * 10),
+		})
+	}
+	if err := s.UpsertRollupBatch(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	pts, err := s.QueryClusterTrend(ctx,
+		hourStart.Add(-time.Hour), hourStart.Add(time.Hour), "hour")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, p := range pts {
+		if p.Bucket.Equal(hourStart) {
+			if p.Requests != 6 || p.Tokens != 60 {
+				t.Fatalf("hour trend: req=%d tok=%d, want 6/60", p.Requests, p.Tokens)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("hourStart=%v not in trend %+v", hourStart, pts)
+	}
+}
+
+func TestPGStore_QueryClusterTrend_RejectsInjection(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	// Garbage granularity must NOT cause a SQL error — it should fall
+	// back to "hour" silently. This is the contract the parseUsageRange
+	// upstream relies on.
+	if _, err := s.QueryClusterTrend(ctx,
+		time.Now().UTC().Add(-time.Hour), time.Now().UTC(),
+		"week'); DROP TABLE usage_events; --"); err != nil {
+		t.Fatalf("expected fallback, got error: %v", err)
+	}
+}
+
+func TestPGStore_QueryAPIBreakdown(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	defer cleanupTestRollup(ctx, db, "qapi-n")
+
+	bucket := time.Now().UTC().Truncate(time.Minute)
+	if err := s.UpsertRollupBatch(ctx, []UsageRollupDelta{
+		{UsageRollupKey: UsageRollupKey{BucketStart: bucket, NodeID: "qapi-n", APIKey: "k1", Model: "small"},
+			RequestCount: 5, TotalTokens: 50},
+		{UsageRollupKey: UsageRollupKey{BucketStart: bucket, NodeID: "qapi-n", APIKey: "k2", Model: "big"},
+			RequestCount: 1, TotalTokens: 5000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.QueryAPIBreakdown(ctx, bucket.Add(-time.Hour), bucket.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Filter to our seeded keys (other tests may leave rows around).
+	var ours []APIBreakdown
+	for _, r := range rows {
+		if r.APIKey == "k1" || r.APIKey == "k2" {
+			ours = append(ours, r)
+		}
+	}
+	if len(ours) != 2 {
+		t.Fatalf("expected 2 rows, got %d (%+v)", len(ours), ours)
+	}
+	// Ordered by tokens DESC: k2/big (5000) before k1/small (50).
+	if ours[0].APIKey != "k2" || ours[1].APIKey != "k1" {
+		t.Fatalf("ordering broken: %+v", ours)
+	}
+}
+
+func TestPGStore_QuerySparklineSeries(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	defer cleanupTestRollup(ctx, db, "qspark-n")
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	var seed []UsageRollupDelta
+	for i := 0; i < 60; i++ {
+		seed = append(seed, UsageRollupDelta{
+			UsageRollupKey: UsageRollupKey{
+				BucketStart: now.Add(-time.Duration(i) * time.Minute),
+				NodeID:      "qspark-n", APIKey: "k", Model: "m",
+			},
+			RequestCount: int64(i + 1), TotalTokens: int64((i + 1) * 10),
+		})
+	}
+	if err := s.UpsertRollupBatch(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	pts, err := s.QuerySparklineSeries(ctx, now.Add(-30*time.Minute), now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Filter to our node — but sparkline aggregates across nodes so we
+	// can only check ordering and count.
+	if len(pts) < 30 {
+		t.Fatalf("want >= 30 points (last 30 min), got %d", len(pts))
+	}
+	for i := 1; i < len(pts); i++ {
+		if !pts[i].Bucket.After(pts[i-1].Bucket) {
+			t.Fatalf("sparkline not ordered: %v then %v", pts[i-1].Bucket, pts[i].Bucket)
+		}
+	}
+}
+
+func TestPGStore_QueryServiceHealthGrid(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	defer cleanupTestRollup(ctx, db, "qhealth-n1")
+	defer cleanupTestRollup(ctx, db, "qhealth-n2")
+
+	base := time.Now().UTC().Truncate(time.Hour)
+	if err := s.UpsertRollupBatch(ctx, []UsageRollupDelta{
+		{UsageRollupKey: UsageRollupKey{BucketStart: base, NodeID: "qhealth-n1", APIKey: "k", Model: "m"},
+			RequestCount: 10, SuccessCount: 9, FailureCount: 1},
+		{UsageRollupKey: UsageRollupKey{BucketStart: base.Add(time.Minute), NodeID: "qhealth-n2", APIKey: "k", Model: "m"},
+			RequestCount: 5, SuccessCount: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	grid, err := s.QueryServiceHealthGrid(ctx,
+		base.Add(-time.Hour), base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hit *HealthBucket
+	for i := range grid {
+		if grid[i].HourStart.Equal(base) {
+			hit = &grid[i]
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatalf("base hour %v missing from grid %+v", base, grid)
+	}
+	// Cross-node aggregation: 10 + 5 success = 14? No — n2 has 5 success
+	// but n1 has 9 success + 1 failure (10 req). So success=14, failure=1,
+	// requests=15.
+	if hit.RequestCount != 15 || hit.SuccessCount != 14 || hit.FailureCount != 1 {
+		t.Fatalf("aggregated cell: %+v", *hit)
+	}
+}
+
+func TestPGStore_QueryCredentialBreakdown(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	defer cleanupTestRows(ctx, db, "qcred-n")
+
+	now := time.Now().UTC()
+	rows := []UsageEventRow{
+		{OccurredAt: now, NodeID: "qcred-n", APIKey: "k", Model: "m",
+			Source: "openai", AuthIndex: "0", Failed: false, TotalTokens: 100,
+			DedupHash: DedupHash("k", "m", RequestDetail{Timestamp: now, Source: "openai", AuthIndex: "0",
+				Tokens: TokenStats{TotalTokens: 100}})},
+		{OccurredAt: now.Add(time.Second), NodeID: "qcred-n", APIKey: "k", Model: "m",
+			Source: "openai", AuthIndex: "0", Failed: true, TotalTokens: 0,
+			DedupHash: DedupHash("k", "m", RequestDetail{Timestamp: now.Add(time.Second), Source: "openai", AuthIndex: "0",
+				Tokens: TokenStats{}, Failed: true})},
+		{OccurredAt: now.Add(2 * time.Second), NodeID: "qcred-n", APIKey: "k", Model: "m",
+			Source: "claude", AuthIndex: "0", Failed: false, TotalTokens: 200,
+			DedupHash: DedupHash("k", "m", RequestDetail{Timestamp: now.Add(2 * time.Second), Source: "claude", AuthIndex: "0",
+				Tokens: TokenStats{TotalTokens: 200}})},
+	}
+	if err := s.InsertEventsBatch(ctx, rows); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := s.QueryCredentialBreakdown(ctx, now.Add(-time.Hour), now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var openai, claude *CredentialBreakdown
+	for i := range all {
+		if all[i].AuthIndex != "0" {
+			continue
+		}
+		switch all[i].Source {
+		case "openai":
+			openai = &all[i]
+		case "claude":
+			claude = &all[i]
+		}
+	}
+	if openai == nil || claude == nil {
+		t.Fatalf("missing rows: openai=%v claude=%v all=%+v", openai, claude, all)
+	}
+	// openai: 2 events (1 success + 1 fail), 100 tokens
+	if openai.Requests != 2 || openai.SuccessCount != 1 || openai.FailureCount != 1 || openai.Tokens != 100 {
+		t.Fatalf("openai row: %+v", *openai)
+	}
+	if claude.Requests != 1 || claude.SuccessCount != 1 || claude.FailureCount != 0 || claude.Tokens != 200 {
+		t.Fatalf("claude row: %+v", *claude)
+	}
+}
+
+func TestPGStore_QueryEventDetails_OrderAndFilter(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := NewPGStore(db)
+	if err := s.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	defer cleanupTestRows(ctx, db, "qdet-n")
+
+	t0 := time.Now().UTC().Truncate(time.Second)
+	rows := []UsageEventRow{
+		{OccurredAt: t0.Add(-2 * time.Minute), NodeID: "qdet-n", APIKey: "kA", Model: "m1",
+			Failed: false, TotalTokens: 10,
+			DedupHash: DedupHash("kA", "m1", RequestDetail{Timestamp: t0.Add(-2 * time.Minute), Tokens: TokenStats{TotalTokens: 10}})},
+		{OccurredAt: t0.Add(-1 * time.Minute), NodeID: "qdet-n", APIKey: "kB", Model: "m2",
+			Failed: false, TotalTokens: 20,
+			DedupHash: DedupHash("kB", "m2", RequestDetail{Timestamp: t0.Add(-1 * time.Minute), Tokens: TokenStats{TotalTokens: 20}})},
+		{OccurredAt: t0, NodeID: "qdet-n", APIKey: "kA", Model: "m1",
+			Failed: false, TotalTokens: 30,
+			DedupHash: DedupHash("kA", "m1", RequestDetail{Timestamp: t0, Tokens: TokenStats{TotalTokens: 30}})},
+	}
+	if err := s.InsertEventsBatch(ctx, rows); err != nil {
+		t.Fatal(err)
+	}
+
+	// All rows, newest first.
+	all, err := s.QueryEventDetails(ctx,
+		t0.Add(-time.Hour), t0.Add(time.Hour), 100, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ours []UsageEventRow
+	for _, r := range all {
+		if r.NodeID == "qdet-n" {
+			ours = append(ours, r)
+		}
+	}
+	if len(ours) != 3 {
+		t.Fatalf("want 3 rows, got %d", len(ours))
+	}
+	for i := 1; i < len(ours); i++ {
+		if ours[i].OccurredAt.After(ours[i-1].OccurredAt) {
+			t.Fatalf("not DESC: %v then %v",
+				ours[i-1].OccurredAt, ours[i].OccurredAt)
+		}
+	}
+
+	// Filter by api=kA → 2 rows.
+	filt, err := s.QueryEventDetails(ctx,
+		t0.Add(-time.Hour), t0.Add(time.Hour), 100, 0, "kA", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fOurs int
+	for _, r := range filt {
+		if r.NodeID == "qdet-n" && r.APIKey == "kA" {
+			fOurs++
+		}
+	}
+	if fOurs != 2 {
+		t.Fatalf("api=kA filter: want 2, got %d", fOurs)
+	}
+
+	// Filter by api=kA + model=m1 → 2 rows (both kA rows are m1).
+	filt2, err := s.QueryEventDetails(ctx,
+		t0.Add(-time.Hour), t0.Add(time.Hour), 100, 0, "kA", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f2Ours int
+	for _, r := range filt2 {
+		if r.NodeID == "qdet-n" && r.APIKey == "kA" && r.Model == "m1" {
+			f2Ours++
+		}
+	}
+	if f2Ours != 2 {
+		t.Fatalf("kA+m1 filter: want 2, got %d", f2Ours)
+	}
+
+	// Limit + offset.
+	page1, err := s.QueryEventDetails(ctx,
+		t0.Add(-time.Hour), t0.Add(time.Hour), 1, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page2, err := s.QueryEventDetails(ctx,
+		t0.Add(-time.Hour), t0.Add(time.Hour), 1, 1, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) == 0 || len(page2) == 0 {
+		t.Fatalf("paging returned empty: page1=%d page2=%d", len(page1), len(page2))
+	}
+	if page1[0].DedupHash != nil && page2[0].DedupHash != nil &&
+		string(page1[0].DedupHash) == string(page2[0].DedupHash) {
+		t.Fatalf("offset didn't advance: same row on page1 and page2")
+	}
+}

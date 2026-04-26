@@ -214,6 +214,292 @@ func (s *PGStore) CleanupRollups(ctx context.Context, olderThan time.Time) (int6
 	return res.RowsAffected()
 }
 
+// =============================================================================
+// Read path — cluster-aggregated queries used by /v0/management/usage.
+//
+// Design rules:
+//   - All queries are bounded by (from, to) range to keep them under the
+//     90-day rollup TTL.
+//   - All time params are sent in UTC; PG stores TIMESTAMPTZ but mixing
+//     timezones at the boundary leads to off-by-N-hour bugs when the API
+//     returns 'YYYY-MM-DD' strings to the UI.
+//   - Cluster aggregation (SUM across all node_id) happens in PG, not
+//     server-side, so the wire payload stays tiny even with 4-N nodes.
+//   - LIMIT 200 on breakdown queries keeps the response capped — admin
+//     UI cards never show >50 rows anyway, and 200 leaves headroom for
+//     "show all" toggles before we'd need pagination.
+// =============================================================================
+
+// ClusterTotals is the cluster-wide rollup of the requested range.
+type ClusterTotals struct {
+	TotalRequests int64
+	SuccessCount  int64
+	FailureCount  int64
+	TotalTokens   int64
+	LatencyMsSum  int64
+}
+
+// QueryClusterTotals sums all rollup rows in [from, to). Returns zeros (no
+// error) on empty range — the UI shows "no data" cards in that case.
+func (s *PGStore) QueryClusterTotals(ctx context.Context, from, to time.Time) (ClusterTotals, error) {
+	var t ClusterTotals
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(request_count),0),
+		       COALESCE(SUM(success_count),0),
+		       COALESCE(SUM(failure_count),0),
+		       COALESCE(SUM(total_tokens),0),
+		       COALESCE(SUM(latency_ms_sum),0)
+		FROM usage_minute_rollup
+		WHERE bucket_start >= $1 AND bucket_start < $2`,
+		from.UTC(), to.UTC()).
+		Scan(&t.TotalRequests, &t.SuccessCount, &t.FailureCount,
+			&t.TotalTokens, &t.LatencyMsSum)
+	if err != nil {
+		return ClusterTotals{}, fmt.Errorf("usage QueryClusterTotals: %w", err)
+	}
+	return t, nil
+}
+
+// TrendPoint is one bucket on the requests/tokens trend chart. Granularity
+// is parameterised by the caller (date_trunc('hour'|'day', bucket_start)).
+type TrendPoint struct {
+	Bucket   time.Time `json:"bucket"`
+	Requests int64     `json:"requests"`
+	Tokens   int64     `json:"tokens"`
+}
+
+// QueryClusterTrend returns one TrendPoint per bucket in [from, to). The
+// granularity is restricted to "hour" or "day" — anything else falls back
+// to "hour" so a typo can't smuggle arbitrary SQL into date_trunc.
+func (s *PGStore) QueryClusterTrend(ctx context.Context, from, to time.Time, granularity string) ([]TrendPoint, error) {
+	trunc := "hour"
+	if granularity == "day" {
+		trunc = "day"
+	}
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT date_trunc('%s', bucket_start) AS bucket,
+		       COALESCE(SUM(request_count),0),
+		       COALESCE(SUM(total_tokens),0)
+		FROM usage_minute_rollup
+		WHERE bucket_start >= $1 AND bucket_start < $2
+		GROUP BY bucket
+		ORDER BY bucket`, trunc), from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("usage QueryClusterTrend: %w", err)
+	}
+	defer rows.Close()
+	var out []TrendPoint
+	for rows.Next() {
+		var p TrendPoint
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.Tokens); err != nil {
+			return nil, fmt.Errorf("usage QueryClusterTrend scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// APIBreakdown is one (api_key, model) pair with its summed activity.
+type APIBreakdown struct {
+	APIKey   string `json:"api_key"`
+	Model    string `json:"model"`
+	Requests int64  `json:"requests"`
+	Tokens   int64  `json:"tokens"`
+}
+
+// QueryAPIBreakdown returns the top-200 (api,model) pairs ordered by total
+// tokens — that ordering matches what the ApiDetailsCard / ModelStatsCard
+// already show, so the UI doesn't need to re-sort.
+func (s *PGStore) QueryAPIBreakdown(ctx context.Context, from, to time.Time) ([]APIBreakdown, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT api_key, model,
+		       COALESCE(SUM(request_count),0),
+		       COALESCE(SUM(total_tokens),0)
+		FROM usage_minute_rollup
+		WHERE bucket_start >= $1 AND bucket_start < $2
+		GROUP BY api_key, model
+		ORDER BY SUM(total_tokens) DESC
+		LIMIT 200`, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("usage QueryAPIBreakdown: %w", err)
+	}
+	defer rows.Close()
+	var out []APIBreakdown
+	for rows.Next() {
+		var a APIBreakdown
+		if err := rows.Scan(&a.APIKey, &a.Model, &a.Requests, &a.Tokens); err != nil {
+			return nil, fmt.Errorf("usage QueryAPIBreakdown scan: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// SparklinePoint is a per-minute aggregated bucket (cluster-wide). Used by
+// StatCards which show "last hour activity" mini-charts.
+type SparklinePoint struct {
+	Bucket   time.Time `json:"bucket"`
+	Requests int64     `json:"requests"`
+	Tokens   int64     `json:"tokens"`
+}
+
+// QuerySparklineSeries returns per-minute aggregates without date_trunc —
+// the rollup is already minute-granular so we just GROUP BY bucket_start.
+func (s *PGStore) QuerySparklineSeries(ctx context.Context, from, to time.Time) ([]SparklinePoint, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT bucket_start,
+		       COALESCE(SUM(request_count),0),
+		       COALESCE(SUM(total_tokens),0)
+		FROM usage_minute_rollup
+		WHERE bucket_start >= $1 AND bucket_start < $2
+		GROUP BY bucket_start
+		ORDER BY bucket_start`, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("usage QuerySparklineSeries: %w", err)
+	}
+	defer rows.Close()
+	var out []SparklinePoint
+	for rows.Next() {
+		var p SparklinePoint
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.Tokens); err != nil {
+			return nil, fmt.Errorf("usage QuerySparklineSeries scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// HealthBucket is one hour-cell of the 7×24 service-health grid.
+type HealthBucket struct {
+	HourStart    time.Time `json:"hour_start"`
+	RequestCount int64     `json:"request_count"`
+	SuccessCount int64     `json:"success_count"`
+	FailureCount int64     `json:"failure_count"`
+}
+
+// QueryServiceHealthGrid returns one HealthBucket per hour in [from, to).
+// Empty hours produce no row — the UI draws those as "no traffic" cells.
+func (s *PGStore) QueryServiceHealthGrid(ctx context.Context, from, to time.Time) ([]HealthBucket, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT date_trunc('hour', bucket_start) AS hr,
+		       COALESCE(SUM(request_count),0),
+		       COALESCE(SUM(success_count),0),
+		       COALESCE(SUM(failure_count),0)
+		FROM usage_minute_rollup
+		WHERE bucket_start >= $1 AND bucket_start < $2
+		GROUP BY hr
+		ORDER BY hr`, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("usage QueryServiceHealthGrid: %w", err)
+	}
+	defer rows.Close()
+	var out []HealthBucket
+	for rows.Next() {
+		var b HealthBucket
+		if err := rows.Scan(&b.HourStart, &b.RequestCount, &b.SuccessCount, &b.FailureCount); err != nil {
+			return nil, fmt.Errorf("usage QueryServiceHealthGrid scan: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// CredentialBreakdown is one (source, auth_index) pair. This reads
+// usage_events (raw rows) — NOT the rollup — because rollup PK doesn't
+// carry source/auth_index. Bounded by event TTL (default 7 days), so
+// front-end must request a smaller window for credential queries.
+type CredentialBreakdown struct {
+	Source       string `json:"source"`
+	AuthIndex    string `json:"auth_index"`
+	Requests     int64  `json:"requests"`
+	Tokens       int64  `json:"tokens"`
+	SuccessCount int64  `json:"success_count"`
+	FailureCount int64  `json:"failure_count"`
+}
+
+func (s *PGStore) QueryCredentialBreakdown(ctx context.Context, from, to time.Time) ([]CredentialBreakdown, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT source, auth_index,
+		       COUNT(*),
+		       COALESCE(SUM(total_tokens),0),
+		       SUM(CASE WHEN failed THEN 0 ELSE 1 END),
+		       SUM(CASE WHEN failed THEN 1 ELSE 0 END)
+		FROM usage_events
+		WHERE occurred_at >= $1 AND occurred_at < $2
+		GROUP BY source, auth_index
+		ORDER BY COUNT(*) DESC
+		LIMIT 200`, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("usage QueryCredentialBreakdown: %w", err)
+	}
+	defer rows.Close()
+	var out []CredentialBreakdown
+	for rows.Next() {
+		var b CredentialBreakdown
+		if err := rows.Scan(&b.Source, &b.AuthIndex,
+			&b.Requests, &b.Tokens, &b.SuccessCount, &b.FailureCount); err != nil {
+			return nil, fmt.Errorf("usage QueryCredentialBreakdown scan: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// QueryEventDetails returns raw event rows for the /usage?include=details
+// path. Bounded by limit (caller passes 500 by default) and ordered by
+// occurred_at DESC so the most recent activity is on page 1. apiFilter
+// and modelFilter are exact-match (empty string = no filter).
+func (s *PGStore) QueryEventDetails(ctx context.Context, from, to time.Time, limit, offset int, apiFilter, modelFilter string) ([]UsageEventRow, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	// Build WHERE dynamically — we want the indexed (occurred_at, api_key,
+	// model) prefix to kick in when filters are present, but skip the
+	// extra predicates entirely otherwise.
+	var sb strings.Builder
+	sb.WriteString(`SELECT occurred_at, node_id, api_key, provider, model,
+		source, auth_id, auth_index, auth_type, failed, latency_ms,
+		input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+		total_tokens, dedup_hash
+		FROM usage_events
+		WHERE occurred_at >= $1 AND occurred_at < $2`)
+	args := []any{from.UTC(), to.UTC()}
+	if apiFilter != "" {
+		args = append(args, apiFilter)
+		fmt.Fprintf(&sb, ` AND api_key = $%d`, len(args))
+	}
+	if modelFilter != "" {
+		args = append(args, modelFilter)
+		fmt.Fprintf(&sb, ` AND model = $%d`, len(args))
+	}
+	args = append(args, limit, offset)
+	fmt.Fprintf(&sb, ` ORDER BY occurred_at DESC LIMIT $%d OFFSET $%d`,
+		len(args)-1, len(args))
+
+	rows, err := s.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage QueryEventDetails: %w", err)
+	}
+	defer rows.Close()
+	var out []UsageEventRow
+	for rows.Next() {
+		var r UsageEventRow
+		if err := rows.Scan(
+			&r.OccurredAt, &r.NodeID, &r.APIKey, &r.Provider, &r.Model,
+			&r.Source, &r.AuthID, &r.AuthIndex, &r.AuthType, &r.Failed, &r.LatencyMs,
+			&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens,
+			&r.TotalTokens, &r.DedupHash,
+		); err != nil {
+			return nil, fmt.Errorf("usage QueryEventDetails scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // schemaDDL mirrors the usage-related DDL embedded in
 // postgresstore.EnsureSchema. Used only by PGStore.EnsureSchema for tests
 // that bring up a bare PG. KEEP IN SYNC with postgresstore.go.
