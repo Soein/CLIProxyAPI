@@ -344,10 +344,12 @@ func TestPGStore_QueryAPIBreakdown(t *testing.T) {
 
 	bucket := time.Now().UTC().Truncate(time.Minute)
 	if err := s.UpsertRollupBatch(ctx, []UsageRollupDelta{
+		// k1/small: 5 req, 4 success, 1 failure
 		{UsageRollupKey: UsageRollupKey{BucketStart: bucket, NodeID: "qapi-n", APIKey: "k1", Model: "small"},
-			RequestCount: 5, TotalTokens: 50},
+			RequestCount: 5, SuccessCount: 4, FailureCount: 1, TotalTokens: 50},
+		// k2/big: 1 req, all failed
 		{UsageRollupKey: UsageRollupKey{BucketStart: bucket, NodeID: "qapi-n", APIKey: "k2", Model: "big"},
-			RequestCount: 1, TotalTokens: 5000},
+			RequestCount: 1, SuccessCount: 0, FailureCount: 1, TotalTokens: 5000},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +371,13 @@ func TestPGStore_QueryAPIBreakdown(t *testing.T) {
 	// Ordered by tokens DESC: k2/big (5000) before k1/small (50).
 	if ours[0].APIKey != "k2" || ours[1].APIKey != "k1" {
 		t.Fatalf("ordering broken: %+v", ours)
+	}
+	// Verify the new success/failure columns flow through.
+	if ours[0].SuccessCount != 0 || ours[0].FailureCount != 1 {
+		t.Errorf("k2/big: succ=%d fail=%d; want 0/1", ours[0].SuccessCount, ours[0].FailureCount)
+	}
+	if ours[1].SuccessCount != 4 || ours[1].FailureCount != 1 {
+		t.Errorf("k1/small: succ=%d fail=%d; want 4/1", ours[1].SuccessCount, ours[1].FailureCount)
 	}
 }
 

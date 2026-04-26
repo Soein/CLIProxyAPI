@@ -300,11 +300,16 @@ func (s *PGStore) QueryClusterTrend(ctx context.Context, from, to time.Time, gra
 }
 
 // APIBreakdown is one (api_key, model) pair with its summed activity.
+// SuccessCount/FailureCount are needed because the legacy frontend
+// derives them from the (now-empty in PG mode) details[] array — without
+// them, ApiDetailsCard / ModelStatsCard would show 0/0 for every row.
 type APIBreakdown struct {
-	APIKey   string `json:"api_key"`
-	Model    string `json:"model"`
-	Requests int64  `json:"requests"`
-	Tokens   int64  `json:"tokens"`
+	APIKey       string `json:"api_key"`
+	Model        string `json:"model"`
+	Requests     int64  `json:"requests"`
+	SuccessCount int64  `json:"success_count"`
+	FailureCount int64  `json:"failure_count"`
+	Tokens       int64  `json:"tokens"`
 }
 
 // QueryAPIBreakdown returns the top-200 (api,model) pairs ordered by total
@@ -314,6 +319,8 @@ func (s *PGStore) QueryAPIBreakdown(ctx context.Context, from, to time.Time) ([]
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT api_key, model,
 		       COALESCE(SUM(request_count),0),
+		       COALESCE(SUM(success_count),0),
+		       COALESCE(SUM(failure_count),0),
 		       COALESCE(SUM(total_tokens),0)
 		FROM usage_minute_rollup
 		WHERE bucket_start >= $1 AND bucket_start < $2
@@ -327,7 +334,8 @@ func (s *PGStore) QueryAPIBreakdown(ctx context.Context, from, to time.Time) ([]
 	var out []APIBreakdown
 	for rows.Next() {
 		var a APIBreakdown
-		if err := rows.Scan(&a.APIKey, &a.Model, &a.Requests, &a.Tokens); err != nil {
+		if err := rows.Scan(&a.APIKey, &a.Model, &a.Requests,
+			&a.SuccessCount, &a.FailureCount, &a.Tokens); err != nil {
 			return nil, fmt.Errorf("usage QueryAPIBreakdown scan: %w", err)
 		}
 		out = append(out, a)
@@ -498,6 +506,74 @@ func (s *PGStore) QueryEventDetails(ctx context.Context, from, to time.Time, lim
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// RebuildRollupForRange recomputes usage_minute_rollup from raw
+// usage_events for [from, to). The conflict update uses EXCLUDED.* (not
+// the additive +EXCLUDED form bulkUpsertRollup uses) — this REPLACES
+// the affected rollup rows from raw events, which is the correct
+// semantics for an administrative bulk-import: the source of truth is
+// the imported event stream, not the stale rollup totals.
+//
+// NOT used in the hot path. Imports are one-shot operations.
+func (s *PGStore) RebuildRollupForRange(ctx context.Context, from, to time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		WITH agg AS (
+			SELECT date_trunc('minute', occurred_at) AS bucket,
+			       node_id, api_key, model,
+			       COUNT(*) AS req,
+			       SUM(CASE WHEN failed THEN 0 ELSE 1 END) AS succ,
+			       SUM(CASE WHEN failed THEN 1 ELSE 0 END) AS fail,
+			       COALESCE(SUM(input_tokens),0)     AS itok,
+			       COALESCE(SUM(output_tokens),0)    AS otok,
+			       COALESCE(SUM(reasoning_tokens),0) AS rtok,
+			       COALESCE(SUM(cached_tokens),0)    AS ctok,
+			       COALESCE(SUM(total_tokens),0)    AS ttok,
+			       COALESCE(SUM(latency_ms),0)      AS lat
+			FROM usage_events
+			WHERE occurred_at >= $1 AND occurred_at < $2
+			GROUP BY bucket, node_id, api_key, model
+		)
+		INSERT INTO usage_minute_rollup AS r
+			(bucket_start, node_id, api_key, model,
+			 request_count, success_count, failure_count,
+			 input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+			 total_tokens, latency_ms_sum)
+		SELECT bucket, node_id, api_key, model, req, succ, fail,
+		       itok, otok, rtok, ctok, ttok, lat
+		FROM agg
+		ON CONFLICT (bucket_start, node_id, api_key, model) DO UPDATE SET
+			request_count    = EXCLUDED.request_count,
+			success_count    = EXCLUDED.success_count,
+			failure_count    = EXCLUDED.failure_count,
+			input_tokens     = EXCLUDED.input_tokens,
+			output_tokens    = EXCLUDED.output_tokens,
+			reasoning_tokens = EXCLUDED.reasoning_tokens,
+			cached_tokens    = EXCLUDED.cached_tokens,
+			total_tokens     = EXCLUDED.total_tokens,
+			latency_ms_sum   = EXCLUDED.latency_ms_sum,
+			updated_at       = NOW()`, from.UTC(), to.UTC())
+	if err != nil {
+		return fmt.Errorf("usage RebuildRollupForRange: %w", err)
+	}
+	return nil
+}
+
+// QueryActiveNodeCount returns COUNT(DISTINCT node_id) over rollup rows in
+// [from, to). Reflects who actually contributed traffic in the window —
+// more truthful than counting cluster_nodes membership (a node can be in
+// the ring but idle).
+func (s *PGStore) QueryActiveNodeCount(ctx context.Context, from, to time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT node_id)
+		FROM usage_minute_rollup
+		WHERE bucket_start >= $1 AND bucket_start < $2`,
+		from.UTC(), to.UTC()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("usage QueryActiveNodeCount: %w", err)
+	}
+	return n, nil
 }
 
 // schemaDDL mirrors the usage-related DDL embedded in

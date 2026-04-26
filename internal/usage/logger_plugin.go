@@ -122,8 +122,16 @@ type StatisticsSnapshot struct {
 }
 
 // APISnapshot summarises metrics for a single API key.
+//
+// SuccessCount/FailureCount are populated in BOTH memory and PG modes
+// (memory mode: derived from Details on Snapshot(); PG mode: pulled from
+// QueryAPIBreakdown's success_count/failure_count rollup columns) so the
+// frontend's existing `hasExplicitCounts` branch in getApiStats sees a
+// consistent shape regardless of backend.
 type APISnapshot struct {
 	TotalRequests int64                    `json:"total_requests"`
+	SuccessCount  int64                    `json:"success_count"`
+	FailureCount  int64                    `json:"failure_count"`
 	TotalTokens   int64                    `json:"total_tokens"`
 	Models        map[string]ModelSnapshot `json:"models"`
 }
@@ -131,6 +139,8 @@ type APISnapshot struct {
 // ModelSnapshot summarises metrics for a specific model.
 type ModelSnapshot struct {
 	TotalRequests int64           `json:"total_requests"`
+	SuccessCount  int64           `json:"success_count"`
+	FailureCount  int64           `json:"failure_count"`
 	TotalTokens   int64           `json:"total_tokens"`
 	Details       []RequestDetail `json:"details"`
 }
@@ -247,15 +257,33 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			TotalTokens:   stats.TotalTokens,
 			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
 		}
+		var apiSucc, apiFail int64
 		for modelName, modelStatsValue := range stats.Models {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
 			copy(requestDetails, modelStatsValue.Details)
+			// Derive per-model success/failure from Details so PG-mode
+			// and memory-mode payloads share the same shape (frontend
+			// `hasExplicitCounts` branch picks them up uniformly).
+			var mSucc, mFail int64
+			for _, d := range requestDetails {
+				if d.Failed {
+					mFail++
+				} else {
+					mSucc++
+				}
+			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
+				SuccessCount:  mSucc,
+				FailureCount:  mFail,
 				TotalTokens:   modelStatsValue.TotalTokens,
 				Details:       requestDetails,
 			}
+			apiSucc += mSucc
+			apiFail += mFail
 		}
+		apiSnapshot.SuccessCount = apiSucc
+		apiSnapshot.FailureCount = apiFail
 		result.APIs[apiName] = apiSnapshot
 	}
 
