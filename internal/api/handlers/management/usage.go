@@ -128,6 +128,11 @@ func (h *Handler) serveClusterUsage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// Cluster ring size — counts cluster_nodes heartbeat-alive in the
+	// last 60s. Frontend uses (nodeCount / clusterNodeCount) so the badge
+	// shows "N/M nodes" rather than just N — disambiguates "deployed but
+	// idle" from "actually contributing".
+	clusterNodeCount, _ := h.pgUsage.QueryClusterNodeCount(ctx, 60)
 
 	var details []usage.UsageEventRow
 	if rng.Include == "details" {
@@ -158,8 +163,9 @@ func (h *Handler) serveClusterUsage(c *gin.Context) {
 		},
 		"failed_requests": totals.FailureCount,
 		"cluster": gin.H{
-			"aggregated": true,
-			"node_count": nodeCount,
+			"aggregated":         true,
+			"node_count":         nodeCount,
+			"cluster_node_count": clusterNodeCount,
 			"range": gin.H{
 				"from":        rng.From.Format(time.RFC3339),
 				"to":          rng.To.Format(time.RFC3339),

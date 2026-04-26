@@ -584,6 +584,30 @@ func (s *PGStore) QueryActiveNodeCount(ctx context.Context, from, to time.Time) 
 	return n, nil
 }
 
+// QueryClusterNodeCount returns the number of cluster_nodes rows whose
+// last_heartbeat is fresh (within stalenessSeconds). This is the "ring
+// size" — how many nodes are alive in the cluster, regardless of whether
+// they served any LLM traffic in the query window. The UI uses this
+// alongside QueryActiveNodeCount to show "2/4 nodes contributing".
+func (s *PGStore) QueryClusterNodeCount(ctx context.Context, stalenessSeconds int) (int, error) {
+	if stalenessSeconds <= 0 {
+		stalenessSeconds = 60
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM cluster_nodes
+		WHERE last_heartbeat > NOW() - ($1 || ' seconds')::INTERVAL`,
+		fmt.Sprintf("%d", stalenessSeconds)).Scan(&n)
+	if err != nil {
+		// Table may not exist on legacy deployments — return 0, not error,
+		// so the UI degrades gracefully (badge just shows active count
+		// without the "/N" suffix).
+		return 0, nil
+	}
+	return n, nil
+}
+
 // schemaDDL mirrors the usage-related DDL embedded in
 // postgresstore.EnsureSchema. Used only by PGStore.EnsureSchema for tests
 // that bring up a bare PG. KEEP IN SYNC with postgresstore.go.
