@@ -222,20 +222,13 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 		s.usageSink = usageSink
 	}
 
-	// Wire codex automation cluster status writeback. PG-backed mode only
-	// (memory mode keeps in-memory status). Each automation runOnce
-	// upserts (kind, node_id, last_run_at) so a UI request hitting any
-	// node sees the cluster-wide latest check time, not just whatever
-	// node it happened to land on. The handler-side reader is wired in
-	// internal/api.server (alongside SetPGUsage) — same PG pool.
+	// Stash codex automation cluster status store. The actual injection
+	// into the automation instances happens later in service.go AFTER
+	// the automations are constructed (bootstrapCluster runs first).
+	// Memory mode skips this — automation falls back to in-memory.
 	if uc.Backend != "memory" {
-		stateStore := internalusage.NewPGStore(db)
-		if s.codexWeeklyAutomation != nil {
-			s.codexWeeklyAutomation.SetClusterStateWriter(stateStore, nodeID)
-		}
-		if s.codexHourlyAutomation != nil {
-			s.codexHourlyAutomation.SetClusterStateWriter(stateStore, nodeID)
-		}
+		s.codexAutomationStateStore = internalusage.NewPGStore(db)
+		s.codexAutomationNodeID = nodeID
 	}
 
 	// Leader-gated TTL cleanup. Spawned even on followers — the cleanup

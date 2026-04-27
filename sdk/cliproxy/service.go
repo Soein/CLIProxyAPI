@@ -104,6 +104,13 @@ type Service struct {
 	// change subscriber). nil when cluster mode is disabled.
 	clusterCancel context.CancelFunc
 
+	// codexAutomationStateStore is the cluster-shared writer for
+	// codex weekly/hourly RunOnce timestamps. Wired in bootstrapCluster
+	// (which has the *sql.DB) but consumed later when codexWeeklyAutomation
+	// /codexHourlyAutomation get constructed — so it's stashed here.
+	codexAutomationStateStore *internalusage.PGStore
+	codexAutomationNodeID     string
+
 	// clusterRegistrar publishes this replica's routing metadata to the
 	// shared cluster_nodes table so the front-door (new-api) can consistent-
 	// hash account requests to a specific instance. nil when cluster mode
@@ -597,6 +604,15 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			s.codexWeeklyAutomation.SetLeaderGate(gate)
 			s.codexHourlyAutomation.SetLeaderGate(gate)
+		}
+
+		// Cluster status writeback: stashed in bootstrapCluster (which
+		// has the *sql.DB) and consumed here now that automations exist.
+		// nil in single-instance / memory mode — automation falls back
+		// to in-memory lastCheckedAt.
+		if s.codexAutomationStateStore != nil && s.codexAutomationNodeID != "" {
+			s.codexWeeklyAutomation.SetClusterStateWriter(s.codexAutomationStateStore, s.codexAutomationNodeID)
+			s.codexHourlyAutomation.SetClusterStateWriter(s.codexAutomationStateStore, s.codexAutomationNodeID)
 		}
 	}
 
