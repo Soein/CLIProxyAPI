@@ -14,9 +14,11 @@ import (
 )
 
 type fakeAuthManager struct {
-	auths        map[string]*coreauth.Auth
-	responseBody map[string]string
-	updateCalls  int
+	auths           map[string]*coreauth.Auth
+	responseBody    map[string]string
+	updateCalls     int
+	shardingEnabled bool
+	ownedAuths      map[string]bool // when nil, all owned
 }
 
 func (f *fakeAuthManager) List() []*coreauth.Auth {
@@ -57,10 +59,18 @@ func (f *fakeAuthManager) HttpRequest(_ context.Context, auth *coreauth.Auth, _ 
 	}, nil
 }
 
-// Sharding hooks — tests run in single-instance mode (sharding disabled,
-// every auth owned), exercising the legacy whole-list path.
-func (f *fakeAuthManager) IsAuthShardingEnabled() bool { return false }
-func (f *fakeAuthManager) OwnsAuth(string) bool        { return true }
+// Sharding hooks. Tests can flip these per-call; default is the
+// single-instance path (sharding disabled, every auth owned).
+func (f *fakeAuthManager) IsAuthShardingEnabled() bool {
+	return f.shardingEnabled
+}
+
+func (f *fakeAuthManager) OwnsAuthStrict(authID string) bool {
+	if f.ownedAuths == nil {
+		return true
+	}
+	return f.ownedAuths[authID]
+}
 
 func TestAutomationRunOnce_DisablesCodexAuthWhenWeeklyLimitReached(t *testing.T) {
 	t.Parallel()
@@ -564,5 +574,57 @@ func TestWindowReached(t *testing.T) {
 				t.Fatalf("WindowReached = (%v, %v), want (%v, %v)", got, ok, tc.want, tc.wantOk)
 			}
 		})
+	}
+}
+
+// TestAutomationListAuths_ShardingFilter verifies that when sharding is on,
+// the automation only operates on auths owned by this node — the central
+// invariant of the cluster sharding feature. The filter happens BEFORE
+// any network call, so it's safe to assert directly on listAuths.
+func TestAutomationListAuths_ShardingFilter(t *testing.T) {
+	t.Parallel()
+	manager := &fakeAuthManager{
+		auths: map[string]*coreauth.Auth{
+			"codex-a": {ID: "codex-a", Provider: "codex", Status: coreauth.StatusActive},
+			"codex-b": {ID: "codex-b", Provider: "codex", Status: coreauth.StatusActive},
+			"codex-c": {ID: "codex-c", Provider: "codex", Status: coreauth.StatusActive},
+		},
+		shardingEnabled: true,
+		ownedAuths:      map[string]bool{"codex-a": true, "codex-c": true}, // owned 2/3
+	}
+	a := NewAutomation(manager, func() *internalconfig.Config { return &internalconfig.Config{} })
+
+	got := a.listAuths()
+	if len(got) != 2 {
+		t.Fatalf("listAuths returned %d auths, want 2", len(got))
+	}
+	ids := map[string]bool{}
+	for _, auth := range got {
+		ids[auth.ID] = true
+	}
+	if !ids["codex-a"] || !ids["codex-c"] {
+		t.Fatalf("expected {codex-a, codex-c}, got %v", ids)
+	}
+	if ids["codex-b"] {
+		t.Fatal("codex-b is not owned by this node — must not appear in listAuths")
+	}
+}
+
+// TestAutomationListAuths_NoShardingReturnsAll documents the legacy path:
+// when sharding is disabled, every auth is returned regardless of OwnsAuthStrict.
+func TestAutomationListAuths_NoShardingReturnsAll(t *testing.T) {
+	t.Parallel()
+	manager := &fakeAuthManager{
+		auths: map[string]*coreauth.Auth{
+			"codex-a": {ID: "codex-a", Provider: "codex", Status: coreauth.StatusActive},
+			"codex-b": {ID: "codex-b", Provider: "codex", Status: coreauth.StatusActive},
+		},
+		shardingEnabled: false,
+		ownedAuths:      map[string]bool{"codex-a": true}, // ignored when sharding off
+	}
+	a := NewAutomation(manager, func() *internalconfig.Config { return &internalconfig.Config{} })
+
+	if got := a.listAuths(); len(got) != 2 {
+		t.Fatalf("non-sharded listAuths returned %d auths, want 2 (full list)", len(got))
 	}
 }

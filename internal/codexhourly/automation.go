@@ -36,8 +36,10 @@ type authManager interface {
 	NewHttpRequest(context.Context, *coreauth.Auth, string, string, []byte, http.Header) (*http.Request, error)
 	HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error)
 	// Cluster sharding hooks — see codexweekly.authManager for contract.
+	// OwnsAuthStrict requires ring.Ready(): avoids 4× duplicate wham/usage
+	// probes during the post-bootstrap ring-sync window.
 	IsAuthShardingEnabled() bool
-	OwnsAuth(authID string) bool
+	OwnsAuthStrict(authID string) bool
 }
 
 // Status 汇报 hourly automation 的运行时状态,与 codexweekly.Status 对称。
@@ -282,9 +284,12 @@ func (a *Automation) RunOnce(ctx context.Context) {
 	a.mu.Unlock()
 
 	if writer != nil && nodeID != "" {
-		if err := writer.UpsertCodexAutomationState(ctx, "hourly", nodeID, now); err != nil {
+		// Bounded timeout — see codexweekly counterpart for rationale.
+		upCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := writer.UpsertCodexAutomationState(upCtx, "hourly", nodeID, now); err != nil {
 			log.Warnf("codex hourly automation: cluster state upsert failed: %v", err)
 		}
+		cancel()
 	}
 }
 
@@ -432,7 +437,7 @@ func (a *Automation) listAuths() []*coreauth.Auth {
 		if auth == nil {
 			continue
 		}
-		if a.manager.OwnsAuth(auth.ID) {
+		if a.manager.OwnsAuthStrict(auth.ID) {
 			out = append(out, auth)
 		}
 	}

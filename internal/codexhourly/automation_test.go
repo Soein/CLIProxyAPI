@@ -14,9 +14,11 @@ import (
 )
 
 type fakeAuthManager struct {
-	auths        map[string]*coreauth.Auth
-	responseBody map[string]string
-	updateCalls  int
+	auths           map[string]*coreauth.Auth
+	responseBody    map[string]string
+	updateCalls     int
+	shardingEnabled bool
+	ownedAuths      map[string]bool // when nil, all owned
 }
 
 func (f *fakeAuthManager) List() []*coreauth.Auth {
@@ -57,9 +59,14 @@ func (f *fakeAuthManager) HttpRequest(_ context.Context, auth *coreauth.Auth, _ 
 	}, nil
 }
 
-// Sharding hooks — see codexweekly tests; mirror behavior.
-func (f *fakeAuthManager) IsAuthShardingEnabled() bool { return false }
-func (f *fakeAuthManager) OwnsAuth(string) bool        { return true }
+// Sharding hooks — mirror codexweekly tests so coverage stays symmetric.
+func (f *fakeAuthManager) IsAuthShardingEnabled() bool { return f.shardingEnabled }
+func (f *fakeAuthManager) OwnsAuthStrict(authID string) bool {
+	if f.ownedAuths == nil {
+		return true
+	}
+	return f.ownedAuths[authID]
+}
 
 func TestAutomationRunOnce_DisablesCodexAuthWhenHourlyLimitReached(t *testing.T) {
 	t.Parallel()
@@ -382,5 +389,41 @@ func TestHourlyLimitReached_WindowScoped(t *testing.T) {
 				t.Fatalf("hourlyLimitReached = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAutomationListAuths_ShardingFilter — mirror of codexweekly counterpart.
+func TestAutomationListAuths_ShardingFilter(t *testing.T) {
+	t.Parallel()
+	manager := &fakeAuthManager{
+		auths: map[string]*coreauth.Auth{
+			"codex-a": {ID: "codex-a", Provider: "codex", Status: coreauth.StatusActive},
+			"codex-b": {ID: "codex-b", Provider: "codex", Status: coreauth.StatusActive},
+			"codex-c": {ID: "codex-c", Provider: "codex", Status: coreauth.StatusActive},
+		},
+		shardingEnabled: true,
+		ownedAuths:      map[string]bool{"codex-b": true}, // owned 1/3
+	}
+	a := NewAutomation(manager, func() *internalconfig.Config { return &internalconfig.Config{} })
+	got := a.listAuths()
+	if len(got) != 1 || got[0].ID != "codex-b" {
+		t.Fatalf("listAuths returned %v, want only codex-b", got)
+	}
+}
+
+// TestAutomationListAuths_NoShardingReturnsAll — mirror.
+func TestAutomationListAuths_NoShardingReturnsAll(t *testing.T) {
+	t.Parallel()
+	manager := &fakeAuthManager{
+		auths: map[string]*coreauth.Auth{
+			"codex-a": {ID: "codex-a", Provider: "codex", Status: coreauth.StatusActive},
+			"codex-b": {ID: "codex-b", Provider: "codex", Status: coreauth.StatusActive},
+		},
+		shardingEnabled: false,
+		ownedAuths:      map[string]bool{"codex-a": true},
+	}
+	a := NewAutomation(manager, func() *internalconfig.Config { return &internalconfig.Config{} })
+	if got := a.listAuths(); len(got) != 2 {
+		t.Fatalf("non-sharded listAuths returned %d auths, want 2", len(got))
 	}
 }

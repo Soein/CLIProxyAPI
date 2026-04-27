@@ -354,6 +354,35 @@ func (m *Manager) OwnsAuth(authID string) bool {
 	return ring.IsMine(authID)
 }
 
+// OwnsAuthStrict mirrors OwnsAuth but returns false when the ring exists
+// but isn't yet Ready (post-cluster-bootstrap window where every node's
+// ring.IsMine would return true and trigger N-way duplicate work).
+//
+// Use this from callers that fire upstream side-effects (network calls
+// to OpenAI / chatgpt.com etc.) where over-serving during bootstrap is
+// not just wasted work but a thundering-herd risk. Dispatch and refresh
+// paths should keep using OwnsAuth (over-serve-during-bootstrap is the
+// right default for serving traffic).
+//
+// Single-instance / sharding-disabled mode still returns true so non-
+// cluster deployments work unchanged.
+func (m *Manager) OwnsAuthStrict(authID string) bool {
+	if m == nil {
+		return true
+	}
+	m.clusterMu.RLock()
+	enabled := m.authShardingEnabled
+	ring := m.authRing
+	m.clusterMu.RUnlock()
+	if !enabled || ring == nil {
+		return true
+	}
+	if !ring.Ready() {
+		return false
+	}
+	return ring.IsMine(authID)
+}
+
 // SyncScheduler exposes syncScheduler to external callers — notably the
 // RingWatcher OnChange callback, which needs to trigger a re-sync after
 // membership changes without waiting for the next mutation.

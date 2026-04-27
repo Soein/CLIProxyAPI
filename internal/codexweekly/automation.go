@@ -50,8 +50,14 @@ type authManager interface {
 	// In single-instance / non-sharded mode both methods can return defaults
 	// (sharding disabled / always own); leader-gating in cluster_bootstrap
 	// keeps that path single-replica.
+	//
+	// OwnsAuthStrict is preferred over OwnsAuth here because the former
+	// returns false during the post-cluster-bootstrap window when the ring
+	// exists but isn't Ready yet. Without strict, all 4 nodes would briefly
+	// claim ownership of every auth → 4× duplicate wham/usage probes hitting
+	// chatgpt.com on every cold start.
 	IsAuthShardingEnabled() bool
-	OwnsAuth(authID string) bool
+	OwnsAuthStrict(authID string) bool
 }
 
 type Status struct {
@@ -293,11 +299,15 @@ func (a *Automation) RunOnce(ctx context.Context) {
 
 	// Persist to PG so peer nodes' management UI shows this run. Best-
 	// effort: PG hiccups must not abort the in-memory state update — the
-	// next tick will retry the upsert.
+	// next tick will retry the upsert. Bound the call with its own timeout
+	// because the parent ctx is the long-lived cluster ctx; without this,
+	// a stuck PG would block RunOnce forever and freeze the 5-min ticker.
 	if writer != nil && nodeID != "" {
-		if err := writer.UpsertCodexAutomationState(ctx, "weekly", nodeID, now); err != nil {
+		upCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := writer.UpsertCodexAutomationState(upCtx, "weekly", nodeID, now); err != nil {
 			log.Warnf("codex weekly automation: cluster state upsert failed: %v", err)
 		}
+		cancel()
 	}
 }
 
@@ -465,7 +475,7 @@ func (a *Automation) listAuths() []*coreauth.Auth {
 		if auth == nil {
 			continue
 		}
-		if a.manager.OwnsAuth(auth.ID) {
+		if a.manager.OwnsAuthStrict(auth.ID) {
 			out = append(out, auth)
 		}
 	}
