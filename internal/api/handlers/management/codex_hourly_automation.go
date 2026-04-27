@@ -1,7 +1,9 @@
 package management
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexhourly"
@@ -42,6 +44,17 @@ func (h *Handler) GetCodexHourlyAutomationStatus(c *gin.Context) {
 	}
 	if h != nil && h.codexHourlyStatus != nil {
 		status = h.codexHourlyStatus()
+	}
+	// See codex_weekly_automation.go for the cluster overlay rationale.
+	if h != nil && h.codexAutomationReader != nil {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		if t, err := h.codexAutomationReader.GetCodexAutomationLatest(ctx, "hourly"); err == nil && !t.IsZero() {
+			ts := t
+			if status.LastCheckedAt == nil || ts.After(*status.LastCheckedAt) {
+				status.LastCheckedAt = &ts
+			}
+		}
 	}
 	c.JSON(http.StatusOK, status)
 }

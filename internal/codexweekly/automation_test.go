@@ -57,6 +57,11 @@ func (f *fakeAuthManager) HttpRequest(_ context.Context, auth *coreauth.Auth, _ 
 	}, nil
 }
 
+// Sharding hooks — tests run in single-instance mode (sharding disabled,
+// every auth owned), exercising the legacy whole-list path.
+func (f *fakeAuthManager) IsAuthShardingEnabled() bool { return false }
+func (f *fakeAuthManager) OwnsAuth(string) bool        { return true }
+
 func TestAutomationRunOnce_DisablesCodexAuthWhenWeeklyLimitReached(t *testing.T) {
 	t.Parallel()
 

@@ -606,6 +606,50 @@ func (s *PGStore) QueryActiveNodeCount(ctx context.Context, from, to time.Time) 
 	return n, nil
 }
 
+// =============================================================================
+// Codex automation cluster status — used by management /codex-*-automation/
+// status endpoints so a UI hitting any node sees the cluster-wide latest
+// check time. The same PG pool that already serves usage queries is reused
+// (one less connection to manage).
+// =============================================================================
+
+// UpsertCodexAutomationState records that a node ran the named automation
+// kind ('weekly' | 'hourly') at t. Idempotent on retry. Called from
+// automation.RunOnce after each successful tick.
+func (s *PGStore) UpsertCodexAutomationState(ctx context.Context, kind, nodeID string, t time.Time) error {
+	if kind == "" || nodeID == "" {
+		return fmt.Errorf("usage UpsertCodexAutomationState: kind and node_id required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO codex_automation_state (kind, node_id, last_run_at, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (kind, node_id) DO UPDATE SET
+			last_run_at = EXCLUDED.last_run_at,
+			updated_at  = NOW()`,
+		kind, nodeID, t.UTC())
+	if err != nil {
+		return fmt.Errorf("usage UpsertCodexAutomationState: %w", err)
+	}
+	return nil
+}
+
+// GetCodexAutomationLatest returns the cluster-wide latest run timestamp
+// for the given automation kind. Returns zero time + nil error when the
+// automation has never run anywhere — caller should treat that as "wait".
+func (s *PGStore) GetCodexAutomationLatest(ctx context.Context, kind string) (time.Time, error) {
+	var t sql.NullTime
+	err := s.db.QueryRowContext(ctx,
+		`SELECT MAX(last_run_at) FROM codex_automation_state WHERE kind = $1`, kind).
+		Scan(&t)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("usage GetCodexAutomationLatest: %w", err)
+	}
+	if !t.Valid {
+		return time.Time{}, nil
+	}
+	return t.Time, nil
+}
+
 // QueryClusterNodeCount returns the number of cluster_nodes rows whose
 // last_heartbeat is fresh (within stalenessSeconds). This is the "ring
 // size" — how many nodes are alive in the cluster, regardless of whether

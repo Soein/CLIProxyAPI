@@ -584,9 +584,19 @@ func (s *Service) Run(ctx context.Context) error {
 		// successfully. Installed AFTER automation construction because
 		// NewAutomation doesn't accept a gate. Closures capture the same
 		// Manager whose IsLeader flag the advisory-lock elector drives.
+		//
+		// When AuthSharding is enabled, every node should run automation
+		// against its own auth shard (filtered by OwnsAuth in
+		// automation.listAuths) — leader-gating would defeat that by
+		// silencing 3 of 4 nodes. So in sharding mode we install a
+		// no-op gate (always true) and rely on the per-auth filter.
 		if s.cfg != nil && s.cfg.Cluster.Enabled {
-			s.codexWeeklyAutomation.SetLeaderGate(s.coreManager.IsLeader)
-			s.codexHourlyAutomation.SetLeaderGate(s.coreManager.IsLeader)
+			gate := s.coreManager.IsLeader
+			if s.cfg.Cluster.AuthSharding {
+				gate = func() bool { return true }
+			}
+			s.codexWeeklyAutomation.SetLeaderGate(gate)
+			s.codexHourlyAutomation.SetLeaderGate(gate)
 		}
 	}
 

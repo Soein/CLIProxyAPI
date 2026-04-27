@@ -35,6 +35,9 @@ type authManager interface {
 	Update(context.Context, *coreauth.Auth) (*coreauth.Auth, error)
 	NewHttpRequest(context.Context, *coreauth.Auth, string, string, []byte, http.Header) (*http.Request, error)
 	HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error)
+	// Cluster sharding hooks — see codexweekly.authManager for contract.
+	IsAuthShardingEnabled() bool
+	OwnsAuth(authID string) bool
 }
 
 // Status 汇报 hourly automation 的运行时状态,与 codexweekly.Status 对称。
@@ -61,7 +64,29 @@ type Automation struct {
 	// usage endpoint. nil means "always leader" (single-instance mode).
 	leaderGate func() bool
 
+	// clusterStateWriter persists the lastCheckedAt timestamp to PG —
+	// see codexweekly.Automation for the contract.
+	clusterStateWriter ClusterStateWriter
+	clusterNodeID      string
+
 	now func() time.Time
+}
+
+// ClusterStateWriter mirrors codexweekly.ClusterStateWriter for the hourly
+// loop; both share the same PG table (different `kind`).
+type ClusterStateWriter interface {
+	UpsertCodexAutomationState(ctx context.Context, kind, nodeID string, t time.Time) error
+}
+
+// SetClusterStateWriter installs the cluster persistence hook + node id.
+func (a *Automation) SetClusterStateWriter(w ClusterStateWriter, nodeID string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.clusterStateWriter = w
+	a.clusterNodeID = nodeID
+	a.mu.Unlock()
 }
 
 // SetLeaderGate installs a cluster-mode gate consulted at the start of each
@@ -249,9 +274,18 @@ func (a *Automation) RunOnce(ctx context.Context) {
 	log.Infof("codex hourly automation: RunOnce complete provider_counts=%v codex=%d managed=%d excluded=%d checked=%d reached=%d reenabled_path=%d",
 		providerCounts, codexCount, managedCount, excludedCount, checkedCount, reachedCount, reenabledCount)
 
+	now := a.now()
 	a.mu.Lock()
-	a.lastCheckedAt = a.now()
+	a.lastCheckedAt = now
+	writer := a.clusterStateWriter
+	nodeID := a.clusterNodeID
 	a.mu.Unlock()
+
+	if writer != nil && nodeID != "" {
+		if err := writer.UpsertCodexAutomationState(ctx, "hourly", nodeID, now); err != nil {
+			log.Warnf("codex hourly automation: cluster state upsert failed: %v", err)
+		}
+	}
 }
 
 func (a *Automation) checkHourlyLimit(ctx context.Context, auth *coreauth.Auth) (bool, error) {
@@ -389,7 +423,20 @@ func (a *Automation) listAuths() []*coreauth.Auth {
 	if a == nil || a.manager == nil {
 		return nil
 	}
-	return a.manager.List()
+	all := a.manager.List()
+	if !a.manager.IsAuthShardingEnabled() {
+		return all
+	}
+	out := make([]*coreauth.Auth, 0, len(all))
+	for _, auth := range all {
+		if auth == nil {
+			continue
+		}
+		if a.manager.OwnsAuth(auth.ID) {
+			out = append(out, auth)
+		}
+	}
+	return out
 }
 
 func shouldManageAuth(auth *coreauth.Auth) bool {

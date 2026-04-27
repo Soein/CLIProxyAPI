@@ -44,6 +44,14 @@ type authManager interface {
 	Update(context.Context, *coreauth.Auth) (*coreauth.Auth, error)
 	NewHttpRequest(context.Context, *coreauth.Auth, string, string, []byte, http.Header) (*http.Request, error)
 	HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error)
+	// Cluster sharding hooks. When IsAuthShardingEnabled()==true, automation
+	// only checks auths owned by the current node — letting the 4 nodes
+	// run wham/usage queries in parallel instead of serially on the leader.
+	// In single-instance / non-sharded mode both methods can return defaults
+	// (sharding disabled / always own); leader-gating in cluster_bootstrap
+	// keeps that path single-replica.
+	IsAuthShardingEnabled() bool
+	OwnsAuth(authID string) bool
 }
 
 type Status struct {
@@ -68,7 +76,32 @@ type Automation struct {
 	// usage endpoint. nil means "always leader" (single-instance mode).
 	leaderGate func() bool
 
+	// clusterStateWriter persists the lastCheckedAt timestamp to PG so
+	// the management UI on any node sees the cluster-wide latest. nil
+	// means in-memory only (single-instance / no PG configured).
+	clusterStateWriter ClusterStateWriter
+	clusterNodeID      string
+
 	now func() time.Time
+}
+
+// ClusterStateWriter is the cluster-shared persistence hook for automation
+// last-run-at timestamps. Implemented by internal/usage.PGStore in PG-backed
+// deployments; left nil otherwise.
+type ClusterStateWriter interface {
+	UpsertCodexAutomationState(ctx context.Context, kind, nodeID string, t time.Time) error
+}
+
+// SetClusterStateWriter installs the cluster persistence hook + the local
+// node id. Both must be set for cluster status writeback to take effect.
+func (a *Automation) SetClusterStateWriter(w ClusterStateWriter, nodeID string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.clusterStateWriter = w
+	a.clusterNodeID = nodeID
+	a.mu.Unlock()
 }
 
 // SetLeaderGate installs a cluster-mode gate consulted at the start of each
@@ -251,9 +284,21 @@ func (a *Automation) RunOnce(ctx context.Context) {
 	log.Infof("codex weekly automation: RunOnce complete provider_counts=%v codex=%d managed=%d excluded=%d checked=%d reached=%d reenabled_path=%d",
 		providerCounts, codexCount, managedCount, excludedCount, checkedCount, reachedCount, reenabledCount)
 
+	now := a.now()
 	a.mu.Lock()
-	a.lastCheckedAt = a.now()
+	a.lastCheckedAt = now
+	writer := a.clusterStateWriter
+	nodeID := a.clusterNodeID
 	a.mu.Unlock()
+
+	// Persist to PG so peer nodes' management UI shows this run. Best-
+	// effort: PG hiccups must not abort the in-memory state update — the
+	// next tick will retry the upsert.
+	if writer != nil && nodeID != "" {
+		if err := writer.UpsertCodexAutomationState(ctx, "weekly", nodeID, now); err != nil {
+			log.Warnf("codex weekly automation: cluster state upsert failed: %v", err)
+		}
+	}
 }
 
 func (a *Automation) checkWeeklyLimit(ctx context.Context, auth *coreauth.Auth) (bool, error) {
@@ -406,7 +451,25 @@ func (a *Automation) listAuths() []*coreauth.Auth {
 	if a == nil || a.manager == nil {
 		return nil
 	}
-	return a.manager.List()
+	all := a.manager.List()
+	if !a.manager.IsAuthShardingEnabled() {
+		return all
+	}
+	// Sharding mode: only return auths this node owns. Other nodes
+	// will own (and check) the rest in parallel. Counters like
+	// AutoDisabledCount in Status() will reflect just this node's
+	// shard — the cluster-wide aggregation is computed in the
+	// management handler from PG.
+	out := make([]*coreauth.Auth, 0, len(all))
+	for _, auth := range all {
+		if auth == nil {
+			continue
+		}
+		if a.manager.OwnsAuth(auth.ID) {
+			out = append(out, auth)
+		}
+	}
+	return out
 }
 
 // IsAutomationExcluded 读取"排除出 codex 自动化"标记,同时作用于 weekly + hourly。

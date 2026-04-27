@@ -57,6 +57,10 @@ func (f *fakeAuthManager) HttpRequest(_ context.Context, auth *coreauth.Auth, _ 
 	}, nil
 }
 
+// Sharding hooks — see codexweekly tests; mirror behavior.
+func (f *fakeAuthManager) IsAuthShardingEnabled() bool { return false }
+func (f *fakeAuthManager) OwnsAuth(string) bool        { return true }
+
 func TestAutomationRunOnce_DisablesCodexAuthWhenHourlyLimitReached(t *testing.T) {
 	t.Parallel()
 

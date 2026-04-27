@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -57,6 +58,26 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 	codexWeeklyStatus   func() codexweekly.Status
 	codexHourlyStatus   func() codexhourly.Status
+	// Optional cluster-aware reader: when set, /codex-*-automation/status
+	// endpoints overlay the cluster-wide latest run timestamp from PG so
+	// follower nodes' UI no longer shows "等待首次检查" while the leader
+	// (or another shard owner) actually ran the check.
+	codexAutomationReader CodexAutomationStatusReader
+}
+
+// CodexAutomationStatusReader is the read-side hook for cluster-shared
+// automation status. Implemented by internal/usage.PGStore.
+type CodexAutomationStatusReader interface {
+	GetCodexAutomationLatest(ctx context.Context, kind string) (time.Time, error)
+}
+
+// SetCodexAutomationStatusReader installs the cluster status reader. Pass
+// nil to disable (single-instance / no PG).
+func (h *Handler) SetCodexAutomationStatusReader(r CodexAutomationStatusReader) {
+	if h == nil {
+		return
+	}
+	h.codexAutomationReader = r
 }
 
 // NewHandler creates a new management handler instance.

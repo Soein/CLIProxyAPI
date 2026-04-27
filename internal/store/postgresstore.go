@@ -384,6 +384,23 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		}
 	}
 
+	// codex_automation_state: per-(kind, node) heartbeat for the leader-
+	// gated-or-sharded codex weekly/hourly automation loops. The
+	// management /codex-*-automation/status endpoint reads MAX(last_run_at)
+	// across the cluster so any node's UI shows the cluster-wide latest
+	// check time — not just whatever node happened to receive the request.
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS codex_automation_state (
+			kind         TEXT NOT NULL,
+			node_id      TEXT NOT NULL,
+			last_run_at  TIMESTAMPTZ NOT NULL,
+			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (kind, node_id)
+		)
+	`); err != nil {
+		return fmt.Errorf("postgres store: create codex_automation_state: %w", err)
+	}
+
 	return nil
 }
 

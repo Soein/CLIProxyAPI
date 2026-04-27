@@ -1,7 +1,9 @@
 package management
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
@@ -42,6 +44,19 @@ func (h *Handler) GetCodexWeeklyAutomationStatus(c *gin.Context) {
 	}
 	if h != nil && h.codexWeeklyStatus != nil {
 		status = h.codexWeeklyStatus()
+	}
+	// Cluster overlay: when this node is a follower (or different shard
+	// owner) it has never run weekly RunOnce so LastCheckedAt is nil.
+	// Take MAX(last_run_at) across all nodes from PG instead.
+	if h != nil && h.codexAutomationReader != nil {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		if t, err := h.codexAutomationReader.GetCodexAutomationLatest(ctx, "weekly"); err == nil && !t.IsZero() {
+			ts := t
+			if status.LastCheckedAt == nil || ts.After(*status.LastCheckedAt) {
+				status.LastCheckedAt = &ts
+			}
+		}
 	}
 	c.JSON(http.StatusOK, status)
 }

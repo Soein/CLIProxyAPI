@@ -285,7 +285,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		if authManager != nil {
 			if store := authManager.GetStore(); store != nil {
 				if pg, ok := store.(interface{ DB() *sql.DB }); ok && pg.DB() != nil {
-					s.mgmt.SetPGUsage(usage.NewPGStore(pg.DB()))
+					pgStore := usage.NewPGStore(pg.DB())
+					s.mgmt.SetPGUsage(pgStore)
+					// Same PG pool drives the cluster-aware codex
+					// automation status read path.
+					s.mgmt.SetCodexAutomationStatusReader(pgStore)
 				}
 			}
 		}
