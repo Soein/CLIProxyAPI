@@ -473,8 +473,29 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
 
+	// metadataSetter mirrors the same private interface in sdk/auth/filestore.go.
+	// We cannot import that package here (cyclic), so it is redeclared locally.
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+
+	// Persist auth.Disabled into the JSON payload via the Metadata channel.
+	// Both the Storage and Metadata-only branches below funnel through
+	// auth.Metadata, so writing the flag here covers both paths. Without
+	// this, the on-disk JSON (and therefore the upserted PG row) loses the
+	// Go-level Disabled bool and a restart re-enables auths that codex
+	// weekly/hourly automation just disabled — see CHANGELOG: "auto-disabled
+	// auths reactivate after restart" bug.
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = auth.Disabled
+
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(auth.Metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
@@ -612,12 +633,22 @@ func (s *PostgresStore) buildAuthFromRow(id, payload string, createdAt, updatedA
 	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
 		attr["email"] = email
 	}
+	// Restore the Disabled bool from the persisted JSON. Save writes
+	// metadata["disabled"] = auth.Disabled before persisting; reversing it
+	// here keeps the in-memory Auth aligned with PG after a restart, so
+	// dispatch and codex automation continue to honor an auto-disabled state.
+	disabled, _ := metadata["disabled"].(bool)
+	status := cliproxyauth.StatusActive
+	if disabled {
+		status = cliproxyauth.StatusDisabled
+	}
 	auth := &cliproxyauth.Auth{
 		ID:               normalizeAuthID(id),
 		Provider:         provider,
 		FileName:         normalizeAuthID(id),
 		Label:            labelFor(metadata),
-		Status:           cliproxyauth.StatusActive,
+		Status:           status,
+		Disabled:         disabled,
 		Attributes:       attr,
 		Metadata:         metadata,
 		CreatedAt:        createdAt,
