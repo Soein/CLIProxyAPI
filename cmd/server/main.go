@@ -127,8 +127,12 @@ func main() {
 	var cfg *config.Config
 	var isCloudDeploy bool
 	var (
-		usePostgresStore     bool
-		pgStoreDSN           string
+		usePostgresStore bool
+		pgStoreDSN       string
+		// pgStoreReadDSN, pgStoreBootstrapTO and the other pgStore* fields
+		// below are only assigned and only consumed inside the
+		// `if usePostgresStore { ... }` blocks; their zero values are never
+		// read by the runtime store-init path.
 		pgStoreReadDSN       string
 		pgStoreSchema        string
 		pgStoreLocalPath     string
