@@ -27,7 +27,16 @@ const (
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
 type PostgresStoreConfig struct {
-	DSN         string
+	DSN string
+	// ReadDSN is an optional read-only DSN used for SELECT-heavy paths
+	// (List / GetByID / syncAuthFromDatabase / syncConfigFromDatabase). When
+	// non-empty and reachable, queries that don't mutate state are routed to
+	// this pool so cold-start full-table scans can hit a local read replica
+	// rather than crossing the WAN to the write leader. Writes and DDL
+	// (EnsureSchema, persistAuth, persistConfig, *Delete*) always use DSN.
+	// When empty or the pool fails its initial ping, reads transparently
+	// fall back to DSN.
+	ReadDSN     string
 	Schema      string
 	ConfigTable string
 	AuthTable   string
@@ -37,7 +46,11 @@ type PostgresStoreConfig struct {
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
 // while mirroring data to a local workspace so existing file-based workflows continue to operate.
 type PostgresStore struct {
-	db         *sql.DB
+	db *sql.DB
+	// readDB, when non-nil, points at a dedicated read-only pool (e.g. an HAProxy
+	// read backend pointing to local replicas). Reads opt in via readPool();
+	// writes always go through db.
+	readDB     *sql.DB
 	cfg        PostgresStoreConfig
 	spoolRoot  string
 	configPath string
@@ -119,8 +132,32 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 		return nil, fmt.Errorf("postgres store: ping database: %w", err)
 	}
 
+	// Optional read pool: only opened when ReadDSN is set and differs from DSN.
+	// A failed ping is non-fatal — we log a warning and let readPool() fall back
+	// to the write pool, keeping the store usable even if the replica is
+	// temporarily unreachable.
+	var readDB *sql.DB
+	trimmedRead := strings.TrimSpace(cfg.ReadDSN)
+	if trimmedRead != "" && trimmedRead != cfg.DSN {
+		cfg.ReadDSN = trimmedRead
+		rdb, errOpen := sql.Open("pgx", trimmedRead)
+		if errOpen != nil {
+			log.WithError(errOpen).Warn("postgres store: open read database failed; reads will fall back to write pool")
+		} else if errPing := rdb.PingContext(ctx); errPing != nil {
+			_ = rdb.Close()
+			log.WithError(errPing).Warn("postgres store: read database ping failed; reads will fall back to write pool")
+		} else {
+			readDB = rdb
+		}
+	} else {
+		// Normalize so s.cfg.ReadDSN reflects the trimmed value (or empty
+		// string when DSN==ReadDSN), keeping s.cfg internally consistent.
+		cfg.ReadDSN = ""
+	}
+
 	store := &PostgresStore{
 		db:         db,
+		readDB:     readDB,
 		cfg:        cfg,
 		spoolRoot:  absSpool,
 		configPath: filepath.Join(configDir, "config.yaml"),
@@ -129,12 +166,41 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	return store, nil
 }
 
-// Close releases the underlying database connection.
+// Close releases the underlying database connections. Read pool errors are
+// joined with the write pool error so a failure in either path is surfaced
+// rather than silently dropped.
 func (s *PostgresStore) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
-	return s.db.Close()
+	var errs []error
+	// readDB != db is a defensive guard against a future refactor that hands
+	// the same *sql.DB to both fields; today NewPostgresStore always opens
+	// readDB via a separate sql.Open call so the pointers diverge by
+	// construction.
+	if s.readDB != nil && s.readDB != s.db {
+		if err := s.readDB.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("read pool: %w", err))
+		}
+	}
+	if s.db != nil {
+		if err := s.db.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// readPool returns the pool used for read-only queries. Falls back to the
+// write pool when no read replica is configured or the replica failed its
+// initial ping. Callers must ensure the store is initialized; nil-receiver
+// behavior matches the rest of the read path (panic), keeping the convention
+// uniform across List / GetByID / syncAuth* / syncConfig*.
+func (s *PostgresStore) readPool() *sql.DB {
+	if s.readDB != nil {
+		return s.readDB
+	}
+	return s.db
 }
 
 // DB returns the underlying *sql.DB. Exposed so cluster-mode coordinators
@@ -544,7 +610,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 // List enumerates all auth records stored in PostgreSQL.
 func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	query := fmt.Sprintf("SELECT id, content, created_at, updated_at FROM %s ORDER BY id", s.fullTableName(s.cfg.AuthTable))
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.readPool().QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("postgres store: list auth: %w", err)
 	}
@@ -592,6 +658,11 @@ func (s *PostgresStore) GetByID(ctx context.Context, id string) (*cliproxyauth.A
 		createdAt time.Time
 		updatedAt time.Time
 	)
+	// Always read from the write pool here. NOTIFY-driven ReloadByID is
+	// triggered by a write that just landed on the leader; routing this lookup
+	// to a read replica risks observing pre-write state during replication
+	// lag and (per the (nil, nil) contract above) silently dropping a
+	// just-upserted row from the in-memory cache.
 	err := s.db.QueryRowContext(ctx, query, id).Scan(&rowID, &payload, &createdAt, &updatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -737,7 +808,7 @@ func (s *PostgresStore) PersistConfig(ctx context.Context) error {
 func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfigPath string) error {
 	query := fmt.Sprintf("SELECT content FROM %s WHERE id = $1", s.fullTableName(s.cfg.ConfigTable))
 	var content string
-	err := s.db.QueryRowContext(ctx, query, defaultConfigKey).Scan(&content)
+	err := s.readPool().QueryRowContext(ctx, query, defaultConfigKey).Scan(&content)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, errStat := os.Stat(s.configPath); errors.Is(errStat, fs.ErrNotExist) {
@@ -776,9 +847,14 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 }
 
 // syncAuthFromDatabase populates the local auth directory from PostgreSQL data.
+//
+// Reads through readPool() — when PGSTORE_READ_DSN points at a local replica
+// this turns the bootstrap full-table scan from a cross-region SELECT into a
+// near-zero-latency query, which is the dominant slowness during cold start
+// for clusters whose write leader is far from the booting node.
 func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 	query := fmt.Sprintf("SELECT id, content FROM %s", s.fullTableName(s.cfg.AuthTable))
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.readPool().QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("postgres store: load auth from database: %w", err)
 	}
