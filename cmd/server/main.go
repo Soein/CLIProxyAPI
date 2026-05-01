@@ -129,8 +129,10 @@ func main() {
 	var (
 		usePostgresStore     bool
 		pgStoreDSN           string
+		pgStoreReadDSN       string
 		pgStoreSchema        string
 		pgStoreLocalPath     string
+		pgStoreBootstrapTO   time.Duration
 		pgStoreInst          *store.PostgresStore
 		useGitStore          bool
 		gitStoreRemoteURL    string
@@ -183,6 +185,25 @@ func main() {
 		}
 		if value, ok := lookupEnv("PGSTORE_LOCAL_PATH", "pgstore_local_path"); ok {
 			pgStoreLocalPath = value
+		}
+		// PGSTORE_READ_DSN — optional read-only DSN. When set, NewPostgresStore opens
+		// a second connection pool used by List / GetByID / syncAuth / syncConfig so
+		// cold-start full-table scans hit a local read replica instead of crossing the
+		// WAN to the patroni leader. EnsureSchema and all writes still use DSN.
+		if value, ok := lookupEnv("PGSTORE_READ_DSN", "pgstore_read_dsn"); ok {
+			pgStoreReadDSN = value
+		}
+		// PGSTORE_BOOTSTRAP_TIMEOUT — Go duration string controlling the deadline
+		// passed to NewPostgresStore and Bootstrap. Default 5m; the previous hard-
+		// coded 30s was insufficient when auth_store was full-scanned over a high-
+		// latency replica link.
+		pgStoreBootstrapTO = 5 * time.Minute
+		if value, ok := lookupEnv("PGSTORE_BOOTSTRAP_TIMEOUT", "pgstore_bootstrap_timeout"); ok {
+			if d, errParse := time.ParseDuration(value); errParse == nil && d > 0 {
+				pgStoreBootstrapTO = d
+			} else {
+				log.Warnf("invalid PGSTORE_BOOTSTRAP_TIMEOUT=%q; using default %s", value, pgStoreBootstrapTO)
+			}
 		}
 		if pgStoreLocalPath == "" {
 			if writableBase != "" {
@@ -241,9 +262,10 @@ func main() {
 			pgStoreLocalPath = wd
 		}
 		pgStoreLocalPath = filepath.Join(pgStoreLocalPath, "pgstore")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), pgStoreBootstrapTO)
 		pgStoreInst, err = store.NewPostgresStore(ctx, store.PostgresStoreConfig{
 			DSN:      pgStoreDSN,
+			ReadDSN:  pgStoreReadDSN,
 			Schema:   pgStoreSchema,
 			SpoolDir: pgStoreLocalPath,
 		})
@@ -253,7 +275,7 @@ func main() {
 			return
 		}
 		examplePath := filepath.Join(wd, "config.example.yaml")
-		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel = context.WithTimeout(context.Background(), pgStoreBootstrapTO)
 		if errBootstrap := pgStoreInst.Bootstrap(ctx, examplePath); errBootstrap != nil {
 			cancel()
 			log.Errorf("failed to bootstrap postgres-backed config: %v", errBootstrap)
