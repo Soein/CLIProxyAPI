@@ -137,7 +137,8 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	// to the write pool, keeping the store usable even if the replica is
 	// temporarily unreachable.
 	var readDB *sql.DB
-	if trimmedRead := strings.TrimSpace(cfg.ReadDSN); trimmedRead != "" && trimmedRead != cfg.DSN {
+	trimmedRead := strings.TrimSpace(cfg.ReadDSN)
+	if trimmedRead != "" && trimmedRead != cfg.DSN {
 		cfg.ReadDSN = trimmedRead
 		rdb, errOpen := sql.Open("pgx", trimmedRead)
 		if errOpen != nil {
@@ -148,6 +149,10 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 		} else {
 			readDB = rdb
 		}
+	} else {
+		// Normalize so s.cfg.ReadDSN reflects the trimmed value (or empty
+		// string when DSN==ReadDSN), keeping s.cfg internally consistent.
+		cfg.ReadDSN = ""
 	}
 
 	store := &PostgresStore{
@@ -161,27 +166,37 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	return store, nil
 }
 
-// Close releases the underlying database connections.
+// Close releases the underlying database connections. Read pool errors are
+// joined with the write pool error so a failure in either path is surfaced
+// rather than silently dropped.
 func (s *PostgresStore) Close() error {
 	if s == nil {
 		return nil
 	}
+	var errs []error
+	// readDB != db is a defensive guard against a future refactor that hands
+	// the same *sql.DB to both fields; today NewPostgresStore always opens
+	// readDB via a separate sql.Open call so the pointers diverge by
+	// construction.
 	if s.readDB != nil && s.readDB != s.db {
-		_ = s.readDB.Close()
+		if err := s.readDB.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("read pool: %w", err))
+		}
 	}
-	if s.db == nil {
-		return nil
+	if s.db != nil {
+		if err := s.db.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return s.db.Close()
+	return errors.Join(errs...)
 }
 
 // readPool returns the pool used for read-only queries. Falls back to the
 // write pool when no read replica is configured or the replica failed its
-// initial ping. Always non-nil for an initialized store.
+// initial ping. Callers must ensure the store is initialized; nil-receiver
+// behavior matches the rest of the read path (panic), keeping the convention
+// uniform across List / GetByID / syncAuth* / syncConfig*.
 func (s *PostgresStore) readPool() *sql.DB {
-	if s == nil {
-		return nil
-	}
 	if s.readDB != nil {
 		return s.readDB
 	}
