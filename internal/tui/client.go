@@ -140,7 +140,7 @@ func (c *Client) PutConfigYAML(yamlContent string) error {
 	return err
 }
 
-// GetUsage fetches usage statistics.
+// GetUsage fetches aggregated usage statistics for the TUI usage tab.
 func (c *Client) GetUsage() (map[string]any, error) {
 	return c.getJSON("/v0/management/usage")
 }
