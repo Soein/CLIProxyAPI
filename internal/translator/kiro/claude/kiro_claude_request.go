@@ -34,20 +34,16 @@ func ConvertClaudeRequestToKiro(model string, rawJSON []byte, _ bool) []byte {
 		lastUserText = anthropicContentToString(lastUser.Content)
 	}
 
-	// 只有在有 system 字段时才注入 identity override；
-	// 否则直接使用用户消息内容，避免干扰无系统提示的简单请求。
-	var combined string
-	if len(req.System) > 0 {
-		systemPrompt := ComposeSystem(req.System)
-		combined = systemPrompt
-		if lastUserText != "" {
-			if combined != "" {
-				combined += "\n"
-			}
-			combined += lastUserText
+	// Identity override is ALWAYS injected as defense against Kiro self-
+	// identifying ("I'm Kiro IDE..."). User-supplied system prompt (if any)
+	// is appended inside the override; the user message comes last.
+	systemPrompt := ComposeSystem(req.System)
+	combined := systemPrompt
+	if lastUserText != "" {
+		if combined != "" {
+			combined += "\n"
 		}
-	} else {
-		combined = lastUserText
+		combined += lastUserText
 	}
 
 	var ctx *UserInputMessageContext

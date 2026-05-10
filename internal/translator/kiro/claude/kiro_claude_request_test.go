@@ -26,8 +26,14 @@ func TestConvertSimpleRequest(t *testing.T) {
 	if body.ConversationState.ConversationID == "" {
 		t.Errorf("conversationId empty")
 	}
-	if body.ConversationState.CurrentMessage.UserInputMessage.Content != "hello" {
-		t.Errorf("content = %q; want hello", body.ConversationState.CurrentMessage.UserInputMessage.Content)
+	// Identity override is always injected, so content has the override
+	// followed by the user message. We assert both pieces are present.
+	content := body.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(content, "<CRITICAL_OVERRIDE>") {
+		t.Errorf("identity override missing from content: %q", content)
+	}
+	if !strings.HasSuffix(content, "hello") {
+		t.Errorf("user message should be at end: %q", content)
 	}
 	if body.ConversationState.CurrentMessage.UserInputMessage.ModelID != "claude-sonnet-4.5" {
 		t.Errorf("modelId = %q; want claude-sonnet-4.5", body.ConversationState.CurrentMessage.UserInputMessage.ModelID)
