@@ -55,6 +55,7 @@ func SaveCredentials(path string, c *Credentials) error {
 		return fmt.Errorf("kiro: write tmp: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("kiro: rename: %w", err)
 	}
 	return nil
