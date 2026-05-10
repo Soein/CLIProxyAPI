@@ -2,13 +2,17 @@ package executor
 
 import (
 	"context"
+	"encoding/binary"
+	"hash/crc32"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/eventstream/awsstream"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func TestKiroIdentifier(t *testing.T) {
@@ -66,3 +70,65 @@ func (s *kiroAuthStorage) SaveTokenToFile(_ string) error { return nil }
 // detected by loadKiroCredentials Strategy 1.
 func (s *kiroAuthStorage) GetAccessToken() string { return s.accessToken }
 func (s *kiroAuthStorage) GetProfileArn() string  { return s.profileArn }
+
+// makeKiroFrame creates a fake event-stream frame containing one JSON payload.
+// Mirrors awsstream/decoder_test.go's makeFrame helper.
+func makeKiroFrame(eventType, jsonPayload string) []byte {
+	headers := []byte{}
+	headers = append(headers, byte(len(":event-type")))
+	headers = append(headers, []byte(":event-type")...)
+	headers = append(headers, byte(awsstream.HeaderValueTypeString))
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(eventType)))
+	headers = append(headers, lenBuf[:]...)
+	headers = append(headers, []byte(eventType)...)
+
+	totalLen := uint32(awsstream.PreludeSize + len(headers) + len(jsonPayload) + awsstream.MessageCRCSize)
+	headersLen := uint32(len(headers))
+
+	frame := make([]byte, 0, totalLen)
+	var preludeBuf [12]byte
+	binary.BigEndian.PutUint32(preludeBuf[0:4], totalLen)
+	binary.BigEndian.PutUint32(preludeBuf[4:8], headersLen)
+	binary.BigEndian.PutUint32(preludeBuf[8:12], crc32.ChecksumIEEE(preludeBuf[0:8]))
+	frame = append(frame, preludeBuf[:]...)
+	frame = append(frame, headers...)
+	frame = append(frame, []byte(jsonPayload)...)
+	msgCRC := crc32.ChecksumIEEE(frame[:totalLen-awsstream.MessageCRCSize])
+	var crcBuf [4]byte
+	binary.BigEndian.PutUint32(crcBuf[:], msgCRC)
+	frame = append(frame, crcBuf[:]...)
+	return frame
+}
+
+func TestKiroExecuteNonStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+		w.WriteHeader(200)
+		w.Write(makeKiroFrame("content", `{"text":"Hello "}`))
+		w.Write(makeKiroFrame("content", `{"text":"world"}`))
+		w.Write(makeKiroFrame("contextUsage", `{"contextUsagePercentage":1.5}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-1",
+		Provider: "kiro",
+		Storage:  &kiroAuthStorage{accessToken: "test_at", profileArn: "arn:profile"},
+	}
+
+	e := NewKiroExecutor(&config.Config{})
+	e.endpointOverride = srv.URL
+
+	req := cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4.5",
+		Payload: []byte(`{"profileArn":"arn","conversationState":{"agentTaskType":"vibe","chatTriggerType":"MANUAL","conversationId":"c","currentMessage":{"userInputMessage":{"content":"hi","modelId":"claude-sonnet-4.5","origin":"AI_EDITOR"}}}}`),
+	}
+	resp, err := e.Execute(context.Background(), auth, req, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), "Hello") || !strings.Contains(string(resp.Payload), "world") {
+		t.Errorf("payload missing text: %s", resp.Payload)
+	}
+}

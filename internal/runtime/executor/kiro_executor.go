@@ -1,24 +1,37 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime"
+	"strings"
 
 	"github.com/google/uuid"
 	internalkiro "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/eventstream/awsstream"
+	kiroclaude "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+)
+
+const (
+	kiroEndpointTemplate = "https://q.{region}.amazonaws.com/generateAssistantResponse"
+	kiroDefaultRegion    = "us-east-1"
 )
 
 // KiroExecutor implements cliproxyauth.ProviderExecutor for AWS Kiro (Amazon Q Developer).
 type KiroExecutor struct {
 	cfg        *config.Config
 	httpClient *http.Client
+	// endpointOverride lets tests redirect HTTP calls. Empty in production.
+	endpointOverride string
 }
 
 // NewKiroExecutor constructs a KiroExecutor with config-based proxy.
@@ -70,9 +83,69 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	return auth, nil
 }
 
-// Execute is implemented in Task 3.
-func (e *KiroExecutor) Execute(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, fmt.Errorf("kiro executor: Execute not yet implemented (Task 3)")
+// Execute performs a non-streaming request: reads all event-stream frames,
+// passes each through the response translator, and returns the aggregated
+// SSE-flavored payload as the single response.
+func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	frames, err := e.fetchFrames(ctx, auth, req.Payload)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
+	var allBytes []byte
+	param := new(any)
+	for _, f := range frames {
+		lines := kiroclaude.ConvertKiroResponseToClaude(ctx, req.Model, req.Payload, req.Payload, f.Payload, param)
+		for _, ln := range lines {
+			allBytes = append(allBytes, ln...)
+			allBytes = append(allBytes, '\n')
+		}
+	}
+	return cliproxyexecutor.Response{Payload: allBytes}, nil
+}
+
+// fetchFrames POSTs the body to Kiro and returns all decoded frames. Used by
+// Execute (sync). ExecuteStream uses postKiro directly + a goroutine.
+func (e *KiroExecutor) fetchFrames(ctx context.Context, auth *cliproxyauth.Auth, body []byte) ([]*awsstream.Frame, error) {
+	resp, err := e.postKiro(ctx, auth, body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("kiro: upstream status %d", resp.StatusCode)
+	}
+	dec := awsstream.NewDecoder(resp.Body)
+	var frames []*awsstream.Frame
+	for {
+		f, err := dec.ReadFrame()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return frames, fmt.Errorf("kiro executor: decode frame: %w", err)
+		}
+		frames = append(frames, f)
+	}
+	return frames, nil
+}
+
+// postKiro builds the HTTP request and dispatches via HttpRequest.
+func (e *KiroExecutor) postKiro(ctx context.Context, auth *cliproxyauth.Auth, body []byte) (*http.Response, error) {
+	endpoint := e.endpointOverride
+	if endpoint == "" {
+		creds, _ := loadKiroCredentials(auth)
+		region := kiroDefaultRegion
+		if creds != nil && creds.Region != "" {
+			region = creds.Region
+		}
+		endpoint = strings.ReplaceAll(kiroEndpointTemplate, "{region}", region)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("kiro executor: build request: %w", err)
+	}
+	return e.HttpRequest(ctx, auth, httpReq)
 }
 
 // ExecuteStream is implemented in Task 4.
