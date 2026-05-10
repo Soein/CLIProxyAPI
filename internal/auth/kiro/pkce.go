@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -80,11 +81,13 @@ type CallbackServer struct {
 	Result      chan CallbackResult
 	server      *http.Server
 	once        sync.Once
+	done        chan struct{}
 }
 
 // Close shuts down the underlying HTTP server.
 func (c *CallbackServer) Close() {
 	c.once.Do(func() {
+		close(c.done)
 		if c.server != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -122,6 +125,7 @@ func StartCallbackServer(opts CallbackOptions) (*CallbackServer, error) {
 		Port:        port,
 		RedirectURI: fmt.Sprintf("http://127.0.0.1:%d/oauth/callback", port),
 		Result:      make(chan CallbackResult, 1),
+		done:        make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -146,24 +150,33 @@ func StartCallbackServer(opts CallbackOptions) (*CallbackServer, error) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if res.Err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(w, "<html><body><h1>授权失败</h1><p>%s</p></body></html>", res.Err)
+			fmt.Fprintf(w, "<html><body><h1>授权失败</h1><p>%s</p></body></html>", html.EscapeString(res.Err.Error()))
 		} else {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, `<html><body><h1>授权成功</h1><p>请关闭此窗口</p></body></html>`)
 		}
 		select {
 		case cb.Result <- res:
+			go cb.Close()
 		default:
 		}
 	})
 
-	cb.server = &http.Server{Handler: mux}
+	cb.server = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+	}
 	go func() { _ = cb.server.Serve(listener) }()
 
-	// Auto-shutdown timer.
+	// Auto-shutdown timer: exits early if Close() is called first.
 	go func() {
-		time.Sleep(opts.Timeout)
-		cb.Close()
+		select {
+		case <-time.After(opts.Timeout):
+			cb.Close()
+		case <-cb.done:
+		}
 	}()
 
 	return cb, nil
