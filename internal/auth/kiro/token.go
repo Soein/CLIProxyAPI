@@ -12,6 +12,7 @@ import (
 // All three auth methods share this struct; method-specific fields are
 // populated as appropriate.
 type Credentials struct {
+	Type                        string    `json:"type"` // always "kiro"
 	AuthMethod                  string    `json:"auth_method"`
 	AccessToken                 string    `json:"access_token"`
 	RefreshToken                string    `json:"refresh_token"`
@@ -43,6 +44,9 @@ func LoadCredentials(path string) (*Credentials, error) {
 // SaveCredentials writes credentials atomically to path. Parent directory is
 // created if missing. The file is written 0600 since it contains tokens.
 func SaveCredentials(path string, c *Credentials) error {
+	if c.Type == "" {
+		c.Type = "kiro"
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("kiro: mkdir: %w", err)
 	}

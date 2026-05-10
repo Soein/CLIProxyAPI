@@ -3,6 +3,7 @@ package kiro
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,5 +70,27 @@ func TestIsExpiredLeeway(t *testing.T) {
 				t.Errorf("IsExpired(%v, %v) = %v; want %v", tc.expiresAt, tc.leeway, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSaveCredentialsAlwaysSetsType(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kiro.json")
+	c := &Credentials{
+		AccessToken:  "at",
+		RefreshToken: "rt",
+		AuthMethod:   AuthMethodImport,
+		ExpiresAt:    time.Now().Add(time.Hour),
+		// Note: Type is intentionally NOT set
+	}
+	if err := SaveCredentials(path, c); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"type": "kiro"`) {
+		t.Errorf("on-disk JSON missing type=kiro: %s", raw)
 	}
 }
