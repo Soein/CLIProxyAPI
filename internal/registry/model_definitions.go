@@ -78,6 +78,18 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// GetKiroModels returns the standard Kiro (Amazon Q Developer) model definitions
+// as a pointer slice, consistent with other GetXxxModels helpers.
+func GetKiroModels() []*ModelInfo {
+	flat := KiroModels()
+	out := make([]*ModelInfo, len(flat))
+	for i := range flat {
+		m := flat[i]
+		out[i] = &m
+	}
+	return out
+}
+
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
