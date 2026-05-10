@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	internalkiro "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -36,6 +35,5 @@ func (KiroAuthenticator) Login(ctx context.Context, cfg *config.Config, opts *Lo
 	_ = ctx
 	_ = cfg
 	_ = opts
-	_ = internalkiro.MachineIDFallback // anchor the import so package compiles even if other refs change
 	return nil, fmt.Errorf("kiro: Login not yet implemented (M2)")
 }

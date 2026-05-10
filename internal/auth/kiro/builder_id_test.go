@@ -88,7 +88,7 @@ func TestBuilderIDPollSuccess(t *testing.T) {
 	bd.OIDCEndpointOverride = srv.URL
 	bd.PollInterval = 10 * time.Millisecond
 
-	creds, err := bd.PollToken(context.Background(), "cid", "csec", "dc", 100, time.Second)
+	creds, err := bd.PollToken(context.Background(), "cid", "csec", "dc", time.Second)
 	if err != nil {
 		t.Fatalf("PollToken: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestBuilderIDPollTimeout(t *testing.T) {
 	bd.OIDCEndpointOverride = srv.URL
 	bd.PollInterval = 10 * time.Millisecond
 
-	_, err := bd.PollToken(context.Background(), "cid", "csec", "dc", 100, 50*time.Millisecond)
+	_, err := bd.PollToken(context.Background(), "cid", "csec", "dc", 50*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("expected timeout error, got %v", err)
 	}
@@ -129,7 +129,7 @@ func TestBuilderIDPollExplicitError(t *testing.T) {
 	bd.OIDCEndpointOverride = srv.URL
 	bd.PollInterval = 1 * time.Millisecond
 
-	_, err := bd.PollToken(context.Background(), "cid", "csec", "dc", 100, time.Second)
+	_, err := bd.PollToken(context.Background(), "cid", "csec", "dc", time.Second)
 	if err == nil || !strings.Contains(err.Error(), "access_denied") {
 		t.Fatalf("expected access_denied error, got %v", err)
 	}

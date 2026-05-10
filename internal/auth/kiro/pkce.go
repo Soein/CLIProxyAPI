@@ -205,7 +205,7 @@ func ExchangePKCECode(ctx context.Context, client *http.Client, opts PKCEExchang
 		}
 		tokenURL = strings.ReplaceAll(SocialAuthEndpoint, "{region}", region) + "/oauth/token"
 	}
-	body, _ := json.Marshal(map[string]string{
+	body := mustJSON(map[string]string{
 		"code":          opts.Code,
 		"code_verifier": opts.CodeVerifier,
 		"redirect_uri":  opts.RedirectURI,

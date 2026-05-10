@@ -53,7 +53,7 @@ func (r *Refresher) refreshSocial(ctx context.Context, c *Credentials) (*Credent
 	if url == "" {
 		url = strings.ReplaceAll(SocialRefreshEndpoint, "{region}", regionOrDefault(c))
 	}
-	body, _ := json.Marshal(map[string]string{"refreshToken": c.RefreshToken})
+	body := mustJSON(map[string]string{"refreshToken": c.RefreshToken})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("kiro: build refresh request: %w", err)
@@ -104,7 +104,7 @@ func (r *Refresher) refreshBuilderID(ctx context.Context, c *Credentials) (*Cred
 	if url == "" {
 		url = strings.ReplaceAll(BuilderIDOIDCEndpoint, "{region}", regionOrDefault(c)) + "/token"
 	}
-	body, _ := json.Marshal(map[string]string{
+	body := mustJSON(map[string]string{
 		"refreshToken": c.RefreshToken,
 		"clientId":     c.ClientID,
 		"clientSecret": c.ClientSecret,

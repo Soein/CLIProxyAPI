@@ -60,7 +60,7 @@ type RegisterClientResult struct {
 
 // RegisterClient anonymously creates a new OIDC client.
 func (b *BuilderIDClient) RegisterClient(ctx context.Context) (*RegisterClientResult, error) {
-	body, _ := json.Marshal(map[string]any{
+	body := mustJSON(map[string]any{
 		"clientName": "Kiro IDE",
 		"clientType": "public",
 		"scopes":     BuilderIDScopes,
@@ -119,7 +119,7 @@ func (b *BuilderIDClient) StartDeviceAuthorization(ctx context.Context, clientID
 	if startURL == "" {
 		startURL = BuilderIDStartURL
 	}
-	body, _ := json.Marshal(map[string]string{
+	body := mustJSON(map[string]string{
 		"clientId":     clientID,
 		"clientSecret": clientSecret,
 		"startUrl":     startURL,
@@ -165,7 +165,7 @@ func (b *BuilderIDClient) StartDeviceAuthorization(ctx context.Context, clientID
 
 // PollToken polls the /token endpoint until the user completes consent or
 // the timeout elapses. interval is overridden by b.PollInterval if set.
-func (b *BuilderIDClient) PollToken(ctx context.Context, clientID, clientSecret, deviceCode string, _ int, timeout time.Duration) (*Credentials, error) {
+func (b *BuilderIDClient) PollToken(ctx context.Context, clientID, clientSecret, deviceCode string, timeout time.Duration) (*Credentials, error) {
 	deadline := time.Now().Add(timeout)
 	interval := b.PollInterval
 	if interval <= 0 {
@@ -177,7 +177,7 @@ func (b *BuilderIDClient) PollToken(ctx context.Context, clientID, clientSecret,
 			return nil, fmt.Errorf("kiro: device code timeout")
 		}
 
-		body, _ := json.Marshal(map[string]string{
+		body := mustJSON(map[string]string{
 			"clientId":     clientID,
 			"clientSecret": clientSecret,
 			"deviceCode":   deviceCode,
