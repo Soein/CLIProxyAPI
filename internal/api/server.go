@@ -719,6 +719,7 @@ func (s *Server) registerManagementRoutes() {
 		// Kiro-specific endpoints (login flows + manual refresh).
 		// List/Upload/Delete are covered by the generic auth_files endpoints.
 		mgmt.POST("/auth/kiro/login/pkce/start", s.mgmt.PostKiroPKCEStart)
+		mgmt.GET("/auth/kiro/login/pkce/:sid", s.mgmt.GetKiroPKCEStatus)
 		mgmt.POST("/auth/kiro/login/device/start", s.mgmt.PostKiroDeviceStart)
 		mgmt.GET("/auth/kiro/login/device/:sid", s.mgmt.GetKiroDeviceStatus)
 		mgmt.POST("/auth/kiro/:name/refresh", s.mgmt.PostKiroRefresh)

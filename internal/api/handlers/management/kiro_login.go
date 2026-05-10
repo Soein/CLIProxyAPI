@@ -2,9 +2,9 @@ package management
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -50,16 +50,90 @@ func (h *Handler) PostKiroPKCEStart(c *gin.Context) {
 	}
 	challenge := internalkiro.CodeChallenge(verifier)
 
-	const callbackPort = 19876
-	redirectURI := buildKiroCallbackURI(callbackPort)
-	authURL := internalkiro.BuildPKCEAuthURL(idp, redirectURI, challenge, state, req.Region)
-
-	sid := h.kiroSessions.NewPKCESession(verifier, state, redirectURI)
-	c.JSON(http.StatusOK, gin.H{
-		"session_id": sid,
-		"auth_url":   authURL,
-		"state":      state,
+	// Start the local callback server first so we know the actual port BEFORE
+	// constructing the auth URL (port may differ from default if 19876 is busy).
+	cb, err := internalkiro.StartCallbackServer(internalkiro.CallbackOptions{
+		ExpectedState: state,
 	})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "start callback server: " + err.Error()})
+		return
+	}
+
+	authURL := internalkiro.BuildPKCEAuthURL(idp, cb.RedirectURI, challenge, state, req.Region)
+	sid := h.kiroSessions.NewPKCESession(verifier, state, cb.RedirectURI)
+
+	authDir := ""
+	if h.cfg != nil {
+		authDir = h.cfg.AuthDir
+	}
+	region := req.Region
+
+	// Spawn goroutine to wait for the callback, exchange the code, persist creds.
+	go func() {
+		defer cb.Close()
+		select {
+		case res := <-cb.Result:
+			if res.Err != nil {
+				h.kiroSessions.CompletePKCE(sid, nil, res.Err)
+				return
+			}
+			creds, exchErr := internalkiro.ExchangePKCECode(context.Background(), nil, internalkiro.PKCEExchangeOptions{
+				Code:         res.Code,
+				CodeVerifier: verifier,
+				RedirectURI:  cb.RedirectURI,
+				Region:       region,
+			})
+			if exchErr != nil {
+				h.kiroSessions.CompletePKCE(sid, nil, exchErr)
+				return
+			}
+			// Persist creds to AuthDir so they appear in ListAuthFiles.
+			if authDir != "" {
+				fname := internalkiro.CredentialFileName(creds.ProfileArn)
+				full := filepath.Join(authDir, fname)
+				if saveErr := internalkiro.SaveCredentials(full, creds); saveErr != nil {
+					h.kiroSessions.CompletePKCE(sid, nil, saveErr)
+					return
+				}
+			}
+			h.kiroSessions.CompletePKCE(sid, creds, nil)
+		case <-time.After(10 * time.Minute):
+			h.kiroSessions.CompletePKCE(sid, nil, errors.New("pkce login timeout"))
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{
+		"session_id":   sid,
+		"auth_url":     authURL,
+		"state":        state,
+		"redirect_uri": cb.RedirectURI,
+	})
+}
+
+// GetKiroPKCEStatus returns the current status of a PKCE login session.
+// Status is "pending" / "success" / "error". Frontend polls until non-pending.
+func (h *Handler) GetKiroPKCEStatus(c *gin.Context) {
+	if h == nil || h.kiroSessions == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "kiro session store not initialized"})
+		return
+	}
+	sid := c.Param("sid")
+	sess, err := h.kiroSessions.GetPKCE(sid)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	resp := gin.H{
+		"status": sess.Status,
+	}
+	if sess.Err != "" {
+		resp["error"] = sess.Err
+	}
+	if sess.Credentials != nil {
+		resp["access_token_preview"] = previewKiroToken(sess.Credentials.AccessToken)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func normalizeKiroProvider(p string) string {
@@ -71,10 +145,6 @@ func normalizeKiroProvider(p string) string {
 	default:
 		return ""
 	}
-}
-
-func buildKiroCallbackURI(port int) string {
-	return "http://127.0.0.1:" + strconv.Itoa(port) + "/oauth/callback"
 }
 
 // PostKiroDeviceStart begins a Builder ID device-code login.

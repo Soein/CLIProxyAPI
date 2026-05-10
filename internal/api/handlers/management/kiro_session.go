@@ -16,10 +16,14 @@ var errKiroSessionNotFound = errors.New("kiro session not found")
 const defaultKiroSessionTTL = 10 * time.Minute
 
 // kiroPKCESession captures one in-flight PKCE login.
+// Status is one of "pending", "success", "error".
 type kiroPKCESession struct {
 	CodeVerifier string
 	State        string
 	RedirectURI  string
+	Status       string                 // "pending" / "success" / "error"
+	Credentials  *internalkiro.Credentials // set on success
+	Err          string                 // set on error
 	CreatedAt    time.Time
 	ExpiresAt    time.Time
 }
@@ -73,6 +77,7 @@ func (s *kiroSessionStore) NewPKCESession(verifier, state, redirectURI string) s
 		CodeVerifier: verifier,
 		State:        state,
 		RedirectURI:  redirectURI,
+		Status:       "pending",
 		CreatedAt:    now,
 		ExpiresAt:    now.Add(s.ttl),
 	}
@@ -87,10 +92,30 @@ func (s *kiroSessionStore) GetPKCE(sid string) (*kiroPKCESession, error) {
 	if !ok {
 		return nil, errKiroSessionNotFound
 	}
-	if !sess.ExpiresAt.IsZero() && time.Now().After(sess.ExpiresAt) {
+	// Only expire pending sessions — completed ones stay accessible for 2 extra
+	// minutes (same grace period as device sessions) so the frontend can fetch
+	// the result after the browser redirect.
+	if !sess.ExpiresAt.IsZero() && time.Now().After(sess.ExpiresAt) && sess.Status == "pending" {
 		return nil, errKiroSessionNotFound
 	}
 	return sess, nil
+}
+
+// CompletePKCE marks a PKCE session as succeeded or failed.
+func (s *kiroSessionStore) CompletePKCE(sid string, creds *internalkiro.Credentials, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.pkce[sid]
+	if !ok {
+		return
+	}
+	if err != nil {
+		sess.Status = "error"
+		sess.Err = err.Error()
+		return
+	}
+	sess.Status = "success"
+	sess.Credentials = creds
 }
 
 func (s *kiroSessionStore) DeletePKCE(sid string) {
@@ -149,7 +174,11 @@ func (s *kiroSessionStore) CompleteDevice(sid string, creds *internalkiro.Creden
 
 func (s *kiroSessionStore) purgeExpiredLocked(now time.Time) {
 	for k, v := range s.pkce {
-		if !v.ExpiresAt.IsZero() && now.After(v.ExpiresAt) {
+		// Don't purge completed PKCE sessions immediately — give frontend 2 extra
+		// minutes to fetch the result (same grace period as device sessions).
+		if !v.ExpiresAt.IsZero() && now.After(v.ExpiresAt.Add(2*time.Minute)) {
+			delete(s.pkce, k)
+		} else if !v.ExpiresAt.IsZero() && now.After(v.ExpiresAt) && v.Status == "pending" {
 			delete(s.pkce, k)
 		}
 	}

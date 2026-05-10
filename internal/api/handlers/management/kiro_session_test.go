@@ -55,3 +55,65 @@ func TestKiroSessionStoreExpiry(t *testing.T) {
 		t.Error("expected expiry error")
 	}
 }
+
+func TestKiroSessionStorePKCEStatusInitiallyPending(t *testing.T) {
+	store := newKiroSessionStore(5 * time.Minute)
+	sid := store.NewPKCESession("v", "s", "r")
+	got, err := store.GetPKCE(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "pending" {
+		t.Errorf("Status = %q; want pending", got.Status)
+	}
+}
+
+func TestKiroSessionStoreCompletePKCE(t *testing.T) {
+	store := newKiroSessionStore(5 * time.Minute)
+	sid := store.NewPKCESession("v", "s", "r")
+	creds := &internalkiro.Credentials{AccessToken: "at"}
+	store.CompletePKCE(sid, creds, nil)
+	got, err := store.GetPKCE(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "success" || got.Credentials == nil {
+		t.Errorf("after complete: %+v", got)
+	}
+}
+
+func TestKiroSessionStoreCompletePKCEError(t *testing.T) {
+	store := newKiroSessionStore(5 * time.Minute)
+	sid := store.NewPKCESession("v", "s", "r")
+	store.CompletePKCE(sid, nil, errors.New("something broke"))
+	got, err := store.GetPKCE(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "error" || got.Err == "" {
+		t.Errorf("after error complete: %+v", got)
+	}
+}
+
+func TestKiroSessionStorePKCECompletedNotPurgedImmediately(t *testing.T) {
+	// Completed PKCE sessions should survive past their TTL for 2 extra minutes
+	// so the frontend has time to fetch the result (mirrors device-session behaviour).
+	store := newKiroSessionStore(10 * time.Millisecond)
+	sid := store.NewPKCESession("v", "s", "r")
+	store.CompletePKCE(sid, &internalkiro.Credentials{AccessToken: "tok"}, nil)
+
+	// Sleep past the original TTL.
+	time.Sleep(50 * time.Millisecond)
+
+	// Trigger purge by creating a new session.
+	store.NewPKCESession("v2", "s2", "r2")
+
+	// The completed session must still be accessible.
+	got, err := store.GetPKCE(sid)
+	if err != nil {
+		t.Fatalf("completed session was purged too early: %v", err)
+	}
+	if got.Status != "success" {
+		t.Errorf("Status = %q; want success", got.Status)
+	}
+}

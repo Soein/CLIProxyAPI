@@ -105,3 +105,76 @@ func TestGetKiroDeviceStatusUnknownSession(t *testing.T) {
 		t.Errorf("status = %d; want 404", w.Code)
 	}
 }
+
+func TestGetKiroPKCEStatusReturnsPending(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &Handler{kiroSessions: newKiroSessionStore(10 * time.Minute)}
+	r := gin.New()
+	r.GET("/v0/management/auth/kiro/login/pkce/:sid", h.GetKiroPKCEStatus)
+
+	sid := h.kiroSessions.NewPKCESession("v", "s", "http://127.0.0.1:1/cb")
+	req := httptest.NewRequest("GET", "/v0/management/auth/kiro/login/pkce/"+sid, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "pending" {
+		t.Errorf("status = %v", resp["status"])
+	}
+}
+
+func TestGetKiroPKCEStatusReturnsSuccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &Handler{kiroSessions: newKiroSessionStore(10 * time.Minute)}
+	r := gin.New()
+	r.GET("/v0/management/auth/kiro/login/pkce/:sid", h.GetKiroPKCEStatus)
+
+	sid := h.kiroSessions.NewPKCESession("v", "s", "http://127.0.0.1:1/cb")
+	h.kiroSessions.CompletePKCE(sid, &internalkiro.Credentials{AccessToken: "at"}, nil)
+
+	req := httptest.NewRequest("GET", "/v0/management/auth/kiro/login/pkce/"+sid, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "success" {
+		t.Errorf("status = %v", resp["status"])
+	}
+}
+
+func TestGetKiroPKCEStatusUnknownSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &Handler{kiroSessions: newKiroSessionStore(10 * time.Minute)}
+	r := gin.New()
+	r.GET("/v0/management/auth/kiro/login/pkce/:sid", h.GetKiroPKCEStatus)
+
+	req := httptest.NewRequest("GET", "/v0/management/auth/kiro/login/pkce/nonexistent", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d; want 404", w.Code)
+	}
+}
+
+func TestPostKiroPKCEStartReturnsRedirectURI(t *testing.T) {
+	_, r := setupKiroPKCEHandler(t)
+	body := strings.NewReader(`{"provider":"github"}`)
+	req := httptest.NewRequest("POST", "/v0/management/auth/kiro/login/pkce/start", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["redirect_uri"] == "" {
+		t.Errorf("redirect_uri missing: %+v", resp)
+	}
+	if !strings.Contains(resp["redirect_uri"], "127.0.0.1") {
+		t.Errorf("redirect_uri should be a local address: %s", resp["redirect_uri"])
+	}
+}
