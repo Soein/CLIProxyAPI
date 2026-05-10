@@ -148,9 +148,52 @@ func (e *KiroExecutor) postKiro(ctx context.Context, auth *cliproxyauth.Auth, bo
 	return e.HttpRequest(ctx, auth, httpReq)
 }
 
-// ExecuteStream is implemented in Task 4.
-func (e *KiroExecutor) ExecuteStream(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return nil, fmt.Errorf("kiro executor: ExecuteStream not yet implemented (Task 4)")
+// ExecuteStream performs a streaming request: starts a goroutine that decodes
+// event-stream frames and sends translated SSE chunks via the result channel.
+// The goroutine handles cleanup via deferred close + body close.
+func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	resp, err := e.postKiro(ctx, auth, req.Payload)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode/100 != 2 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("kiro: upstream status %d", resp.StatusCode)
+	}
+
+	chunks := make(chan cliproxyexecutor.StreamChunk, 16)
+	go func() {
+		defer close(chunks)
+		defer resp.Body.Close()
+		dec := awsstream.NewDecoder(resp.Body)
+		param := new(any)
+		for {
+			f, err := dec.ReadFrame()
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if err != nil {
+				select {
+				case chunks <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("kiro: decode: %w", err)}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			lines := kiroclaude.ConvertKiroResponseToClaude(ctx, req.Model, req.Payload, req.Payload, f.Payload, param)
+			for _, ln := range lines {
+				select {
+				case chunks <- cliproxyexecutor.StreamChunk{Payload: ln}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return &cliproxyexecutor.StreamResult{
+		Headers: resp.Header,
+		Chunks:  chunks,
+	}, nil
 }
 
 // CountTokens returns 0 for now. Real counting is M5.

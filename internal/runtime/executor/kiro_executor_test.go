@@ -101,6 +101,51 @@ func makeKiroFrame(eventType, jsonPayload string) []byte {
 	return frame
 }
 
+func TestKiroExecuteStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+		flusher, _ := w.(http.Flusher)
+		w.WriteHeader(200)
+		w.Write(makeKiroFrame("content", `{"text":"Hi"}`))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		w.Write(makeKiroFrame("content", `{"text":"!"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	auth := &cliproxyauth.Auth{
+		ID: "kiro-1", Provider: "kiro",
+		Storage: &kiroAuthStorage{accessToken: "test_at", profileArn: "arn"},
+	}
+	e := NewKiroExecutor(&config.Config{})
+	e.endpointOverride = srv.URL
+
+	req := cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4.5",
+		Payload: []byte(`{}`),
+	}
+	result, err := e.ExecuteStream(context.Background(), auth, req, cliproxyexecutor.Options{Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream: %v", err)
+	}
+	if result == nil {
+		t.Fatal("nil StreamResult")
+	}
+
+	got := []string{}
+	for ch := range result.Chunks {
+		if ch.Err != nil {
+			t.Errorf("chunk err: %v", ch.Err)
+		}
+		got = append(got, string(ch.Payload))
+	}
+	merged := strings.Join(got, "\n")
+	if !strings.Contains(merged, `"text":"Hi"`) || !strings.Contains(merged, `"text":"!"`) {
+		t.Errorf("missing chunks in:\n%s", merged)
+	}
+}
+
 func TestKiroExecuteNonStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
