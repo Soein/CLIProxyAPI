@@ -76,8 +76,10 @@ func TestConvertHistoryAndCurrent(t *testing.T) {
 	out := ConvertClaudeRequestToKiro("claude-sonnet-4.5", in, true)
 	var body KiroRequestBody
 	_ = json.Unmarshal(out, &body)
-	if body.ConversationState.CurrentMessage.UserInputMessage.Content != "q2" {
-		t.Errorf("current message should be q2; got %q", body.ConversationState.CurrentMessage.UserInputMessage.Content)
+	// Identity override is prepended; user message ("q2") must be at the end.
+	curContent := body.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.HasSuffix(curContent, "q2") {
+		t.Errorf("current message should end with q2; got %q", curContent)
 	}
 	if len(body.ConversationState.History) != 2 {
 		t.Fatalf("history len = %d; want 2", len(body.ConversationState.History))
