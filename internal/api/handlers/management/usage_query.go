@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 // usageRange is the parsed query parameters for /v0/management/usage in

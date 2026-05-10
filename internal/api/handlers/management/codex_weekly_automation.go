@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 )
 
 func (h *Handler) GetCodexWeeklyAutomationEnabled(c *gin.Context) {

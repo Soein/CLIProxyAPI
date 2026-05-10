@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // stubRing lets tests dictate IsMine without spinning up cluster.AuthRing.

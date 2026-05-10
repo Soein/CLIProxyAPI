@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	codexweekly "github.com/router-for-me/CLIProxyAPI/v6/internal/codexweekly"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	codexweekly "github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type fakeAuthManager struct {

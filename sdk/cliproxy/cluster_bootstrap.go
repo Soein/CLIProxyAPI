@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/cluster"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cluster"
 	log "github.com/sirupsen/logrus"
 )
 
