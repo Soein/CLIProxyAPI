@@ -6,9 +6,12 @@ import (
 	"hash/crc32"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	internalkiro "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/eventstream/awsstream"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -175,5 +178,139 @@ func TestKiroExecuteNonStream(t *testing.T) {
 	}
 	if !strings.Contains(string(resp.Payload), "Hello") || !strings.Contains(string(resp.Payload), "world") {
 		t.Errorf("payload missing text: %s", resp.Payload)
+	}
+}
+
+// --- Refresh persistence tests ---
+
+func TestKiroRefreshPersistsToDiskAndMetadata(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mock social refresh endpoint.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"accessToken":"fresh_at","refreshToken":"fresh_rt","profileArn":"arn:fresh","expiresIn":3600}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kiro-acct.json")
+
+	original := &internalkiro.Credentials{
+		AuthMethod:   internalkiro.AuthMethodSocial,
+		AccessToken:  "stale_at",
+		RefreshToken: "stale_rt",
+		ProfileArn:   "arn:stale",
+		Region:       "us-east-1",
+		ExpiresAt:    time.Now().Add(10 * time.Second), // near expiry
+	}
+	if err := internalkiro.SaveCredentials(path, original); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	// Build an Auth that points at the file via Attributes["path"].
+	// Storage carries the access token (kiroAccessor pattern), Metadata
+	// also has the access_token so loadKiroCredentials can find it.
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-acct",
+		Provider: "kiro",
+		Storage:  &kiroAuthStorage{accessToken: original.AccessToken, profileArn: original.ProfileArn},
+		Attributes: map[string]string{
+			"path":   path,
+			"source": path,
+		},
+		Metadata: map[string]any{
+			"type":          "kiro",
+			"auth_method":   internalkiro.AuthMethodSocial,
+			"access_token":  original.AccessToken,
+			"refresh_token": original.RefreshToken,
+			"region":        original.Region,
+		},
+	}
+
+	// We exercise persistKiroRefresh directly (after a real Refresher call
+	// to a mock server). The KiroExecutor.Refresh method uses the same
+	// composition internally — see Refresh() in kiro_executor.go.
+	r := internalkiro.NewRefresher(srv.Client())
+	r.SocialRefreshURLOverride = srv.URL
+	updated, err := r.Refresh(context.Background(), original)
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if err := persistKiroRefresh(auth, updated); err != nil {
+		t.Fatalf("persistKiroRefresh: %v", err)
+	}
+
+	// Verify on-disk file reflects new token.
+	reloaded, err := internalkiro.LoadCredentials(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.AccessToken != "fresh_at" {
+		t.Errorf("on-disk AccessToken = %q; want fresh_at", reloaded.AccessToken)
+	}
+	if reloaded.RefreshToken != "fresh_rt" {
+		t.Errorf("on-disk RefreshToken = %q; want fresh_rt", reloaded.RefreshToken)
+	}
+
+	// Verify Metadata mirrors the new token.
+	if got := auth.Metadata["access_token"]; got != "fresh_at" {
+		t.Errorf("Metadata access_token = %v; want fresh_at", got)
+	}
+	if got := auth.Metadata["refresh_token"]; got != "fresh_rt" {
+		t.Errorf("Metadata refresh_token = %v; want fresh_rt", got)
+	}
+	if got := auth.Metadata["profile_arn"]; got != "arn:fresh" {
+		t.Errorf("Metadata profile_arn = %v; want arn:fresh", got)
+	}
+
+	// Verify LastRefreshedAt was stamped.
+	if auth.LastRefreshedAt.IsZero() {
+		t.Errorf("LastRefreshedAt was not stamped")
+	}
+}
+
+func TestLoadKiroCredentialsOverlaysMetadataOverStorage(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Storage: &kiroAuthStorage{accessToken: "stale_at", profileArn: "arn:stale"},
+		Metadata: map[string]any{
+			"access_token":  "fresh_at",  // overlay should win
+			"refresh_token": "fresh_rt",
+			"profile_arn":   "arn:fresh",
+			"region":        "us-west-2",
+		},
+	}
+	creds, err := loadKiroCredentials(auth)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if creds.AccessToken != "fresh_at" {
+		t.Errorf("AccessToken = %q; want fresh_at (Metadata overlay)", creds.AccessToken)
+	}
+	if creds.RefreshToken != "fresh_rt" {
+		t.Errorf("RefreshToken = %q; want fresh_rt", creds.RefreshToken)
+	}
+	if creds.Region != "us-west-2" {
+		t.Errorf("Region = %q; want us-west-2", creds.Region)
+	}
+}
+
+func TestLoadKiroCredentialsFromMetadataOnly(t *testing.T) {
+	// No Storage set — must fall back to Metadata.
+	auth := &cliproxyauth.Auth{
+		Metadata: map[string]any{
+			"access_token":  "from_meta",
+			"refresh_token": "rt_from_meta",
+			"region":        "us-east-1",
+		},
+	}
+	creds, err := loadKiroCredentials(auth)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if creds.AccessToken != "from_meta" {
+		t.Errorf("AccessToken = %q; want from_meta", creds.AccessToken)
+	}
+	if creds.AuthMethod != internalkiro.AuthMethodImport {
+		t.Errorf("AuthMethod = %q; want import (default)", creds.AuthMethod)
 	}
 }

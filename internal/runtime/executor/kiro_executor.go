@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	internalkiro "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
@@ -66,7 +67,24 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	return e.httpClient.Do(req)
 }
 
-// Refresh delegates to internal/auth/kiro.Refresher.
+// Refresh delegates to internal/auth/kiro.Refresher and persists the rotated
+// tokens back to disk + the in-memory Auth metadata so subsequent requests
+// pick up the fresh access token without a server restart.
+//
+// Persistence strategy:
+//  1. Load credentials from auth.Storage (existing path).
+//  2. Call Refresher.Refresh to rotate tokens.
+//  3. Write the updated credentials atomically to the file path stored in
+//     auth.Attributes["path"] (set by management.buildAuthFromFileData).
+//  4. Mirror the new fields into auth.Metadata so the conductor and any UI
+//     consumers see the rotated values.
+//  5. Stamp auth.LastRefreshedAt so the auto-refresh loop respects the
+//     freshly-set expiry instead of immediately scheduling another refresh.
+//
+// In-memory Storage update is best-effort: if Storage implements an updater
+// interface (kiroWriter), we mutate it in place; otherwise the next request
+// will read fresh tokens via the Metadata path inside loadKiroCredentials —
+// see Strategy 3 there.
 func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("kiro executor: refresh: auth is nil")
@@ -76,10 +94,15 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		return nil, err
 	}
 	r := internalkiro.NewRefresher(e.httpClient)
-	if _, err := r.Refresh(ctx, creds); err != nil {
+	updated, err := r.Refresh(ctx, creds)
+	if err != nil {
 		return nil, err
 	}
-	// Persistence of refreshed tokens is wired in M3 (management API).
+	if err := persistKiroRefresh(auth, updated); err != nil {
+		// Disk write failed but tokens are still valid in memory; surface the
+		// error so the auto-refresh loop can apply backoff / alerting.
+		return nil, fmt.Errorf("kiro executor: persist refreshed credentials: %w", err)
+	}
 	return auth, nil
 }
 
@@ -226,35 +249,188 @@ type kiroAccessor interface {
 	GetProfileArn() string
 }
 
+// kiroWriter is the optional companion to kiroAccessor. When auth.Storage
+// implements both, persistKiroRefresh updates the in-memory token state so
+// concurrent in-flight requests don't race against a stale Storage.
+type kiroWriter interface {
+	SetAccessToken(string)
+	SetRefreshToken(string)
+	SetExpiresAt(time.Time)
+}
+
 // loadKiroCredentials extracts Kiro credentials from the auth Storage.
 // Strategy 1: type-assert to kiroAccessor (production KiroTokenStorage + test stub).
-// Strategy 2: json.Marshaler fallback (generic storage that can serialize itself).
+// Strategy 2: read from auth.Metadata when previously refreshed in-place.
+// Strategy 3: json.Marshaler fallback (generic storage that can serialize itself).
 func loadKiroCredentials(auth *cliproxyauth.Auth) (*internalkiro.Credentials, error) {
-	if auth == nil || auth.Storage == nil {
-		return nil, fmt.Errorf("kiro executor: missing storage")
+	if auth == nil {
+		return nil, fmt.Errorf("kiro executor: nil auth")
 	}
 
 	// Strategy 1: direct accessor interface (KiroTokenStorage and test stub).
-	if a, ok := auth.Storage.(kiroAccessor); ok {
-		return &internalkiro.Credentials{
-			AccessToken: a.GetAccessToken(),
-			ProfileArn:  a.GetProfileArn(),
-			AuthMethod:  internalkiro.AuthMethodImport,
-		}, nil
+	if auth.Storage != nil {
+		if a, ok := auth.Storage.(kiroAccessor); ok {
+			c := &internalkiro.Credentials{
+				AccessToken: a.GetAccessToken(),
+				ProfileArn:  a.GetProfileArn(),
+				AuthMethod:  internalkiro.AuthMethodImport,
+			}
+			// Overlay the latest values from Metadata (set by persistKiroRefresh)
+			// so a refreshed token isn't shadowed by stale Storage state.
+			overlayKiroMetadata(c, auth.Metadata)
+			return c, nil
+		}
 	}
 
-	// Strategy 2: JSON marshaler (fallback for generic storages).
-	if marshaler, ok := auth.Storage.(json.Marshaler); ok {
-		data, err := marshaler.MarshalJSON()
-		if err != nil {
-			return nil, fmt.Errorf("kiro executor: marshal storage: %w", err)
-		}
-		var c internalkiro.Credentials
-		if err := json.Unmarshal(data, &c); err != nil {
-			return nil, fmt.Errorf("kiro executor: parse credentials: %w", err)
-		}
-		return &c, nil
+	// Strategy 2: Metadata-driven (file uploaded via management API).
+	if c := credsFromMetadata(auth.Metadata); c != nil {
+		return c, nil
 	}
 
-	return nil, fmt.Errorf("kiro executor: unsupported storage type %T", auth.Storage)
+	// Strategy 3: JSON marshaler (fallback for generic storages).
+	if auth.Storage != nil {
+		if marshaler, ok := auth.Storage.(json.Marshaler); ok {
+			data, err := marshaler.MarshalJSON()
+			if err != nil {
+				return nil, fmt.Errorf("kiro executor: marshal storage: %w", err)
+			}
+			var c internalkiro.Credentials
+			if err := json.Unmarshal(data, &c); err != nil {
+				return nil, fmt.Errorf("kiro executor: parse credentials: %w", err)
+			}
+			return &c, nil
+		}
+	}
+
+	return nil, fmt.Errorf("kiro executor: no usable storage or metadata")
+}
+
+// credsFromMetadata reconstructs Credentials from the Metadata map populated
+// by management.buildAuthFromFileData (which json.Unmarshals the upload).
+func credsFromMetadata(meta map[string]any) *internalkiro.Credentials {
+	if len(meta) == 0 {
+		return nil
+	}
+	access, _ := meta["access_token"].(string)
+	if access == "" {
+		return nil
+	}
+	c := &internalkiro.Credentials{AccessToken: access}
+	overlayKiroMetadata(c, meta)
+	if c.AuthMethod == "" {
+		c.AuthMethod = internalkiro.AuthMethodImport
+	}
+	return c
+}
+
+// overlayKiroMetadata copies refresh-relevant fields from Metadata onto c.
+// It is the inverse of persistKiroRefresh's metadata writes.
+func overlayKiroMetadata(c *internalkiro.Credentials, meta map[string]any) {
+	if c == nil || len(meta) == 0 {
+		return
+	}
+	if v, ok := meta["access_token"].(string); ok && v != "" {
+		c.AccessToken = v
+	}
+	if v, ok := meta["refresh_token"].(string); ok && v != "" {
+		c.RefreshToken = v
+	}
+	if v, ok := meta["profile_arn"].(string); ok && v != "" {
+		c.ProfileArn = v
+	}
+	if v, ok := meta["client_id"].(string); ok && v != "" {
+		c.ClientID = v
+	}
+	if v, ok := meta["client_secret"].(string); ok && v != "" {
+		c.ClientSecret = v
+	}
+	if v, ok := meta["region"].(string); ok && v != "" {
+		c.Region = v
+	}
+	if v, ok := meta["uuid"].(string); ok && v != "" {
+		c.UUID = v
+	}
+	if v, ok := meta["auth_method"].(string); ok && v != "" {
+		c.AuthMethod = v
+	}
+	if v, ok := meta["expires_at"].(string); ok && v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			c.ExpiresAt = t
+		}
+	}
+}
+
+// persistKiroRefresh writes refreshed credentials back to disk (using the path
+// stored in auth.Attributes["path"]) and mirrors the new fields onto Metadata
+// + LastRefreshedAt. If Storage implements kiroWriter, the in-memory token
+// state is also updated so concurrent requests don't see stale tokens.
+func persistKiroRefresh(auth *cliproxyauth.Auth, updated *internalkiro.Credentials) error {
+	if auth == nil || updated == nil {
+		return fmt.Errorf("kiro executor: nil auth or credentials")
+	}
+
+	// 1. Write to disk if we know the file path.
+	if path := authFilePath(auth); path != "" {
+		if err := internalkiro.SaveCredentials(path, updated); err != nil {
+			return err
+		}
+	}
+
+	// 2. Mirror onto Metadata so subsequent loadKiroCredentials sees fresh values.
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = updated.AccessToken
+	if updated.RefreshToken != "" {
+		auth.Metadata["refresh_token"] = updated.RefreshToken
+	}
+	if updated.ProfileArn != "" {
+		auth.Metadata["profile_arn"] = updated.ProfileArn
+	}
+	if updated.ClientID != "" {
+		auth.Metadata["client_id"] = updated.ClientID
+	}
+	if updated.ClientSecret != "" {
+		auth.Metadata["client_secret"] = updated.ClientSecret
+	}
+	if updated.Region != "" {
+		auth.Metadata["region"] = updated.Region
+	}
+	if updated.AuthMethod != "" {
+		auth.Metadata["auth_method"] = updated.AuthMethod
+	}
+	if !updated.ExpiresAt.IsZero() {
+		auth.Metadata["expires_at"] = updated.ExpiresAt.Format(time.RFC3339)
+	}
+
+	// 3. Stamp LastRefreshedAt so the auto-refresh loop honors the new expiry.
+	auth.LastRefreshedAt = time.Now()
+
+	// 4. Best-effort in-memory Storage update.
+	if auth.Storage != nil {
+		if w, ok := auth.Storage.(kiroWriter); ok {
+			w.SetAccessToken(updated.AccessToken)
+			if updated.RefreshToken != "" {
+				w.SetRefreshToken(updated.RefreshToken)
+			}
+			if !updated.ExpiresAt.IsZero() {
+				w.SetExpiresAt(updated.ExpiresAt)
+			}
+		}
+	}
+
+	return nil
+}
+
+// authFilePath returns the on-disk path stored in Attributes by
+// management.buildAuthFromFileData. Empty when the auth wasn't loaded from
+// disk (e.g. constructed directly by SDK login flow).
+func authFilePath(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	if p, ok := auth.Attributes["path"]; ok {
+		return p
+	}
+	return ""
 }
