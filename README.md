@@ -102,6 +102,38 @@ These routes help you select the protocol surface, but they do not by themselves
 
 **→ [Complete Amp CLI Integration Guide](https://help.router-for.me/agent-client/amp-cli.html)**
 
+## Kiro (AWS Amazon Q / CodeWhisperer)
+
+Free Claude Sonnet 4.5 / Opus 4.7 access via your AWS Kiro IDE account.
+
+**Setup:**
+
+1. Install [Kiro IDE](https://kiro.dev/) and complete first-time login (any of: Google / GitHub / AWS Builder ID).
+2. Locate the credential file at `~/.kiro/oauth_creds.json`.
+3. Upload it via the management UI, or POST to:
+   ```
+   POST /v0/management/auth/upload  (multipart, file=oauth_creds.json)
+   ```
+4. Use any standard client — the proxy auto-routes Anthropic/OpenAI/Gemini requests through Kiro:
+   ```
+   curl http://localhost:8888/v1/messages \
+     -H "Authorization: Bearer <PROXY_KEY>" \
+     -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}'
+   ```
+
+**Server-side login (alternative):** The management API exposes endpoints for
+PKCE / Builder ID device-code login, so you can authenticate from a
+browser-less server (`POST /v0/management/auth/kiro/login/pkce/start`,
+`POST /v0/management/auth/kiro/login/device/start`,
+`GET /v0/management/auth/kiro/login/device/{session_id}`).
+
+**Supported models:** `claude-haiku-4-5`, `claude-sonnet-4-5` (default),
+`claude-sonnet-4-5-20250929`, `claude-sonnet-4-6`, `claude-opus-4-5`,
+`claude-opus-4-5-20251101`, `claude-opus-4-6` (1M ctx), `claude-opus-4-7` (1M ctx),
+`claude-sonnet-4-20250514`, `claude-3-7-sonnet-20250219`.
+
+
+
 ## SDK Docs
 
 - Usage: [docs/sdk-usage.md](docs/sdk-usage.md)
