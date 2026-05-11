@@ -178,3 +178,36 @@ func TestPostKiroPKCEStartReturnsRedirectURI(t *testing.T) {
 		t.Errorf("redirect_uri should be a local address: %s", resp["redirect_uri"])
 	}
 }
+
+func TestKiroLoginSlotsCapsConcurrency(t *testing.T) {
+	// Drain any leftovers from previous tests, then exhaust the pool.
+	for tryAcquireKiroLoginSlot() {
+	}
+	for {
+		select {
+		case <-kiroLoginSlots:
+		default:
+			goto filled
+		}
+	}
+filled:
+	// Fill exactly kiroLoginConcurrency slots.
+	for i := 0; i < kiroLoginConcurrency; i++ {
+		if !tryAcquireKiroLoginSlot() {
+			t.Fatalf("expected slot %d to be available", i)
+		}
+	}
+	// One more must fail.
+	if tryAcquireKiroLoginSlot() {
+		t.Errorf("expected acquire to fail when pool is full")
+	}
+	// Release one and re-acquire.
+	releaseKiroLoginSlot()
+	if !tryAcquireKiroLoginSlot() {
+		t.Errorf("expected slot to be available after release")
+	}
+	// Cleanup so other tests start with empty pool.
+	for i := 0; i < kiroLoginConcurrency; i++ {
+		releaseKiroLoginSlot()
+	}
+}

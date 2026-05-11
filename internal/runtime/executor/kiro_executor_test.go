@@ -183,7 +183,7 @@ func TestKiroExecuteNonStream(t *testing.T) {
 
 // --- Refresh persistence tests ---
 
-func TestKiroRefreshPersistsToDiskAndMetadata(t *testing.T) {
+func TestKiroRefreshUpdatesMetadata(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Mock social refresh endpoint.
 		w.Header().Set("Content-Type", "application/json")
@@ -240,19 +240,9 @@ func TestKiroRefreshPersistsToDiskAndMetadata(t *testing.T) {
 		t.Fatalf("persistKiroRefresh: %v", err)
 	}
 
-	// Verify on-disk file reflects new token.
-	reloaded, err := internalkiro.LoadCredentials(path)
-	if err != nil {
-		t.Fatalf("reload: %v", err)
-	}
-	if reloaded.AccessToken != "fresh_at" {
-		t.Errorf("on-disk AccessToken = %q; want fresh_at", reloaded.AccessToken)
-	}
-	if reloaded.RefreshToken != "fresh_rt" {
-		t.Errorf("on-disk RefreshToken = %q; want fresh_rt", reloaded.RefreshToken)
-	}
-
-	// Verify Metadata mirrors the new token.
+	// Verify Metadata mirrors the new token (the conductor's store.Save will
+	// then translate Metadata into both file write + PG upsert; we don't
+	// double-write from inside the executor).
 	if got := auth.Metadata["access_token"]; got != "fresh_at" {
 		t.Errorf("Metadata access_token = %v; want fresh_at", got)
 	}

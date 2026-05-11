@@ -360,23 +360,26 @@ func overlayKiroMetadata(c *internalkiro.Credentials, meta map[string]any) {
 	}
 }
 
-// persistKiroRefresh writes refreshed credentials back to disk (using the path
-// stored in auth.Attributes["path"]) and mirrors the new fields onto Metadata
-// + LastRefreshedAt. If Storage implements kiroWriter, the in-memory token
-// state is also updated so concurrent requests don't see stale tokens.
+// persistKiroRefresh mirrors refreshed credential fields onto auth.Metadata,
+// stamps LastRefreshedAt, and best-effort updates Storage in place.
+//
+// IMPORTANT: this function does NOT write to disk on its own. The conductor's
+// auto_refresh_loop calls store.Save(auth) immediately after Refresh returns,
+// and the configured store (PostgresStore in cluster mode, FileStore in
+// single-instance mode) handles atomic disk write + DB upsert via the
+// Metadata channel. Doing both here would cause double-writes and could race
+// with PG store's internal locking.
+//
+// On any failure, Metadata IS still updated so concurrent in-flight requests
+// observe the new token immediately. The caller decides whether to surface
+// the error (typically: log + continue, since the refresh itself succeeded).
 func persistKiroRefresh(auth *cliproxyauth.Auth, updated *internalkiro.Credentials) error {
 	if auth == nil || updated == nil {
 		return fmt.Errorf("kiro executor: nil auth or credentials")
 	}
 
-	// 1. Write to disk if we know the file path.
-	if path := authFilePath(auth); path != "" {
-		if err := internalkiro.SaveCredentials(path, updated); err != nil {
-			return err
-		}
-	}
-
-	// 2. Mirror onto Metadata so subsequent loadKiroCredentials sees fresh values.
+	// 1. Mirror onto Metadata FIRST so even if anything below fails the
+	//    in-memory state is fresh (and conductor.store.Save can pick it up).
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -403,10 +406,10 @@ func persistKiroRefresh(auth *cliproxyauth.Auth, updated *internalkiro.Credentia
 		auth.Metadata["expires_at"] = updated.ExpiresAt.Format(time.RFC3339)
 	}
 
-	// 3. Stamp LastRefreshedAt so the auto-refresh loop honors the new expiry.
+	// 2. Stamp LastRefreshedAt so the auto-refresh loop honors the new expiry.
 	auth.LastRefreshedAt = time.Now()
 
-	// 4. Best-effort in-memory Storage update.
+	// 3. Best-effort in-memory Storage update.
 	if auth.Storage != nil {
 		if w, ok := auth.Storage.(kiroWriter); ok {
 			w.SetAccessToken(updated.AccessToken)
@@ -420,17 +423,4 @@ func persistKiroRefresh(auth *cliproxyauth.Auth, updated *internalkiro.Credentia
 	}
 
 	return nil
-}
-
-// authFilePath returns the on-disk path stored in Attributes by
-// management.buildAuthFromFileData. Empty when the auth wasn't loaded from
-// disk (e.g. constructed directly by SDK login flow).
-func authFilePath(auth *cliproxyauth.Auth) string {
-	if auth == nil || auth.Attributes == nil {
-		return ""
-	}
-	if p, ok := auth.Attributes["path"]; ok {
-		return p
-	}
-	return ""
 }
