@@ -489,3 +489,14 @@ nonstream-keepalive-interval: 0
 #       params: # JSON paths (gjson/sjson syntax) to remove from the payload
 #         - "generationConfig.thinkingConfig.thinkingBudget"
 #         - "generationConfig.responseJsonSchema"
+
+# Kiro provider (AWS Amazon Q / CodeWhisperer)
+# All fields are optional — defaults match upstream Kiro IDE behavior.
+# Uncomment and customize as needed.
+# kiro:
+#   default_region: us-east-1
+#   social_provider: google              # google | github
+#   device_code_polling_interval_sec: 5
+#   device_code_timeout_sec: 300
+#   callback_port_range: [19876, 19880]
+#   builder_id_start_url: https://view.awsapps.com/start
