@@ -11,6 +11,38 @@ import (
 	internalkiro "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 )
 
+// kiroLoginSlots caps the number of in-flight PKCE + Device-code background
+// goroutines. Each Kiro login spawns one goroutine that may live up to 10
+// minutes, so an unbounded burst (e.g. a frontend bug or a script) could
+// pin a goroutine per request and hammer AWS until the rate-limiter trips.
+//
+// 16 is generous for human use (a single user starting 16 concurrent logins
+// is unrealistic) yet still bounds the worst case.
+//
+// Acquired with a non-blocking send; if full, the handler returns 503 and
+// the caller is expected to retry after polling existing sessions.
+const kiroLoginConcurrency = 16
+
+var kiroLoginSlots = make(chan struct{}, kiroLoginConcurrency)
+
+// tryAcquireKiroLoginSlot returns true when a slot was reserved. The caller
+// MUST releaseKiroLoginSlot when the goroutine finishes.
+func tryAcquireKiroLoginSlot() bool {
+	select {
+	case kiroLoginSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseKiroLoginSlot() {
+	select {
+	case <-kiroLoginSlots:
+	default:
+	}
+}
+
 // PostKiroPKCEStart begins a Kiro social PKCE login.
 //
 // Request body: {"provider":"google"|"github","region":"us-east-1"}
@@ -61,6 +93,15 @@ func (h *Handler) PostKiroPKCEStart(c *gin.Context) {
 	}
 
 	authURL := internalkiro.BuildPKCEAuthURL(idp, cb.RedirectURI, challenge, state, req.Region)
+
+	// Reserve a global login-goroutine slot BEFORE creating the session, so
+	// rate-limiting failures don't leak orphan sessions / callback servers.
+	if !tryAcquireKiroLoginSlot() {
+		cb.Close()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "too many concurrent kiro logins; retry shortly"})
+		return
+	}
+
 	sid := h.kiroSessions.NewPKCESession(verifier, state, cb.RedirectURI)
 
 	authDir := ""
@@ -71,6 +112,7 @@ func (h *Handler) PostKiroPKCEStart(c *gin.Context) {
 
 	// Spawn goroutine to wait for the callback, exchange the code, persist creds.
 	go func() {
+		defer releaseKiroLoginSlot()
 		defer cb.Close()
 		select {
 		case res := <-cb.Result:
@@ -184,6 +226,12 @@ func (h *Handler) PostKiroDeviceStart(c *gin.Context) {
 		return
 	}
 
+	// Reserve a global polling slot BEFORE creating the session.
+	if !tryAcquireKiroLoginSlot() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "too many concurrent kiro logins; retry shortly"})
+		return
+	}
+
 	sid := h.kiroSessions.NewDeviceSession(reg.ClientID, reg.ClientSecret,
 		auth.DeviceCode, auth.UserCode, auth.VerificationURIComplete)
 
@@ -193,6 +241,7 @@ func (h *Handler) PostKiroDeviceStart(c *gin.Context) {
 		authDir = h.cfg.AuthDir
 	}
 	go func() {
+		defer releaseKiroLoginSlot()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		creds, perr := bd.PollToken(ctx, reg.ClientID, reg.ClientSecret, auth.DeviceCode, 10*time.Minute)
