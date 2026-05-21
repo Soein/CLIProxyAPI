@@ -18,23 +18,23 @@ import (
 
 // UsageEventRow is one row in usage_events. Fields map 1:1 to columns.
 type UsageEventRow struct {
-	OccurredAt      time.Time
-	NodeID          string
-	APIKey          string
-	Provider        string
-	Model           string
-	Source          string
-	AuthID          string
-	AuthIndex       string
-	AuthType        string
-	Failed          bool
-	LatencyMs       int64
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	TotalTokens     int64
-	DedupHash       []byte
+	OccurredAt      time.Time `json:"occurred_at"`
+	NodeID          string    `json:"node_id"`
+	APIKey          string    `json:"api_key"`
+	Provider        string    `json:"provider"`
+	Model           string    `json:"model"`
+	Source          string    `json:"source"`
+	AuthID          string    `json:"auth_id"`
+	AuthIndex       string    `json:"auth_index"`
+	AuthType        string    `json:"auth_type"`
+	Failed          bool      `json:"failed"`
+	LatencyMs       int64     `json:"latency_ms"`
+	InputTokens     int64     `json:"input_tokens"`
+	OutputTokens    int64     `json:"output_tokens"`
+	ReasoningTokens int64     `json:"reasoning_tokens"`
+	CachedTokens    int64     `json:"cached_tokens"`
+	TotalTokens     int64     `json:"total_tokens"`
+	DedupHash       []byte    `json:"-"`
 }
 
 // UsageRollupKey is the PK tuple of usage_minute_rollup.

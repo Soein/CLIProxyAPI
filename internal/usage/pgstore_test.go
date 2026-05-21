@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -30,6 +31,53 @@ func openTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("ping: %v", err)
 	}
 	return db
+}
+
+func TestUsageEventRowJSONUsesManagementContract(t *testing.T) {
+	row := UsageEventRow{
+		OccurredAt:      time.Date(2026, 5, 22, 9, 30, 0, 0, time.UTC),
+		NodeID:          "node-1",
+		APIKey:          "api-1",
+		Provider:        "openai",
+		Model:           "gpt-5.4",
+		Source:          "openai",
+		AuthID:          "auth-1",
+		AuthIndex:       "0",
+		AuthType:        "oauth",
+		Failed:          true,
+		LatencyMs:       1234,
+		InputTokens:     10,
+		OutputTokens:    20,
+		ReasoningTokens: 3,
+		CachedTokens:    4,
+		TotalTokens:     37,
+		DedupHash:       []byte("internal-dedup-hash"),
+	}
+
+	payload, err := json.Marshal(row)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	for _, key := range []string{
+		"occurred_at", "node_id", "api_key", "provider", "model",
+		"source", "auth_id", "auth_index", "auth_type", "failed",
+		"latency_ms", "input_tokens", "output_tokens", "reasoning_tokens",
+		"cached_tokens", "total_tokens",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("missing JSON field %q in %s", key, payload)
+		}
+	}
+	for _, key := range []string{"OccurredAt", "NodeID", "APIKey", "InputTokens", "DedupHash"} {
+		if _, ok := fields[key]; ok {
+			t.Fatalf("unexpected JSON field %q in %s", key, payload)
+		}
+	}
 }
 
 func TestPGStore_InsertEventsBatch_IsIdempotent(t *testing.T) {
