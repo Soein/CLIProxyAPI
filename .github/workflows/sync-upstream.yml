@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: write
       actions: write
+      issues: write
 
     steps:
       - name: Checkout 代码
@@ -48,22 +49,103 @@ jobs:
 
           if git merge-base --is-ancestor upstream/main main; then
             echo "✅ main 已包含上游最新提交"
-            echo "did_push=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "did_push=false"
+              echo "has_conflict=false"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "🔀 合并上游代码..."
-          git merge upstream/main --no-edit
+          echo "🔀 尝试合并上游代码..."
+          # Use an if-guard so a merge conflict does not fail the job (set -e
+          # is not triggered inside an if condition). Clean merges still push;
+          # conflicts are aborted and reported via an issue downstream.
+          if git merge upstream/main --no-edit; then
+            synced_sha="$(git rev-parse HEAD)"
+            echo "✅ 合并成功: ${synced_sha}"
+            git push origin HEAD:main
+            echo "🚀 已推送到 GitHub"
+            {
+              echo "did_push=true"
+              echo "has_conflict=false"
+              echo "synced_sha=${synced_sha}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ 合并存在冲突，已 abort（未污染 main），转为 Issue 通知"
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            git merge --abort || true
+            {
+              echo "did_push=false"
+              echo "has_conflict=true"
+              echo "conflict_files<<__CONFLICT_EOF__"
+              echo "${conflicts:-(无法获取冲突文件列表)}"
+              echo "__CONFLICT_EOF__"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
-          synced_sha="$(git rev-parse HEAD)"
-          echo "✅ 合并成功: ${synced_sha}"
-          git push origin HEAD:main
-          echo "🚀 已推送到 GitHub"
-          echo "did_push=true" >> "$GITHUB_OUTPUT"
-          echo "synced_sha=${synced_sha}" >> "$GITHUB_OUTPUT"
+      - name: 冲突时开/更新 Issue 通知
+        if: steps.sync_upstream.outputs.has_conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: "🔄 上游同步存在冲突，需手动处理"
+          CONFLICT_FILES: ${{ steps.sync_upstream.outputs.conflict_files }}
+        run: |
+          set -euo pipefail
+          upstream_commits="$(git log --oneline main..upstream/main | head -20 || echo '(无法获取)')"
+          body_file="$(mktemp)"
+          {
+            echo "自动同步上游时遇到合并冲突，需要手动解决（workflow 已自动 abort，未污染 \`main\`）。"
+            echo ""
+            echo "### 上游新提交"
+            echo '```'
+            echo "${upstream_commits}"
+            echo '```'
+            echo ""
+            echo "### 冲突文件"
+            echo '```'
+            echo "${CONFLICT_FILES}"
+            echo '```'
+            echo ""
+            echo "### 本地解决步骤"
+            echo '```bash'
+            echo "git fetch upstream"
+            echo "git merge upstream/main"
+            echo "# 解决冲突后："
+            echo "git add -A && git commit --no-edit"
+            echo "git push origin main"
+            echo '```'
+            echo ""
+            echo "解决并 push 后，下次自动同步会成功并**自动关闭**本 issue。"
+            echo ""
+            echo "_Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}_"
+          } > "$body_file"
+
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq '.[] | select(.title == env.TITLE) | .number' | head -1 || true)"
+          if [ -n "${existing:-}" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
+            echo "🔔 已更新现有 issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$body_file"
+            echo "🔔 已创建新 issue"
+          fi
+
+      - name: 同步成功时关闭遗留冲突 Issue
+        if: steps.sync_upstream.outputs.has_conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: "🔄 上游同步存在冲突，需手动处理"
+        run: |
+          set -euo pipefail
+          nums="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq '.[] | select(.title == env.TITLE) | .number' || true)"
+          for n in ${nums:-}; do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "✅ 上游已成功同步，自动关闭。" || true
+            echo "✅ 已关闭遗留 issue #$n"
+          done
 
       - name: 显式触发镜像构建
-        if: success() && steps.sync_upstream.outputs.did_push == 'true'
+        if: steps.sync_upstream.outputs.did_push == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -77,34 +159,36 @@ jobs:
           echo "🚀 已通过 workflow_dispatch 触发镜像构建"
 
       - name: 生成同步报告
-        if: success()
+        if: always() && steps.sync_upstream.conclusion == 'success'
         run: |
-          echo "## ✅ 同步成功" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**上游仓库**: router-for-me/CLIProxyAPI" >> $GITHUB_STEP_SUMMARY
-          echo "**同步时间**: $(date +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "**认证方式**: GITHUB_TOKEN" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.sync_upstream.outputs.did_push }}" = "true" ]; then
-            echo "**镜像构建触发方式**: workflow_dispatch" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**镜像构建触发方式**: 无需构建，main 已是最新" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 最近提交" >> $GITHUB_STEP_SUMMARY
-          git log --oneline HEAD~10..HEAD >> $GITHUB_STEP_SUMMARY || true
+          {
+            if [ "${{ steps.sync_upstream.outputs.has_conflict }}" = "true" ]; then
+              echo "## ⚠️ 上游有冲突，需手动处理"
+              echo ""
+              echo "已自动 abort 合并并开/更新 Issue 通知（未污染 main）。"
+              echo "请按 Issue 中的步骤本地解决冲突后 push，下次同步会自动关闭该 Issue。"
+            elif [ "${{ steps.sync_upstream.outputs.did_push }}" = "true" ]; then
+              echo "## ✅ 同步成功（已合并并推送）"
+              echo ""
+              echo "**镜像构建触发方式**: workflow_dispatch"
+            else
+              echo "## ✅ 无需同步（main 已是最新）"
+            fi
+            echo ""
+            echo "**上游仓库**: router-for-me/CLIProxyAPI"
+            echo "**同步时间**: $(date +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "**认证方式**: GITHUB_TOKEN"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 生成失败报告
         if: failure()
         run: |
           {
-            echo "## ❌ 同步失败"
+            echo "## ❌ 同步流程异常失败"
             echo ""
             echo "**上游仓库**: router-for-me/CLIProxyAPI"
             echo "**Workflow 运行**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            echo "**认证方式**: GITHUB_TOKEN"
             echo ""
-            echo "### 建议操作"
-            echo "1. 查看上面的 workflow 日志。"
-            echo "2. 如果 push 因 workflow 文件更新被拒绝，请本地执行 \`git fetch upstream && git merge upstream/main && git push origin main\`。"
-            echo "3. 如果只是 dispatch 镜像构建失败，可手动运行 workflow \`Build and Push Docker Image\`。"
+            echo "注意：合并冲突已被优雅处理为 Issue 通知，不会再让本 workflow 失败。"
+            echo "此处失败通常是其它异常（网络 / 权限 / push 被拒等），请查看上面的日志排查。"
           } >> "$GITHUB_STEP_SUMMARY"
