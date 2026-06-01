@@ -8,8 +8,8 @@ import (
 
 func init() {
 	translator.Register(
-		Claude,                    // source format = Anthropic Messages
-		Kiro,                      // target format = Kiro
+		Claude, // source format = Anthropic Messages
+		Kiro,   // target format = Kiro
 		ConvertClaudeRequestToKiro,
 		interfaces.TranslateResponse{
 			Stream:     ConvertKiroResponseToClaude,

@@ -6,7 +6,8 @@ import (
 )
 
 // buildStringHeader produces the wire bytes for one string-typed header.
-//   name_len(1) | name | type(1=7) | val_len(2 BE) | val
+//
+//	name_len(1) | name | type(1=7) | val_len(2 BE) | val
 func buildStringHeader(name, value string) []byte {
 	out := make([]byte, 0, 1+len(name)+1+2+len(value))
 	out = append(out, byte(len(name)))

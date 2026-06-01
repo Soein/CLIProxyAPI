@@ -250,13 +250,13 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	}
 
 	log.WithFields(log.Fields{
-		"node_id":         nodeID,
-		"region":          s.cfg.Cluster.Region,
-		"probe_interval":  probeInterval,
-		"auth_sharding":   s.cfg.Cluster.AuthSharding,
-		"ring_staleness":  ringStaleness,
-		"ring_poll":       ringPoll,
-		"usage_backend":   uc.Backend,
+		"node_id":        nodeID,
+		"region":         s.cfg.Cluster.Region,
+		"probe_interval": probeInterval,
+		"auth_sharding":  s.cfg.Cluster.AuthSharding,
+		"ring_staleness": ringStaleness,
+		"ring_poll":      ringPoll,
+		"usage_backend":  uc.Backend,
 	}).Info("cluster mode enabled")
 	return nil
 }

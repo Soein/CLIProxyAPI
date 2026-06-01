@@ -21,9 +21,9 @@ type kiroPKCESession struct {
 	CodeVerifier string
 	State        string
 	RedirectURI  string
-	Status       string                 // "pending" / "success" / "error"
+	Status       string                    // "pending" / "success" / "error"
 	Credentials  *internalkiro.Credentials // set on success
-	Err          string                 // set on error
+	Err          string                    // set on error
 	CreatedAt    time.Time
 	ExpiresAt    time.Time
 }

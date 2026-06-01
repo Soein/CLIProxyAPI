@@ -15,7 +15,9 @@ func TestRefreshSocial(t *testing.T) {
 		if !strings.HasSuffix(r.URL.Path, "/refreshToken") {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
-		var body struct{ RefreshToken string `json:"refreshToken"` }
+		var body struct {
+			RefreshToken string `json:"refreshToken"`
+		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.RefreshToken != "rt_old" {
 			t.Errorf("unexpected refreshToken in body: %s", body.RefreshToken)

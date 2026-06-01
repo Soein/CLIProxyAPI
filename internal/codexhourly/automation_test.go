@@ -151,9 +151,9 @@ func TestAutomationRunOnce_ReenablesOnlyHourlyAutoDisabledAfterRecovery(t *testi
 				Disabled:      true,
 				StatusMessage: StatusMessageAutoDisabled,
 				Metadata: map[string]any{
-					"account_id":                "acct_hourly",
-					"access_token":              "token",
-					AutoDisabledAtMetadataKey:   now.Add(-10 * time.Minute).Format(time.RFC3339),
+					"account_id":              "acct_hourly",
+					"access_token":            "token",
+					AutoDisabledAtMetadataKey: now.Add(-10 * time.Minute).Format(time.RFC3339),
 				},
 			},
 			"weekly-disabled": {
@@ -164,9 +164,9 @@ func TestAutomationRunOnce_ReenablesOnlyHourlyAutoDisabledAfterRecovery(t *testi
 				Disabled:      true,
 				StatusMessage: "disabled via codex weekly automation",
 				Metadata: map[string]any{
-					"account_id":                                 "acct_weekly",
-					"access_token":                               "token",
-					codexweekly.AutoDisabledAtMetadataKey:        now.Add(-time.Hour).Format(time.RFC3339),
+					"account_id":                          "acct_weekly",
+					"access_token":                        "token",
+					codexweekly.AutoDisabledAtMetadataKey: now.Add(-time.Hour).Format(time.RFC3339),
 				},
 			},
 			"manual-disabled": {

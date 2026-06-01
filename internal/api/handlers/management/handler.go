@@ -38,13 +38,13 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	usageStats          *usage.RequestStatistics
+	cfg            *config.Config
+	configFilePath string
+	mu             sync.Mutex
+	attemptsMu     sync.Mutex
+	failedAttempts map[string]*attemptInfo // keyed by client IP
+	authManager    *coreauth.Manager
+	usageStats     *usage.RequestStatistics
 	// pgUsage / usageQueryCache are wired in Sprint 1.4 but only consumed
 	// in Sprint 2 (the cluster-aggregated /usage read path). They are
 	// intentionally dead in Sprint 1; do not remove.

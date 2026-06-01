@@ -16,10 +16,10 @@ const DefaultRegion = "us-east-1"
 
 // Endpoint templates. {region} is substituted at call time.
 const (
-	SocialAuthEndpoint     = "https://prod.{region}.auth.desktop.kiro.dev"
-	SocialRefreshEndpoint  = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
-	BuilderIDOIDCEndpoint  = "https://oidc.{region}.amazonaws.com"
-	BuilderIDStartURL      = "https://view.awsapps.com/start"
+	SocialAuthEndpoint    = "https://prod.{region}.auth.desktop.kiro.dev"
+	SocialRefreshEndpoint = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+	BuilderIDOIDCEndpoint = "https://oidc.{region}.amazonaws.com"
+	BuilderIDStartURL     = "https://view.awsapps.com/start"
 )
 
 // PKCE callback ports tried in order when launching the local server.

@@ -45,14 +45,14 @@ const (
 // RegistrarConfig parameterises InstanceRegistrar. DB/NodeID/Endpoint are
 // required; everything else has a sane default.
 type RegistrarConfig struct {
-	DB          *sql.DB
-	NodeID      string
-	Region      string
-	Endpoint    string
-	Weight      int
-	Interval    time.Duration // heartbeat cadence; default 10s
-	DrainGrace  time.Duration // how long to sit in 'draining' before 'down'; default 30s
-	TimeSource  func() time.Time
+	DB         *sql.DB
+	NodeID     string
+	Region     string
+	Endpoint   string
+	Weight     int
+	Interval   time.Duration // heartbeat cadence; default 10s
+	DrainGrace time.Duration // how long to sit in 'draining' before 'down'; default 30s
+	TimeSource func() time.Time
 }
 
 // InstanceRegistrar keeps one row in cluster_nodes up-to-date for the

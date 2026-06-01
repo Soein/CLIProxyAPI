@@ -263,7 +263,7 @@ func TestLoadKiroCredentialsOverlaysMetadataOverStorage(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Storage: &kiroAuthStorage{accessToken: "stale_at", profileArn: "arn:stale"},
 		Metadata: map[string]any{
-			"access_token":  "fresh_at",  // overlay should win
+			"access_token":  "fresh_at", // overlay should win
 			"refresh_token": "fresh_rt",
 			"profile_arn":   "arn:fresh",
 			"region":        "us-west-2",

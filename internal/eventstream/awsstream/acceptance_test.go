@@ -10,9 +10,10 @@ import (
 
 // TestAcceptance_KiroLikeStream simulates a Kiro `generateAssistantResponse`
 // stream of three frames:
-//   1. event-type=initial     payload={"role":"assistant"}
-//   2. event-type=content     payload={"text":"Hello "}
-//   3. event-type=content     payload={"text":"world!"}
+//  1. event-type=initial     payload={"role":"assistant"}
+//  2. event-type=content     payload={"text":"Hello "}
+//  3. event-type=content     payload={"text":"world!"}
+//
 // The test verifies all frames decode and event-type ordering is preserved.
 func TestAcceptance_KiroLikeStream(t *testing.T) {
 	frames := [][]byte{

@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
+
 type usageExportPayload struct {
 	Version    int                      `json:"version"`
 	ExportedAt time.Time                `json:"exported_at"`
@@ -28,13 +29,13 @@ type usageImportPayload struct {
 // cfg.Usage.Backend:
 //
 //   - "" / "memory" / "dual"   →  returns the in-memory per-node snapshot
-//                                 (legacy shape; what the existing UI
-//                                 already consumes)
+//     (legacy shape; what the existing UI
+//     already consumes)
 //   - "pg" + h.pgUsage != nil  →  returns cluster-aggregated PG payload
-//                                 with both legacy `usage.*` fields AND
-//                                 a new `cluster.*` block of pre-aggregated
-//                                 series (sparkline / health grid / api &
-//                                 credential breakdowns)
+//     with both legacy `usage.*` fields AND
+//     a new `cluster.*` block of pre-aggregated
+//     series (sparkline / health grid / api &
+//     credential breakdowns)
 //
 // "dual" is intentionally on the in-memory path: dual mode means we're
 // double-writing to PG to warm the rollup tables, but the read path hasn't
@@ -271,10 +272,10 @@ func (h *Handler) exportFromPG(c *gin.Context) {
 	}
 
 	snap := usage.StatisticsSnapshot{
-		TotalRequests:  totals.TotalRequests,
-		SuccessCount:   totals.SuccessCount,
-		FailureCount:   totals.FailureCount,
-		TotalTokens:    totals.TotalTokens,
+		TotalRequests: totals.TotalRequests,
+		SuccessCount:  totals.SuccessCount,
+		FailureCount:  totals.FailureCount,
+		TotalTokens:   totals.TotalTokens,
 		// (cached/reasoning tokens are not in the legacy snapshot top-level
 		// shape — they live inside per-detail Tokens. The cluster.* block
 		// carries the cluster sums directly.)

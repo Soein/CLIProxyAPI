@@ -185,9 +185,9 @@ func TestAutomationRunOnce_ReenablesOnlyWeeklyAutoDisabledAfterRecovery(t *testi
 				Disabled:      true,
 				StatusMessage: "disabled via codex hourly automation",
 				Metadata: map[string]any{
-					"account_id":                      "acct_hourly",
-					"access_token":                    "token",
-					"codex_hourly_auto_disabled_at":   now.Add(-10 * time.Minute).Format(time.RFC3339),
+					"account_id":                    "acct_hourly",
+					"access_token":                  "token",
+					"codex_hourly_auto_disabled_at": now.Add(-10 * time.Minute).Format(time.RFC3339),
 				},
 			},
 		},
@@ -550,10 +550,10 @@ func TestWeeklyLimitReached_WindowScoped(t *testing.T) {
 func TestWindowReached(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name    string
-		json    string
-		want    bool
-		wantOk  bool
+		name   string
+		json   string
+		want   bool
+		wantOk bool
 	}{
 		{"empty node", `{}`, false, false},
 		{"limit_reached true wins", `{"limit_reached": true, "used_percent": 0}`, true, true},
