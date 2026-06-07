@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexhourly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -64,6 +65,8 @@ type Handler struct {
 	// (or another shard owner) actually ran the check.
 	codexAutomationReader CodexAutomationStatusReader
 	kiroSessions          *kiroSessionStore
+	postAuthPersistHook   coreauth.PostAuthHook
+	pluginHost            *pluginhost.Host
 }
 
 // CodexAutomationStatusReader is the read-side hook for cluster-shared
@@ -166,6 +169,16 @@ func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageSt
 // usage.backend != "memory".
 func (h *Handler) SetPGUsage(s *usage.PGStore) { h.pgUsage = s }
 
+// SetPluginHost updates the plugin host used by plugin-backed management endpoints.
+func (h *Handler) SetPluginHost(host *pluginhost.Host) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.pluginHost = host
+	h.mu.Unlock()
+}
+
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 
@@ -195,6 +208,11 @@ func (h *Handler) SetCodexWeeklyAutomationStatusProvider(provider func() codexwe
 // SetCodexHourlyAutomationStatusProvider registers a provider for Codex hourly (5h) automation status.
 func (h *Handler) SetCodexHourlyAutomationStatusProvider(provider func() codexhourly.Status) {
 	h.codexHourlyStatus = provider
+}
+
+// SetPostAuthPersistHook registers a hook to be called after auth persistence.
+func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
+	h.postAuthPersistHook = hook
 }
 
 // Middleware enforces access control for management endpoints.
