@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -63,10 +64,15 @@ type Handler struct {
 	// endpoints overlay the cluster-wide latest run timestamp from PG so
 	// follower nodes' UI no longer shows "等待首次检查" while the leader
 	// (or another shard owner) actually ran the check.
-	codexAutomationReader CodexAutomationStatusReader
-	kiroSessions          *kiroSessionStore
-	postAuthPersistHook   coreauth.PostAuthHook
-	pluginHost            *pluginhost.Host
+	codexAutomationReader  CodexAutomationStatusReader
+	kiroSessions           *kiroSessionStore
+	postAuthPersistHook    coreauth.PostAuthHook
+	pluginHost             *pluginhost.Host
+	configReloadHook       func(context.Context, *config.Config)
+	pluginStoreRegistryURL string
+	pluginStoreHTTPClient  pluginstore.HTTPDoer
+	pluginReleaseCacheMu   sync.Mutex
+	pluginReleaseCache     map[string]pluginReleaseCacheEntry
 }
 
 // CodexAutomationStatusReader is the read-side hook for cluster-shared
@@ -179,6 +185,33 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 	h.mu.Unlock()
 }
 
+// SetConfigReloadHook updates the callback used after management saves config changes.
+func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.configReloadHook = hook
+	h.mu.Unlock()
+}
+
+func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, cfg *config.Config) {
+	if h == nil || cfg == nil {
+		return
+	}
+	h.mu.Lock()
+	hook := h.configReloadHook
+	host := h.pluginHost
+	h.mu.Unlock()
+	if hook != nil {
+		hook(ctx, cfg)
+		return
+	}
+	if host != nil {
+		host.ApplyConfig(ctx, cfg)
+	}
+}
+
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 
@@ -223,6 +256,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
 		c.Header("X-CPA-COMMIT", buildinfo.Commit)
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
