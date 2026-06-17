@@ -93,37 +93,6 @@ Standalone persistence and visualization service for CLIProxyAPI, with periodic 
 
 Full CLIProxyAPI management center with request-level monitoring and cost estimates. CPA-Manager tracks collected requests by account, model, channel, latency, status, and token usage; estimates cost with editable model prices and one-click LiteLLM price sync; persists events in SQLite; and provides Codex account-pool operations with batch inspection, quota detection, unhealthy account discovery, cleanup suggestions, and one-click execution for day-to-day multi-account maintenance.
 
-## Kiro (AWS Amazon Q / CodeWhisperer)
-
-Free Claude Sonnet 4.5 / Opus 4.7 access via your AWS Kiro IDE account.
-
-**Setup:**
-
-1. Install [Kiro IDE](https://kiro.dev/) and complete first-time login (any of: Google / GitHub / AWS Builder ID).
-2. Locate the credential file at `~/.kiro/oauth_creds.json`.
-3. Upload it via the management UI, or POST to:
-   ```
-   POST /v0/management/auth/upload  (multipart, file=oauth_creds.json)
-   ```
-4. Use any standard client — the proxy auto-routes Anthropic/OpenAI/Gemini requests through Kiro:
-   ```
-   curl http://localhost:8888/v1/messages \
-     -H "Authorization: Bearer <PROXY_KEY>" \
-     -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}'
-   ```
-
-**Server-side login (alternative):** The management API exposes endpoints for
-PKCE / Builder ID device-code login, so you can authenticate from a
-browser-less server (`POST /v0/management/auth/kiro/login/pkce/start`,
-`POST /v0/management/auth/kiro/login/device/start`,
-`GET /v0/management/auth/kiro/login/device/{session_id}`).
-
-**Supported models:** `claude-haiku-4-5`, `claude-sonnet-4-5` (default),
-`claude-sonnet-4-5-20250929`, `claude-sonnet-4-6`, `claude-opus-4-5`,
-`claude-opus-4-5-20251101`, `claude-opus-4-6` (1M ctx), `claude-opus-4-7` (1M ctx),
-`claude-sonnet-4-20250514`, `claude-3-7-sonnet-20250219`.
-
-
 ## SDK Docs
 
 - Usage: [docs/sdk-usage.md](docs/sdk-usage.md)
@@ -223,7 +192,7 @@ Windows desktop UI that manages CLIProxyAPI and Perplexity WebUI Scraper from a 
 
 ### [Quotio Desktop](https://github.com/xiaocoss/quotio-desktop)
 
-Cross-platform (Tauri) port of Quotio for Windows, macOS and Linux. Manages a pool of AI accounts (Codex, Claude Code, GitHub Copilot, Gemini CLI, Antigravity, Kiro, Cursor, Trae, GLM) through CLIProxyAPI, with per-account 5-hour/weekly quota bars, Codex rate-limit reset credits with one-click reset, smart scheduling, usage statistics, and multi-instance Codex — no API keys needed.
+Cross-platform (Tauri) port of Quotio for Windows, macOS and Linux. Manages a pool of AI accounts (Codex, Claude Code, GitHub Copilot, Gemini CLI, Antigravity, Cursor, Trae, GLM) through CLIProxyAPI, with per-account 5-hour/weekly quota bars, Codex rate-limit reset credits with one-click reset, smart scheduling, usage statistics, and multi-instance Codex — no API keys needed.
 
 > [!NOTE]  
 > If you developed a project based on CLIProxyAPI, please open a PR to add it to this list.

@@ -1281,42 +1281,6 @@ func (r *ModelRegistry) GetFirstAvailableModel(handlerType string) (string, erro
 	return "", fmt.Errorf("no available clients for any model in handler type: %s", handlerType)
 }
 
-// KiroModels returns the model list exposed when at least one Kiro auth is
-// active. The 10 IDs match what Kiro IDE accepts; opus-4-6/opus-4-7 expose
-// a 1M context window, the rest 200k.
-func KiroModels() []ModelInfo {
-	const (
-		ctx200k = 200_000
-		ctx1M   = 1_000_000
-	)
-	now := time.Now().Unix()
-	mk := func(id string, ctxLen int) ModelInfo {
-		return ModelInfo{
-			ID:                  id,
-			Object:              "model",
-			Created:             now,
-			OwnedBy:             "kiro",
-			Type:                "claude",
-			DisplayName:         id,
-			ContextLength:       ctxLen,
-			MaxCompletionTokens: 8192,
-			SupportedParameters: []string{"messages", "stream", "tools", "system"},
-		}
-	}
-	return []ModelInfo{
-		mk("claude-haiku-4-5", ctx200k),
-		mk("claude-sonnet-4-5", ctx200k),
-		mk("claude-sonnet-4-5-20250929", ctx200k),
-		mk("claude-sonnet-4-6", ctx200k),
-		mk("claude-opus-4-5", ctx200k),
-		mk("claude-opus-4-5-20251101", ctx200k),
-		mk("claude-opus-4-6", ctx1M),
-		mk("claude-opus-4-7", ctx1M),
-		mk("claude-sonnet-4-20250514", ctx200k),
-		mk("claude-3-7-sonnet-20250219", ctx200k),
-	}
-}
-
 // GetModelsForClient returns the models registered for a specific client.
 // Parameters:
 //   - clientID: The client identifier (typically auth file name or auth ID)

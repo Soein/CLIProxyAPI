@@ -69,7 +69,6 @@ type Handler struct {
 	// follower nodes' UI no longer shows "等待首次检查" while the leader
 	// (or another shard owner) actually ran the check.
 	codexAutomationReader  CodexAutomationStatusReader
-	kiroSessions           *kiroSessionStore
 	postAuthPersistHook    coreauth.PostAuthHook
 	pluginHost             *pluginhost.Host
 	configReloadHook       func(context.Context, *config.Config)
@@ -114,7 +113,6 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
-		kiroSessions:        newKiroSessionStore(10 * time.Minute),
 	}
 	h.startAttemptCleanup()
 	return h

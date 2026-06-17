@@ -85,18 +85,6 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
-// GetKiroModels returns the standard Kiro (Amazon Q Developer) model definitions
-// as a pointer slice, consistent with other GetXxxModels helpers.
-func GetKiroModels() []*ModelInfo {
-	flat := KiroModels()
-	out := make([]*ModelInfo, len(flat))
-	for i := range flat {
-		m := flat[i]
-		out[i] = &m
-	}
-	return out
-}
-
 // AntigravityWebSearchModelFor returns the Antigravity model that should run a
 // native web search request for modelID.
 func AntigravityWebSearchModelFor(modelID string) string {
