@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1101,6 +1102,73 @@ func TestNormalizeXAITools_SimplifiesCodexAppAutomationUpdateSchema(t *testing.T
 	}
 	if !foundExec {
 		t.Fatalf("exec_command tool missing after normalize: %s", string(out))
+	}
+}
+
+func TestNormalizeXAITools_CapsGrokToolsAtUpstreamLimit(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"model":"grok-4.5","tools":[`)
+	for i := 0; i < 201; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		_, _ = fmt.Fprintf(&body, `{"type":"function","name":"tool_%03d","parameters":{"type":"object","properties":{}}}`, i)
+	}
+	body.WriteString(`]}`)
+
+	out := normalizeXAITools([]byte(body.String()))
+	tools := gjson.GetBytes(out, "tools")
+	if got := len(tools.Array()); got != 200 {
+		t.Fatalf("tool count = %d, want 200", got)
+	}
+	if got := tools.Array()[199].Get("name").String(); got != "tool_199" {
+		t.Fatalf("last retained tool = %q, want tool_199", got)
+	}
+}
+
+func TestNormalizeXAIToolsWithConfig_PrioritizesNamespacesForGrok(t *testing.T) {
+	body := []byte(`{"model":"grok-4.5","tools":[{"type":"namespace","name":"optional","tools":[{"type":"function","name":"optional_1"},{"type":"function","name":"optional_2"}]},{"type":"namespace","name":"critical","tools":[{"type":"function","name":"critical_1"},{"type":"function","name":"critical_2"},{"type":"function","name":"critical_3"}]},{"type":"function","name":"exec_command"}]}`)
+	out := normalizeXAIToolsWithConfig(body, config.XAIConfig{
+		MaxTools:                4,
+		PreferredToolNamespaces: []string{"critical"},
+	})
+
+	tools := gjson.GetBytes(out, "tools").Array()
+	if got := len(tools); got != 4 {
+		t.Fatalf("tool count = %d, want 4", got)
+	}
+	wantNames := []string{"exec_command", "critical_1", "critical_2", "critical_3"}
+	for i, want := range wantNames {
+		if got := tools[i].Get("name").String(); got != want {
+			t.Fatalf("tool[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestNormalizeXAIToolsWithConfig_DoesNotCapNonGrokModels(t *testing.T) {
+	body := []byte(`{"model":"other-model","tools":[{"type":"function","name":"tool_1"},{"type":"function","name":"tool_2"},{"type":"function","name":"tool_3"}]}`)
+	out := normalizeXAIToolsWithConfig(body, config.XAIConfig{MaxTools: 2})
+	if got := len(gjson.GetBytes(out, "tools").Array()); got != 3 {
+		t.Fatalf("tool count = %d, want 3", got)
+	}
+}
+
+func TestNormalizeXAIToolsWithConfig_PreservesExplicitToolChoice(t *testing.T) {
+	body := []byte(`{"model":"grok-4.5","tool_choice":{"type":"function","name":"forced_tool"},"tools":[{"type":"function","name":"exec_command"},{"type":"namespace","name":"critical","tools":[{"type":"function","name":"critical_tool"}]},{"type":"namespace","name":"optional","tools":[{"type":"function","name":"forced_tool"}]}]}`)
+	out := normalizeXAIToolsWithConfig(body, config.XAIConfig{
+		MaxTools:                2,
+		PreferredToolNamespaces: []string{"critical"},
+	})
+
+	tools := gjson.GetBytes(out, "tools").Array()
+	if got := len(tools); got != 2 {
+		t.Fatalf("tool count = %d, want 2", got)
+	}
+	if got := tools[0].Get("name").String(); got != "forced_tool" {
+		t.Fatalf("first retained tool = %q, want forced_tool", got)
+	}
+	if got := tools[1].Get("name").String(); got != "exec_command" {
+		t.Fatalf("second retained tool = %q, want exec_command", got)
 	}
 }
 

@@ -134,6 +134,9 @@ type Config struct {
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
+	// XAI configures provider-wide xAI request behavior.
+	XAI XAIConfig `yaml:"xai" json:"xai"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -413,6 +416,16 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+}
+
+// XAIConfig controls xAI-specific request compatibility behavior.
+type XAIConfig struct {
+	// MaxTools caps the number of tools sent to Grok. Values above xAI's
+	// upstream limit are clamped; zero uses the upstream limit.
+	MaxTools int `yaml:"max-tools" json:"max-tools"`
+	// PreferredToolNamespaces are retained before other namespaced tools when
+	// a Grok request exceeds MaxTools. Top-level tools always take precedence.
+	PreferredToolNamespaces []string `yaml:"preferred-tool-namespaces" json:"preferred-tool-namespaces"`
 }
 
 // TLSConfig holds HTTPS server settings.

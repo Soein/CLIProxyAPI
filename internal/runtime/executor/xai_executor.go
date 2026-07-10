@@ -44,6 +44,7 @@ const (
 	xaiNamespaceToolType       = "namespace"
 	xaiToolSearchType          = "tool_search"
 	xaiWebSearchToolType       = "web_search"
+	xaiMaxToolsPerRequest      = 200
 	// Codex Desktop injects codex_app.automation_update with a large oneOf+$ref
 	// schema. xAI's free/build Responses path accepts the HTTP request but never
 	// emits SSE when that schema is present, so Desktop hangs on "thinking".
@@ -844,7 +845,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = normalizeXAITools(body)
+	body = normalizeXAIToolsWithConfig(body, e.cfg.XAI)
 	body = normalizeXAIToolChoiceForTools(body)
 	var replayScope xaiReasoningReplayScope
 	body, replayScope, err = applyXAIReasoningReplayCacheRequired(ctx, from, req, opts, body)
@@ -1038,14 +1039,24 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	return body
 }
 
+type xaiNormalizedTool struct {
+	raw       []byte
+	name      string
+	namespace string
+}
+
 func normalizeXAITools(body []byte) []byte {
+	return normalizeXAIToolsWithConfig(body, config.XAIConfig{})
+}
+
+func normalizeXAIToolsWithConfig(body []byte, cfg config.XAIConfig) []byte {
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
 		return body
 	}
 
 	changed := false
-	filtered := []byte(`[]`)
+	normalized := make([]xaiNormalizedTool, 0, len(tools.Array()))
 	for _, tool := range tools.Array() {
 		toolType := tool.Get("type").String()
 		if toolType == xaiNamespaceToolType {
@@ -1061,11 +1072,11 @@ func normalizeXAITools(body []byte) []byte {
 					if len(nestedRaw) == 0 {
 						continue
 					}
-					updated, errSet := sjson.SetRawBytes(filtered, "-1", nestedRaw)
-					if errSet != nil {
-						return body
-					}
-					filtered = updated
+					normalized = append(normalized, xaiNormalizedTool{
+						raw:       nestedRaw,
+						name:      nestedTool.Get("name").String(),
+						namespace: namespaceName,
+					})
 				}
 			}
 			continue
@@ -1078,7 +1089,37 @@ func normalizeXAITools(body []byte) []byte {
 		if len(raw) == 0 {
 			continue
 		}
-		updated, errSet := sjson.SetRawBytes(filtered, "-1", raw)
+		normalized = append(normalized, xaiNormalizedTool{raw: raw, name: tool.Get("name").String()})
+	}
+	model := strings.ToLower(gjson.GetBytes(body, "model").String())
+	if strings.HasPrefix(model, "grok-") {
+		maxTools := xaiMaxToolsPerRequest
+		if cfg.MaxTools > 0 && cfg.MaxTools < maxTools {
+			maxTools = cfg.MaxTools
+		}
+		if len(normalized) > maxTools {
+			explicitToolChoice := gjson.GetBytes(body, "tool_choice.name").String()
+			if explicitToolChoice == "" {
+				explicitToolChoice = gjson.GetBytes(body, "tool_choice.function.name").String()
+			}
+			ordered := prioritizeXAITools(normalized, cfg.PreferredToolNamespaces, explicitToolChoice)
+			omittedNames := make([]string, 0, len(ordered)-maxTools)
+			for _, tool := range ordered[maxTools:] {
+				name := tool.name
+				if tool.namespace != "" {
+					name = tool.namespace + "." + name
+				}
+				omittedNames = append(omittedNames, name)
+			}
+			log.Warnf("xai: capped tools for model %s from %d to %d", model, len(normalized), maxTools)
+			log.Debugf("xai: omitted tools for model %s: %s", model, strings.Join(omittedNames, ","))
+			normalized = ordered[:maxTools]
+			changed = true
+		}
+	}
+	filtered := []byte(`[]`)
+	for _, tool := range normalized {
+		updated, errSet := sjson.SetRawBytes(filtered, "-1", tool.raw)
 		if errSet != nil {
 			return body
 		}
@@ -1092,6 +1133,42 @@ func normalizeXAITools(body []byte) []byte {
 		return body
 	}
 	return updated
+}
+
+func prioritizeXAITools(tools []xaiNormalizedTool, preferredNamespaces []string, explicitToolChoice string) []xaiNormalizedTool {
+	ordered := make([]xaiNormalizedTool, 0, len(tools))
+	selected := make([]bool, len(tools))
+	appendMatching := func(namespace string) {
+		for i, tool := range tools {
+			if !selected[i] && tool.namespace == namespace {
+				ordered = append(ordered, tool)
+				selected[i] = true
+			}
+		}
+	}
+
+	if explicitToolChoice != "" {
+		for i, tool := range tools {
+			if tool.name == explicitToolChoice {
+				ordered = append(ordered, tool)
+				selected[i] = true
+				break
+			}
+		}
+	}
+	appendMatching("")
+	for _, namespace := range preferredNamespaces {
+		namespace = strings.TrimSpace(namespace)
+		if namespace != "" {
+			appendMatching(namespace)
+		}
+	}
+	for i, tool := range tools {
+		if !selected[i] {
+			ordered = append(ordered, tool)
+		}
+	}
+	return ordered
 }
 
 // normalizeXAIToolChoiceForTools drops tool_choice and parallel_tool_calls

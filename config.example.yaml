@@ -258,6 +258,16 @@ codex:
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
 
+# xAI/Grok provider behavior.
+xai:
+  # xAI accepts at most 200 tools per request. Values above 200 are clamped;
+  # zero or omission uses the upstream limit.
+  max-tools: 200
+  # When a Grok request exceeds max-tools, top-level tools are kept first,
+  # followed by these exact namespace names, then remaining namespaces in
+  # their original order.
+  preferred-tool-namespaces: []
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
