@@ -260,8 +260,9 @@ codex:
 
 # xAI/Grok provider behavior.
 xai:
-  # xAI accepts at most 200 tools per request. Values above 200 are clamped;
-  # zero or omission uses the upstream limit.
+  # xAI accepts at most 200 effective upstream tools per request. Server-side
+  # tools such as web_search can consume multiple slots. Values above 200 are
+  # clamped; zero or omission uses the upstream limit.
   max-tools: 200
   # When a Grok request exceeds max-tools, top-level tools are kept first,
   # followed by these exact namespace names, then remaining namespaces in

@@ -46,6 +46,7 @@ const (
 	xaiToolSearchType          = "tool_search"
 	xaiWebSearchToolType       = "web_search"
 	xaiMaxToolsPerRequest      = 200
+	xaiWebSearchUpstreamCost   = 4
 	// Codex Desktop injects codex_app.automation_update with a large oneOf+$ref
 	// schema. xAI's free/build Responses path accepts the HTTP request but never
 	// emits SSE when that schema is present, so Desktop hangs on "thinking".
@@ -1141,6 +1142,22 @@ type xaiNormalizedTool struct {
 	namespace string
 }
 
+func xaiToolUpstreamCost(tool xaiNormalizedTool) int {
+	if gjson.GetBytes(tool.raw, "type").String() == xaiWebSearchToolType {
+		// Grok Build expands web_search into four upstream tools.
+		return xaiWebSearchUpstreamCost
+	}
+	return 1
+}
+
+func xaiToolsUpstreamCost(tools []xaiNormalizedTool) int {
+	total := 0
+	for _, tool := range tools {
+		total += xaiToolUpstreamCost(tool)
+	}
+	return total
+}
+
 func normalizeXAITools(body []byte) []byte {
 	return normalizeXAIToolsWithConfig(body, config.XAIConfig{})
 }
@@ -1193,23 +1210,35 @@ func normalizeXAIToolsWithConfig(body []byte, cfg config.XAIConfig) []byte {
 		if cfg.MaxTools > 0 && cfg.MaxTools < maxTools {
 			maxTools = cfg.MaxTools
 		}
-		if len(normalized) > maxTools {
+		upstreamCost := xaiToolsUpstreamCost(normalized)
+		if upstreamCost > maxTools {
 			explicitToolChoice := gjson.GetBytes(body, "tool_choice.name").String()
 			if explicitToolChoice == "" {
 				explicitToolChoice = gjson.GetBytes(body, "tool_choice.function.name").String()
 			}
 			ordered := prioritizeXAITools(normalized, cfg.PreferredToolNamespaces, explicitToolChoice)
-			omittedNames := make([]string, 0, len(ordered)-maxTools)
-			for _, tool := range ordered[maxTools:] {
+			retained := make([]xaiNormalizedTool, 0, len(ordered))
+			omittedNames := make([]string, 0, len(ordered))
+			retainedCost := 0
+			for _, tool := range ordered {
+				toolCost := xaiToolUpstreamCost(tool)
+				if retainedCost+toolCost <= maxTools {
+					retained = append(retained, tool)
+					retainedCost += toolCost
+					continue
+				}
 				name := tool.name
+				if name == "" {
+					name = gjson.GetBytes(tool.raw, "type").String()
+				}
 				if tool.namespace != "" {
 					name = tool.namespace + "." + name
 				}
 				omittedNames = append(omittedNames, name)
 			}
-			log.Warnf("xai: capped tools for model %s from %d to %d", model, len(normalized), maxTools)
+			log.Warnf("xai: capped tools for model %s from %d entries (%d upstream tools) to %d entries (%d upstream tools)", model, len(normalized), upstreamCost, len(retained), retainedCost)
 			log.Debugf("xai: omitted tools for model %s: %s", model, strings.Join(omittedNames, ","))
-			normalized = ordered[:maxTools]
+			normalized = retained
 			changed = true
 		}
 	}

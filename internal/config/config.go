@@ -420,8 +420,8 @@ type CodexConfig struct {
 
 // XAIConfig controls xAI-specific request compatibility behavior.
 type XAIConfig struct {
-	// MaxTools caps the number of tools sent to Grok. Values above xAI's
-	// upstream limit are clamped; zero uses the upstream limit.
+	// MaxTools caps Grok's effective upstream tool count. Some server-side
+	// tools expand into multiple upstream tools; zero uses the upstream limit.
 	MaxTools int `yaml:"max-tools" json:"max-tools"`
 	// PreferredToolNamespaces are retained before other namespaced tools when
 	// a Grok request exceeds MaxTools. Top-level tools always take precedence.

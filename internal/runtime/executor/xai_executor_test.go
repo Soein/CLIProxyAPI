@@ -1137,6 +1137,37 @@ func TestNormalizeXAITools_CapsGrokToolsAtUpstreamLimit(t *testing.T) {
 	}
 }
 
+func TestNormalizeXAITools_AccountsForWebSearchExpansion(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"model":"grok-4.5","tools":[`)
+	for i := 0; i < 12; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		_, _ = fmt.Fprintf(&body, `{"type":"function","name":"top_level_%03d","parameters":{"type":"object","properties":{}}}`, i)
+	}
+	body.WriteString(`,{"type":"namespace","name":"optional","tools":[`)
+	for i := 0; i < 185; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		_, _ = fmt.Fprintf(&body, `{"type":"function","name":"optional_%03d","parameters":{"type":"object","properties":{}}}`, i)
+	}
+	body.WriteString(`]},{"type":"web_search"}]}`)
+
+	out := normalizeXAITools([]byte(body.String()))
+	tools := gjson.GetBytes(out, "tools").Array()
+	if got := len(tools); got != 197 {
+		t.Fatalf("tool entry count = %d, want 197", got)
+	}
+	if got := tools[12].Get("type").String(); got != xaiWebSearchToolType {
+		t.Fatalf("tool[12].type = %q, want %q", got, xaiWebSearchToolType)
+	}
+	if got := tools[196].Get("name").String(); got != "optional_183" {
+		t.Fatalf("last retained tool = %q, want optional_183", got)
+	}
+}
+
 func TestNormalizeXAIToolsWithConfig_PrioritizesNamespacesForGrok(t *testing.T) {
 	body := []byte(`{"model":"grok-4.5","tools":[{"type":"namespace","name":"optional","tools":[{"type":"function","name":"optional_1"},{"type":"function","name":"optional_2"}]},{"type":"namespace","name":"critical","tools":[{"type":"function","name":"critical_1"},{"type":"function","name":"critical_2"},{"type":"function","name":"critical_3"}]},{"type":"function","name":"exec_command"}]}`)
 	out := normalizeXAIToolsWithConfig(body, config.XAIConfig{
