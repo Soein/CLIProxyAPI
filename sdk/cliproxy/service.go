@@ -2894,8 +2894,9 @@ func oauthModelAliasesForAuth(cfg *config.Config, channel string, attributes map
 
 func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*ModelInfo) []*ModelInfo {
 	type aliasEntry struct {
-		alias string
-		fork  bool
+		alias       string
+		displayName string
+		fork        bool
 	}
 
 	forward := make(map[string][]aliasEntry, len(aliases))
@@ -2909,7 +2910,11 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 			continue
 		}
 		key := strings.ToLower(name)
-		forward[key] = append(forward[key], aliasEntry{alias: alias, fork: aliases[i].Fork})
+		forward[key] = append(forward[key], aliasEntry{
+			alias:       alias,
+			displayName: strings.TrimSpace(aliases[i].DisplayName),
+			fork:        aliases[i].Fork,
+		})
 	}
 	if len(forward) == 0 {
 		return models
@@ -2966,6 +2971,9 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 			seen[aliasKey] = struct{}{}
 			clone := *model
 			clone.ID = mappedID
+			if entry.displayName != "" {
+				clone.DisplayName = entry.displayName
+			}
 			if clone.Name != "" {
 				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
 			}
