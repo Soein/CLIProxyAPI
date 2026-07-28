@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"reflect"
 	"strings"
 	"sync"
@@ -22,24 +23,31 @@ import (
 )
 
 type UsageReporter struct {
-	provider     string
-	executorType string
-	model        string
-	alias        string
-	authID       string
-	authIndex    string
-	authType     string
-	apiKey       string
-	source       string
-	reasoning    string
-	serviceTier  string
-	generate     bool
-	requestedAt  time.Time
-	ttftMu       sync.RWMutex
-	ttft         time.Duration
-	ttftStart    time.Time
-	ttftSet      bool
-	once         sync.Once
+	provider              string
+	executorType          string
+	model                 string
+	alias                 string
+	authID                string
+	authIndex             string
+	authType              string
+	apiKey                string
+	source                string
+	reasoning             string
+	serviceTier           string
+	generate              bool
+	requestedAt           time.Time
+	ttftMu                sync.RWMutex
+	ttft                  time.Duration
+	ttftStart             time.Time
+	ttftSet               bool
+	once                  sync.Once
+	phaseMu               sync.RWMutex
+	phases                *usage.PhaseTimings
+	phaseStart            time.Time
+	firstEventSet         bool
+	firstSemanticTokenSet bool
+	terminalSet           bool
+	transportReusedSet    bool
 }
 
 type usageExecutor interface {
@@ -53,6 +61,9 @@ func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model
 	}
 	reporter := NewUsageReporter(ctx, provider, model, auth)
 	reporter.executorType = ExecutorTypeName(executor)
+	if tracker := usage.PhaseTrackerFromContext(ctx); tracker != nil {
+		reporter.enablePhases(tracker.BeginAttempt())
+	}
 	return reporter
 }
 
@@ -138,6 +149,125 @@ func (r *UsageReporter) ObserveResponse(resp *http.Response) {
 			r.MarkFirstResponseByte()
 		},
 	}
+}
+
+func (r *UsageReporter) enablePhases(seed usage.AttemptSeed) {
+	if r == nil || seed.Attempt <= 0 {
+		return
+	}
+	r.phaseMu.Lock()
+	r.phases = &usage.PhaseTimings{
+		Attempt:                       seed.Attempt,
+		RequestElapsedToUpstreamStart: seed.RequestElapsedToUpstreamStart,
+		AuthSelection:                 seed.AuthSelection,
+		AffinityOutcome:               seed.AffinityOutcome,
+	}
+	// NewExecutorUsageReporter is the upstream dispatch boundary. Keeping this
+	// clock local to the reporter prevents request/auth time from inflating the
+	// network and streaming phases below.
+	r.phaseStart = time.Now()
+	r.phaseMu.Unlock()
+}
+
+// MarkResponseHeaders records the first upstream response headers observation.
+func (r *UsageReporter) MarkResponseHeaders() {
+	if r == nil {
+		return
+	}
+	r.phaseMu.Lock()
+	if r.phases != nil && !r.phases.ResponseHeadersObserved {
+		r.phases.ResponseHeaders = r.phaseElapsedLocked()
+		r.phases.ResponseHeadersObserved = true
+	}
+	r.phaseMu.Unlock()
+}
+
+// MarkFirstEvent records the first upstream protocol event.
+func (r *UsageReporter) MarkFirstEvent() {
+	if r == nil {
+		return
+	}
+	r.phaseMu.Lock()
+	if r.phases != nil && !r.firstEventSet {
+		r.phases.FirstEvent = r.phaseElapsedLocked()
+		r.firstEventSet = true
+	}
+	r.phaseMu.Unlock()
+}
+
+// MarkFirstSemanticToken records the first user-visible response content.
+func (r *UsageReporter) MarkFirstSemanticToken() {
+	if r == nil {
+		return
+	}
+	r.phaseMu.Lock()
+	if r.phases != nil && !r.firstSemanticTokenSet {
+		r.phases.FirstSemanticToken = r.phaseElapsedLocked()
+		r.firstSemanticTokenSet = true
+	}
+	r.phaseMu.Unlock()
+}
+
+// MarkTerminal records the first upstream terminal event and its kind.
+func (r *UsageReporter) MarkTerminal(kind string) {
+	if r == nil {
+		return
+	}
+	r.phaseMu.Lock()
+	if r.phases != nil && !r.terminalSet {
+		r.phases.Terminal = r.phaseElapsedLocked()
+		r.phases.TerminalKind = strings.TrimSpace(kind)
+		r.terminalSet = true
+	}
+	r.phaseMu.Unlock()
+}
+
+// MarkTransportReused records whether the attempt reused an HTTP connection.
+// The first connection observation wins.
+func (r *UsageReporter) MarkTransportReused(reused bool) {
+	if r == nil {
+		return
+	}
+	r.phaseMu.Lock()
+	if r.phases != nil && !r.transportReusedSet {
+		r.phases.TransportReused = reused
+		r.transportReusedSet = true
+	}
+	r.phaseMu.Unlock()
+}
+
+func (r *UsageReporter) phaseElapsedLocked() time.Duration {
+	if r.phaseStart.IsZero() {
+		return 0
+	}
+	elapsed := time.Since(r.phaseStart)
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+func (r *UsageReporter) phaseSnapshot() *usage.PhaseTimings {
+	if r == nil {
+		return nil
+	}
+	r.phaseMu.RLock()
+	defer r.phaseMu.RUnlock()
+	if r.phases == nil {
+		return nil
+	}
+	snapshot := *r.phases
+	return &snapshot
+}
+
+func (r *UsageReporter) phasesEnabled() bool {
+	if r == nil {
+		return false
+	}
+	r.phaseMu.RLock()
+	enabled := r.phases != nil
+	r.phaseMu.RUnlock()
+	return enabled
 }
 
 func (r *UsageReporter) StartResponseTTFT() {
@@ -272,6 +402,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		RequestedAt:         r.requestedAt,
 		Latency:             r.latency(),
 		TTFT:                r.ttftDuration(),
+		Phases:              r.phaseSnapshot(),
 		Failed:              failed,
 		Fail:                fail,
 		Detail:              detail,
@@ -340,9 +471,20 @@ type usageTTFTRoundTripper struct {
 
 func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.reporter.StartResponseTTFT()
+	if t.reporter.phasesEnabled() {
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				t.reporter.MarkTransportReused(info.Reused)
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	}
 	resp, errRoundTrip := t.base.RoundTrip(req)
 	if errRoundTrip != nil {
 		return resp, errRoundTrip
+	}
+	if resp != nil {
+		t.reporter.MarkResponseHeaders()
 	}
 	t.reporter.ObserveResponse(resp)
 	return resp, nil

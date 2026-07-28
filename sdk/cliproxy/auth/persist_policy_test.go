@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"sync/atomic"
 	"testing"
 )
@@ -89,5 +90,38 @@ func TestPersist_SkipsConfigAPIKeyAuth(t *testing.T) {
 	mgr.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5", Success: true})
 	if got := store.saveCount.Load(); got != 0 {
 		t.Fatalf("expected MarkResult to skip persist for config api key, got %d Save calls", got)
+	}
+}
+
+func TestRuntimeOnlyAuthStateNeverCallsCredentialStoreSave(t *testing.T) {
+	store := &countingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "runtime-only-state",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "codex"},
+		ModelStates: map[string]*ModelState{
+			"unsupported-runtime-model": {
+				Status:      StatusError,
+				Unavailable: true,
+				LastError:   &Error{HTTPStatus: http.StatusTooManyRequests},
+			},
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register(skipPersist) error: %v", err)
+	}
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID: auth.ID,
+		Model:  "unsupported-runtime-model",
+		Error:  &Error{HTTPStatus: http.StatusTooManyRequests},
+	})
+	mgr.recordAvailabilityNeutralResult(context.Background(), Result{AuthID: auth.ID, Success: true})
+	mgr.ReconcileRegistryModelStates(context.Background(), auth.ID)
+
+	if got := store.saveCount.Load(); got != 0 {
+		t.Fatalf("runtime-only MarkResult/neutral/reconcile issued %d credential Save calls, want 0", got)
 	}
 }

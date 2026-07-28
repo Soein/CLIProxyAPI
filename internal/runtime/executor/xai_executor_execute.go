@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -19,6 +21,7 @@ import (
 )
 
 func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	opts = xaiOptionsWithSelectedAuth(opts, auth)
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
@@ -28,18 +31,28 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if xaiIsVideoRequest(opts) {
 		return e.executeVideos(ctx, auth, req, opts)
 	}
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+		ctx = cliproxyusage.EnablePhases(ctx)
+	}
 
 	token, _ := xaiCreds(auth)
 	baseURL := xaiChatBaseURL(auth)
 	logXAIResolvedBaseURL(ctx, baseURL)
+	req, opts, continuity := prepareXAIHTTPResponseContinuity(ctx, auth, req, opts, baseURL)
 
 	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
 	if err != nil {
 		return resp, err
 	}
+	applyXAIHTTPResponseContinuityToPrepared(prepared, continuity)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
+	defer func() {
+		if err != nil {
+			reporter.MarkTerminal(xaiFailureTerminalKind(ctx, err))
+		}
+		reporter.TrackFailure(ctx, &err)
+	}()
 	reporter.SetTranslatedReasoningEffort(prepared.body, e.Identifier())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -74,17 +87,15 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		return resp, xaiStatusErr(httpResp.StatusCode, data)
 	}
 
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
-	for _, line := range bytes.Split(data, []byte("\n")) {
+	phaseMarker := xaiResponsePhaseMarker{reporter: reporter}
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(nil, 52_428_800)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 		if !bytes.HasPrefix(line, xaiDataTag) {
 			continue
 		}
@@ -94,23 +105,47 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		if len(eventData) == 0 {
 			continue
 		}
+		upstreamEventType := gjson.GetBytes(eventData, "type").String()
+		phaseMarker.mark(upstreamEventType, eventData, false)
+		if terminalKind := xaiTerminalKind(upstreamEventType); terminalKind != "" {
+			reporter.MarkTerminal(terminalKind)
+		}
+		eventData = xaiNormalizeTerminalResponseData(eventData)
+		if terminalErr, ok := xaiTerminalFailureErr(eventData); ok {
+			helps.RecordAPIResponseError(ctx, e.cfg, terminalErr)
+			return resp, terminalErr
+		}
 		switch gjson.GetBytes(eventData, "type").String() {
 		case "response.output_item.done":
 			xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
-		case "response.completed":
+		case "response.completed", "response.incomplete":
 			if detail, ok := helps.ParseCodexUsage(eventData); ok {
 				reporter.Publish(ctx, detail)
 			}
-			completedData := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
-			completedData = xaiNormalizeReasoningSummaryData(completedData)
-			cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, completedData)
+			reporter.EnsurePublished(ctx)
+			terminalData := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+			terminalData = xaiNormalizeReasoningSummaryData(terminalData)
+			if upstreamEventType == "response.completed" {
+				cacheXAIHTTPResponseContinuity(ctx, continuity, prepared, eventData)
+				cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, terminalData)
+			}
 			var param any
-			out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
+			out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, terminalData, &param)
 			return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 		}
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		reporter.MarkTerminal("canceled")
+		return resp, ctxErr
+	}
+	if errScan := scanner.Err(); errScan != nil {
+		reporter.MarkTerminal("disconnect")
+		helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+		return resp, errScan
+	}
 
-	return resp, statusErr{code: http.StatusRequestTimeout, msg: "xai stream error: stream disconnected before response.completed"}
+	reporter.MarkTerminal("disconnect")
+	return resp, statusErr{code: http.StatusRequestTimeout, msg: "xai stream error: stream disconnected before terminal response"}
 }
 
 func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {

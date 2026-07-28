@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,16 @@ import (
 )
 
 func resetAntigravityCreditsRetryState() {
+	// Credits-hint probes are intentionally detached. Wait for any local probe
+	// to leave its per-auth critical section before replacing the global maps,
+	// otherwise test cleanup can race the final cache writes.
+	antigravityCreditsHintRefreshByID.Range(func(_, value any) bool {
+		if state, ok := value.(*antigravityCreditsHintRefreshState); ok && state != nil {
+			state.mu.Lock()
+			state.mu.Unlock()
+		}
+		return true
+	})
 	antigravityCreditsFailureByAuth = sync.Map{}
 	antigravityShortCooldownByAuth = sync.Map{}
 	antigravityCreditsBalanceByAuth = sync.Map{}
@@ -632,6 +643,100 @@ func TestMaybeRefreshAntigravityCreditsHintHomeRefreshThrottleUsesSetNX(t *testi
 	}
 }
 
+func TestMaybeRefreshAntigravityCreditsHintDispatchAdmissionRejected(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	exec := NewAntigravityExecutor(&config.Config{
+		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
+	})
+	auth := &cliproxyauth.Auth{ID: "dispatch-rejected-credits-hint-" + time.Now().Format("150405.000000000")}
+	var admits atomic.Int64
+	var requests atomic.Int64
+	ctx := cliproxyexecutor.WithDispatchAdmission(context.Background(), func(authID string) (func(), bool) {
+		admits.Add(1)
+		if authID != auth.ID {
+			t.Errorf("admitted auth ID = %q, want %q", authID, auth.ID)
+		}
+		return nil, false
+	})
+	ctx = context.WithValue(ctx, "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, errors.New("unexpected request")
+	}))
+
+	exec.maybeRefreshAntigravityCreditsHint(ctx, auth, "access-token")
+
+	if got := admits.Load(); got != 1 {
+		t.Fatalf("dispatch admissions = %d, want 1", got)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("loadCodeAssist requests = %d, want 0", got)
+	}
+	if cliproxyauth.HasKnownAntigravityCreditsHint(auth.ID) {
+		t.Fatal("rejected credits probe published a hint")
+	}
+}
+
+func TestMaybeRefreshAntigravityCreditsHintHoldsDispatchAdmissionUntilProbeCompletes(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	exec := NewAntigravityExecutor(&config.Config{
+		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
+	})
+	auth := &cliproxyauth.Auth{ID: "dispatch-held-credits-hint-" + time.Now().Format("150405.000000000")}
+	requestStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	released := make(chan struct{})
+	var active atomic.Int64
+	ctx := cliproxyexecutor.WithDispatchAdmission(context.Background(), func(authID string) (func(), bool) {
+		if authID != auth.ID {
+			t.Errorf("admitted auth ID = %q, want %q", authID, auth.ID)
+		}
+		active.Add(1)
+		return func() {
+			active.Add(-1)
+			close(released)
+		}, true
+	})
+	ctx = context.WithValue(ctx, "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		close(requestStarted)
+		<-allowResponse
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"paidTier":{"id":"tier-1"}}`)),
+		}, nil
+	}))
+
+	exec.maybeRefreshAntigravityCreditsHint(ctx, auth, "access-token")
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("credits probe did not start")
+	}
+	if got := active.Load(); got != 1 {
+		t.Fatalf("active dispatch admissions = %d, want 1 while probe is running", got)
+	}
+	select {
+	case <-released:
+		t.Fatal("dispatch admission released before credits probe completed")
+	default:
+	}
+
+	close(allowResponse)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch admission was not released after credits probe completed")
+	}
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active dispatch admissions = %d, want 0", got)
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -653,7 +758,11 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 		},
 	}
 	refreshDone := make(chan struct{})
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+	probeDone := make(chan struct{})
+	ctx := cliproxyexecutor.WithDispatchAdmission(context.Background(), func(string) (func(), bool) {
+		return func() { close(probeDone) }, true
+	})
+	ctx = context.WithValue(ctx, "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.String() != "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
 			t.Fatalf("unexpected request url %s", req.URL.String())
 		}
@@ -694,6 +803,11 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 	}
 	if hint.CreditAmount != 25000 || hint.MinCreditAmount != 50 {
 		t.Fatalf("hint amounts = (%v, %v), want (25000, 50)", hint.CreditAmount, hint.MinCreditAmount)
+	}
+	select {
+	case <-probeDone:
+	case <-time.After(time.Second):
+		t.Fatal("credits hint probe did not release dispatch admission")
 	}
 }
 

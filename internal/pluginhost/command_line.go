@@ -11,6 +11,7 @@ import (
 	"time"
 
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
@@ -244,6 +245,12 @@ func (h *Host) ExecuteCommandLine(ctx context.Context, program string, args []st
 	if len(triggeredByPlugin) == 0 {
 		return 0, false
 	}
+	var errFence error
+	ctx, errFence = coreauth.BeginExplicitAuthOperation(ctx, sdkAuth.GetTokenStore())
+	if errFence != nil {
+		log.WithError(errFence).Error("pluginhost: failed to begin explicit auth operation")
+		return 1, true
+	}
 
 	exitCode := 0
 	handled := false
@@ -382,7 +389,7 @@ func (h *Host) persistCommandLineAuths(ctx context.Context, auths []pluginapi.Au
 		if record == nil {
 			return savedPaths, fmt.Errorf("pluginhost: command-line auth %d is invalid", index+1)
 		}
-		savedPath, errSave := store.Save(ctx, record)
+		savedPath, errSave := coreauth.PersistExplicitAuth(ctx, store, record)
 		if errSave != nil {
 			return savedPaths, fmt.Errorf("pluginhost: save command-line auth %s: %w", record.ID, errSave)
 		}

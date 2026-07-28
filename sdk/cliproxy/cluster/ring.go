@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -34,35 +35,78 @@ type RingMember struct {
 	Weight int // >0; defaults to 100 if <=0
 }
 
-// AuthRing is concurrent-safe. Zero value is usable (returns empty ring,
-// IsMine returns true for ANY id — see below for why).
+// AuthRing is concurrent-safe. The zero value is usable and fails closed:
+// it does not claim any auth until valid membership has been installed.
 type AuthRing struct {
 	myNodeID string
 	snap     atomic.Pointer[ringSnapshot]
+	updateMu sync.Mutex
+	terminal bool
 }
 
 // ringSnapshot is an immutable view of the ring at one instant. Swapped
 // atomically by Rebuild().
 type ringSnapshot struct {
+	epoch   int64
 	members []RingMember // sorted by NodeID for deterministic iteration
+	ready   bool
+}
+
+// RingDecision is one atomic ownership observation. Callers that coordinate
+// dispatch must use Decision instead of separate Owner and Ready calls so a
+// membership publication cannot be observed half before and half after an
+// epoch transition.
+type RingDecision struct {
+	Epoch int64
+	Owner string
+	Ready bool
 }
 
 // NewAuthRing creates an empty ring owned by myNodeID. Before Rebuild is
-// called the ring is "not ready": IsMine returns true for all IDs so the
-// caller degrades to the pre-sharding behavior (better to over-use an
-// auth than to black-hole requests during bootstrap).
+// called the ring is not ready and does not claim any auth.
 func NewAuthRing(myNodeID string) *AuthRing {
 	return &AuthRing{myNodeID: strings.TrimSpace(myNodeID)}
 }
 
 // Rebuild atomically replaces the ring membership. Safe to call from any
 // goroutine. Duplicate NodeIDs are coalesced (last write wins) and
-// non-positive weights are clamped to 100. Empty membership is allowed —
-// IsMine degrades to true in that case, matching the "not ready" semantics.
+// non-positive weights are clamped to 100. Empty membership is allowed and
+// leaves the ring not ready.
 func (r *AuthRing) Rebuild(members []RingMember) {
 	if r == nil {
 		return
 	}
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+	if r.terminal {
+		return
+	}
+	epoch := int64(1)
+	if current := r.snap.Load(); current != nil {
+		epoch = current.epoch + 1
+	}
+	r.publishLocked(epoch, members)
+}
+
+// RebuildAt atomically publishes membership at the database-authoritative
+// epoch. Publications older than the current snapshot are ignored. This
+// prevents a delayed refresh from rolling dispatch ownership backwards.
+func (r *AuthRing) RebuildAt(epoch int64, members []RingMember) {
+	if r == nil || epoch < 0 {
+		return
+	}
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+	if r.terminal {
+		return
+	}
+	if current := r.snap.Load(); current != nil && epoch < current.epoch {
+		return
+	}
+	r.publishLocked(epoch, members)
+}
+
+func (r *AuthRing) publishLocked(epoch int64, members []RingMember) {
 	normalised := make(map[string]RingMember, len(members))
 	for _, m := range members {
 		id := strings.TrimSpace(m.NodeID)
@@ -80,57 +124,77 @@ func (r *AuthRing) Rebuild(members []RingMember) {
 		flat = append(flat, m)
 	}
 	sort.Slice(flat, func(i, j int) bool { return flat[i].NodeID < flat[j].NodeID })
-	r.snap.Store(&ringSnapshot{members: flat})
+	ready := false
+	if r.myNodeID != "" {
+		for _, member := range flat {
+			if member.NodeID == r.myNodeID {
+				ready = true
+				break
+			}
+		}
+	}
+	r.snap.Store(&ringSnapshot{epoch: epoch, members: flat, ready: ready})
+}
+
+// FailClosed permanently invalidates this ring instance. It is linearized
+// with Rebuild so an in-flight watcher refresh cannot publish membership
+// after a fatal loss of the node's database-backed lease. Recovery requires
+// constructing a new AuthRing as part of a new Service lifecycle.
+func (r *AuthRing) FailClosed() {
+	if r == nil {
+		return
+	}
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+	r.terminal = true
+	epoch := int64(0)
+	if current := r.snap.Load(); current != nil {
+		epoch = current.epoch
+	}
+	r.snap.Store(&ringSnapshot{epoch: epoch})
+}
+
+// Decision returns epoch, owner, and local readiness from one immutable ring
+// snapshot. Owner remains visible when the local node is absent so callers can
+// distinguish "owned elsewhere" from an empty ring while still failing closed
+// through Ready=false.
+func (r *AuthRing) Decision(authID string) RingDecision {
+	if r == nil {
+		return RingDecision{}
+	}
+	snap := r.snap.Load()
+	if snap == nil || len(snap.members) == 0 {
+		if snap == nil {
+			return RingDecision{}
+		}
+		return RingDecision{Epoch: snap.epoch}
+	}
+	return RingDecision{
+		Epoch: snap.epoch,
+		Owner: pickOwner(authID, snap.members),
+		Ready: snap.ready,
+	}
 }
 
 // Owner returns the NodeID that owns the given auth_id, or "" when the ring
 // is empty / not ready. Ties broken by NodeID ascending (deterministic).
 func (r *AuthRing) Owner(authID string) string {
-	if r == nil {
-		return ""
-	}
-	snap := r.snap.Load()
-	if snap == nil || len(snap.members) == 0 {
-		return ""
-	}
-	return pickOwner(authID, snap.members)
+	return r.Decision(authID).Owner
 }
 
 // IsMine reports whether the current node owns the given auth_id under the
-// current membership. Critical degradation rules:
+// current membership. Ownership is fail-closed:
 //
-//  1. Nil receiver              -> true  (caller didn't wire the ring)
-//  2. myNodeID unset            -> true  (misconfigured: cannot claim ownership)
-//  3. Ring not yet built        -> true  (bootstrap window)
+//  1. Nil receiver              -> false (caller didn't wire the ring)
+//  2. myNodeID unset            -> false (misconfigured: cannot claim ownership)
+//  3. Ring not yet built        -> false (bootstrap window)
 //  4. Ring built but I'm absent -> false (I'm draining; don't claim)
-//
-// These rules lean toward "over-serve rather than under-serve": an auth
-// being handled by two replicas is safe (PG advisory lock protects refresh,
-// upstream API tolerates concurrent requests), but black-holing an auth
-// because the ring hasn't loaded yet causes user-facing 500s.
 func (r *AuthRing) IsMine(authID string) bool {
 	if r == nil {
-		return true
-	}
-	if r.myNodeID == "" {
-		return true
-	}
-	snap := r.snap.Load()
-	if snap == nil || len(snap.members) == 0 {
-		return true
-	}
-	// If my node was removed from the ring (draining/down), don't claim.
-	selfPresent := false
-	for _, m := range snap.members {
-		if m.NodeID == r.myNodeID {
-			selfPresent = true
-			break
-		}
-	}
-	if !selfPresent {
 		return false
 	}
-	return pickOwner(authID, snap.members) == r.myNodeID
+	decision := r.Decision(authID)
+	return decision.Ready && decision.Owner == r.myNodeID
 }
 
 // Members returns a defensive copy of the current ring membership. Useful
@@ -148,15 +212,15 @@ func (r *AuthRing) Members() []RingMember {
 	return out
 }
 
-// Ready reports whether the ring has been populated at least once AND
-// contains members. Callers use this to distinguish "bootstrap" (IsMine=true
-// degradation) from "I've been removed from ring" (IsMine=false).
+// Ready reports whether the ring has members and contains the configured
+// local node. A non-empty snapshot that omits the local node is not ready for
+// local sharding decisions.
 func (r *AuthRing) Ready() bool {
 	if r == nil {
 		return false
 	}
 	snap := r.snap.Load()
-	return snap != nil && len(snap.members) > 0
+	return snap != nil && snap.ready
 }
 
 // pickOwner computes the Weighted-Rendezvous-Hashing winner (Schindelhauer

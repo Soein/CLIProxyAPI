@@ -2,6 +2,8 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -94,6 +96,13 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	if s == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Watcher and runtime-provider updates describe state that has either
+	// already been persisted or is being persisted by the watcher. Never let
+	// the inline fallback turn them into an ordinary Manager Save/Restore.
+	ctx = coreauth.WithSkipPersist(ctx)
 	updates = coalesceAuthUpdates(updates)
 	s.cfgMu.RLock()
 	cfg := s.cfg
@@ -103,6 +112,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	}
 
 	registrationCtx := coreauth.WithDeferredAPIKeyModelAliasRebuild(ctx)
+	_, versionedStore := s.coreManager.GetStore().(coreauth.VersionedAuthStore)
 	tasks := make([]modelRegistrationTask, 0, len(updates))
 	needsPluginSync := false
 	needsAliasRebuild := false
@@ -110,6 +120,19 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 		switch update.Action {
 		case watcher.AuthUpdateActionAdd, watcher.AuthUpdateActionModify:
 			if update.Auth == nil || update.Auth.ID == "" {
+				continue
+			}
+			if versionedStore && authUpdateUsesAuthoritativeStore(update.Auth) {
+				// A file snapshot is only a persistence proposal for a CAS-backed
+				// store. Reload the authoritative row so an older snapshot cannot
+				// recreate a tombstoned or concurrently-updated credential locally.
+				exists, errReload := s.reloadAuthRuntimeByID(registrationCtx, update.Auth.ID)
+				if errReload != nil {
+					log.WithError(errReload).Warnf("failed to reload authoritative auth %s after watcher %s", update.Auth.ID, update.Action)
+					continue
+				}
+				needsAliasRebuild = true
+				needsPluginSync = needsPluginSync || exists
 				continue
 			}
 			auth := s.prepareCoreAuthForModelRegistration(registrationCtx, update.Auth)
@@ -150,6 +173,13 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	}
 }
 
+func authUpdateUsesAuthoritativeStore(auth *coreauth.Auth) bool {
+	if auth == nil || coreauth.IsConfigAPIKeyAuth(auth) || coreauth.IsPluginVirtualAuth(auth) {
+		return false
+	}
+	return auth.AuthSourceKind() != coreauth.AuthSourceMemory
+}
+
 func coalesceAuthUpdates(updates []watcher.AuthUpdate) []watcher.AuthUpdate {
 	if len(updates) <= 1 {
 		return updates
@@ -187,6 +217,181 @@ func authUpdateID(update watcher.AuthUpdate) string {
 		return strings.TrimSpace(update.Auth.ID)
 	}
 	return ""
+}
+
+// reloadAuthRuntimeByID converges all Service-owned runtime state for one
+// authoritative store row. Manager.ReloadByID owns the auth map and scheduler;
+// this method keeps executor bindings, model registration, and provider
+// sessions in lockstep with that result. It intentionally never persists.
+func (s *Service) reloadAuthRuntimeByID(ctx context.Context, id string) (bool, error) {
+	if s == nil || s.coreManager == nil {
+		return false, nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = coreauth.WithSkipPersist(ctx)
+
+	previousProvider := ""
+	if previous, ok := s.coreManager.GetByID(id); ok && previous != nil {
+		previousProvider = strings.TrimSpace(previous.Provider)
+	}
+	if errReload := s.coreManager.ReloadByID(ctx, id); errReload != nil {
+		return false, errReload
+	}
+
+	auth, exists := s.coreManager.GetByID(id)
+	if !exists || auth == nil {
+		GlobalModelRegistry().UnregisterClient(id)
+		closeProviderSessionsForRemovedAuth(previousProvider, id)
+		if errScrub := s.reconcileAuthMirror(ctx, id); errScrub != nil {
+			return false, errScrub
+		}
+		return false, nil
+	}
+	if previousProvider != "" && !strings.EqualFold(previousProvider, strings.TrimSpace(auth.Provider)) {
+		closeProviderSessionsForRemovedAuth(previousProvider, id)
+	}
+	s.refreshModelRegistrationForAuth(auth)
+	_, exists = s.coreManager.GetByID(id)
+	if errMirror := s.reconcileAuthMirror(ctx, id); errMirror != nil {
+		return exists, errMirror
+	}
+	return exists, nil
+}
+
+// reconcileAuthRuntime performs the periodic, writer-backed Manager reconcile
+// and then converges Service-owned state that Manager hooks do not own:
+// executor bindings, model registrations, provider sessions, aliases, and the
+// plugin runtime. This heals LISTEN/NOTIFY gaps without persisting snapshots.
+func (s *Service) reconcileAuthRuntime(ctx context.Context) error {
+	if s == nil || s.coreManager == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = coreauth.WithSkipPersist(ctx)
+
+	before := authRuntimeSnapshotByID(s.coreManager.List())
+	if errReconcile := s.coreManager.Reconcile(ctx); errReconcile != nil {
+		return errReconcile
+	}
+	after := authRuntimeSnapshotByID(s.coreManager.List())
+	changed := false
+	var convergeErr error
+
+	for id, previous := range before {
+		if _, exists := after[id]; exists {
+			continue
+		}
+		if latest, exists := s.coreManager.GetByID(id); exists && latest != nil {
+			s.refreshModelRegistrationForAuth(latest)
+			changed = true
+			continue
+		}
+		GlobalModelRegistry().UnregisterClient(id)
+		if previous != nil {
+			closeProviderSessionsForRemovedAuth(previous.Provider, id)
+		}
+		if errScrub := s.reconcileAuthMirror(ctx, id); errScrub != nil {
+			log.WithError(errScrub).Warnf("failed to scrub deleted auth mirror %s", id)
+			convergeErr = errors.Join(convergeErr, errScrub)
+		}
+		changed = true
+	}
+
+	for id, current := range after {
+		previous, existed := before[id]
+		if existed && !authRuntimeBindingChanged(previous, current) {
+			continue
+		}
+		if previous != nil && !strings.EqualFold(strings.TrimSpace(previous.Provider), strings.TrimSpace(current.Provider)) {
+			closeProviderSessionsForRemovedAuth(previous.Provider, id)
+		}
+		s.refreshModelRegistrationForAuth(current)
+		changed = true
+	}
+
+	if changed {
+		s.coreManager.RefreshAPIKeyModelAlias()
+		s.syncPluginRuntime(ctx)
+	}
+	return convergeErr
+}
+
+func (s *Service) reconcileAuthMirror(ctx context.Context, id string) error {
+	if s == nil || s.coreManager == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	store := s.coreManager.GetStore()
+	if reconciler, ok := store.(coreauth.AuthMirrorReconciler); ok {
+		if errMirror := reconciler.ReconcileAuthMirror(ctx, id); errMirror != nil {
+			return fmt.Errorf("reconcile auth mirror %s: %w", id, errMirror)
+		}
+		return nil
+	}
+	if _, exists := s.coreManager.GetByID(id); exists {
+		return nil
+	}
+	scrubber, ok := store.(coreauth.AuthDeletedMirrorStore)
+	if !ok {
+		return nil
+	}
+	if errScrub := scrubber.ScrubDeletedAuthMirror(ctx, id); errScrub != nil {
+		return fmt.Errorf("scrub deleted auth mirror %s: %w", id, errScrub)
+	}
+	return nil
+}
+
+func (s *Service) reconcileAuthMirrors(ctx context.Context) error {
+	if s == nil || s.coreManager == nil {
+		return nil
+	}
+	reconciler, ok := s.coreManager.GetStore().(coreauth.AuthMirrorReconciler)
+	if !ok {
+		return nil
+	}
+	if errMirror := reconciler.ReconcileAuthMirrors(ctx); errMirror != nil {
+		return fmt.Errorf("reconcile auth mirrors: %w", errMirror)
+	}
+	return nil
+}
+
+func authRuntimeSnapshotByID(auths []*coreauth.Auth) map[string]*coreauth.Auth {
+	snapshot := make(map[string]*coreauth.Auth, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		snapshot[strings.TrimSpace(auth.ID)] = auth.Clone()
+	}
+	return snapshot
+}
+
+func authRuntimeBindingChanged(previous, current *coreauth.Auth) bool {
+	if previous == nil || current == nil {
+		return previous != current
+	}
+	if !strings.EqualFold(strings.TrimSpace(previous.Provider), strings.TrimSpace(current.Provider)) ||
+		previous.Disabled != current.Disabled || previous.Status != current.Status || previous.Prefix != current.Prefix {
+		return true
+	}
+	return previous.StoreGeneration() != current.StoreGeneration()
+}
+
+func closeProviderSessionsForRemovedAuth(provider, id string) {
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		executor.CloseCodexWebsocketSessionsForAuthID(id, "auth_removed")
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "xai") {
+		executor.CloseXAIWebsocketSessionsForAuthID(id, "auth_removed")
+	}
 }
 
 func (s *Service) ensureWebsocketGateway() {

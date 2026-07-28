@@ -31,6 +31,9 @@ func applyXAIReasoningReplayCacheRequired(ctx context.Context, from sdktranslato
 	if !scope.valid() {
 		return body, scope, nil
 	}
+	if xaiMetadataBool(opts.Metadata, xaiSkipReasoningReplayMetadataKey) {
+		return body, scope, nil
+	}
 	items, ok, errReplay := getXAIReasoningReplayItemsRequired(ctx, scope.modelName, scope.sessionKey)
 	if errReplay != nil {
 		log.Warnf("xai reasoning replay cache read failed: %v", errReplay)
@@ -60,32 +63,37 @@ func xaiReasoningReplayScopeFromRequest(ctx context.Context, from sdktranslator.
 		return xaiReasoningReplayScope{}
 	}
 	sessionKey := codexReasoningReplaySessionKey(ctx, from, req, opts, body)
-	sessionKey = xaiReasoningReplayIsolateSessionKey(ctx, sessionKey)
+	sessionKey = xaiReasoningReplayIsolateSessionKey(ctx, sessionKey, opts)
 	return xaiReasoningReplayScope{
 		modelName:  thinking.ParseSuffix(req.Model).ModelName,
 		sessionKey: sessionKey,
 	}
 }
 
-// xaiReasoningReplayIsolateSessionKey namespaces client-controlled session keys
-// by the downstream CPA API key so two callers cannot share encrypted reasoning
-// or assistant text by reusing prompt_cache_key / window / session headers.
-// Trusted execution session keys keep their existing form. Client-controlled
-// sessions without a caller API key are disabled rather than shared globally.
-func xaiReasoningReplayIsolateSessionKey(ctx context.Context, sessionKey string) string {
+// xaiReasoningReplayIsolateSessionKey namespaces every replay key by selected
+// xAI auth provenance. Client-controlled keys are additionally isolated by the
+// downstream CPA API key. Missing auth provenance fails closed; untrusted
+// client-controlled sessions without a caller API key are also disabled.
+func xaiReasoningReplayIsolateSessionKey(ctx context.Context, sessionKey string, opts cliproxyexecutor.Options) string {
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
 		return ""
 	}
+	authID := xaiMetadataString(opts.Metadata, cliproxyexecutor.SelectedAuthMetadataKey)
+	if authID == "" {
+		return ""
+	}
+	authSum := sha256.Sum256([]byte(authID))
+	authScope := "auth:" + hex.EncodeToString(authSum[:8])
 	if strings.HasPrefix(sessionKey, "execution:") {
-		return sessionKey
+		return authScope + ":" + sessionKey
 	}
 	apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx))
 	if apiKey == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(apiKey))
-	return "caller:" + hex.EncodeToString(sum[:8]) + ":" + sessionKey
+	callerSum := sha256.Sum256([]byte(apiKey))
+	return authScope + ":caller:" + hex.EncodeToString(callerSum[:8]) + ":" + sessionKey
 }
 
 func xaiReasoningReplayEnabledForSource(from sdktranslator.Format) bool {

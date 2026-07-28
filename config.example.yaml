@@ -198,16 +198,6 @@ quota-exceeded:
   switch-preview-model: true # Whether to automatically switch to a preview model when a quota is exceeded
   antigravity-credits: true # Whether to use credits as last-resort fallback when all free-tier auths are exhausted for Claude models
 
-# Codex weekly automation
-codex-weekly-automation:
-  enabled: false # Whether to periodically check Codex weekly usage and auto-disable/re-enable auth files
-  interval-seconds: 300 # How often to check Codex weekly usage
-
-# Codex hourly (5h primary_window) automation
-codex-hourly-automation:
-  enabled: false # Whether to periodically check Codex 5h usage and auto-disable/re-enable auth files
-  interval-seconds: 300 # How often to check Codex 5h usage
-
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
@@ -221,43 +211,67 @@ routing:
   session-affinity-ttl: "1h"
 
 # Multi-node HA cluster coordination (opt-in). Requires the token store to be
-# Postgres-backed (internal/store.PostgresStore) — otherwise these settings
-# are ignored and a warning is logged at startup. In single-instance mode
-# leave this entire block absent or set enabled: false.
+# Postgres-backed (internal/store.PostgresStore). Bootstrap errors stop service
+# startup; the process never silently falls back to single-instance behavior.
+# In single-instance mode leave this entire block absent or set enabled: false.
+# Every node in one HA cluster must share the same PostgreSQL database and
+# schema settings. Cluster tables honor PGSTORE_SCHEMA, but advisory locks and
+# LISTEN/NOTIFY channels remain database-wide. Independent CPA clusters require
+# separate PostgreSQL databases for complete isolation.
+#
+# Upgrade safety: never mix older CPA binaries with this strict dispatch
+# lifecycle. Stop every replica, upgrade them together, then restart the
+# cluster; an older binary does not participate in the lease fence protocol.
+# Management OAuth session state is node-local. Keep auth URL, callback, and
+# status polling on the same replica (LB sticky session or one management node).
+# Regular inference traffic does not require this management-plane stickiness.
 #
 # When enabled:
 #   - Leader election via pg_try_advisory_lock(1, 1); only the leader runs
-#     the auto-refresh loop, codex automations and model updater.
+#     the auto-refresh loop and model updater.
 #   - Per-auth refresh mutex via pg_try_advisory_lock(2, hash32(authID)) so
 #     concurrent replicas cannot race on OAuth token rotation.
 #   - LISTEN/NOTIFY on cliproxy_auth_changed so peer replicas reload the
 #     affected auth rows within milliseconds of any mutation.
 # cluster:
 #   enabled: false           # master switch; default false
-#   node-id: ""              # default: machine hostname
+#   node-id: ""              # default: hostname; REQUIRED and unique when auth-sharding=true
 #   region: ""               # free-form label for cluster_nodes heartbeat
-#   probe-interval: "5s"     # advisory-lock probe cadence
+#   probe-interval: "5s"     # leader + node-lease/watchdog cadence; sharding caps it to ring-staleness/5
 #
 #   # Phase 4: instance-routing metadata consumed by new-api's consistent-
 #   # hash router. Absent endpoint disables routing but leader election
-#   # still works. Weight defaults to 100; use smaller for weaker machines.
+#   # still works when auth sharding is off. auth-sharding=true requires a
+#   # non-empty endpoint. Weight defaults to 100; use smaller for weaker machines.
 #   endpoint: ""             # e.g. "http://100.64.1.10:7860" (Tailscale)
 #   weight: 100              # relative share (4C4G=50, 8C8G=100)
 #   registrar-interval: "10s"  # heartbeat cadence for cluster_nodes row
 #
 #   # Phase 4 Sprint 2: auth (OAuth account) sharding. Each auth hashes to
 #   # exactly one replica; only that replica dispatches and refreshes it.
-#   # Keep FALSE until all replicas in the cluster are on Phase-4 code —
-#   # mixing sharding-on and sharding-off replicas causes accounts to be
-#   # double-used. Flip to true AFTER all replicas are upgraded.
+#   # Strict multi-node account ownership requires TRUE. Never mix sharding-on
+#   # and sharding-off replicas: that double-uses accounts. Change this only as
+#   # part of a coordinated restart after every replica has the same binary.
 #   #
 #   # IMPORTANT: this flag is read once during cluster bootstrap. Changing
 #   # it via config hot-reload does NOT take effect — every replica must
 #   # be restarted (docker restart / systemctl restart) after flipping.
+#   # It also requires an explicit unique node-id. A fresh active row or a
+#   # node-id lease held by another replica makes startup fail closed.
+#   # PostgreSQL dispatch leases are the sole authority for starting work on
+#   # an auth. Their TTL is ring-staleness/2, capped at 15s, so takeover after
+#   # owner loss may wait up to 15s. Work admitted before drain/lease loss may
+#   # finish in flight; the start fence prevents new overlap but cannot promise
+#   # absolute non-overlap for already-running work across membership epochs.
+#   # Home mode and spillover=true are rejected when auth sharding is enabled.
+#   # The default 10s registrar / 5s probe / 30s staleness timing is safe.
+#   # Unsafe custom timing is rejected at startup so this node fails before
+#   # peers can evict its heartbeat and take over the same auth shard.
 #   auth-sharding: false
-#   spillover: true            # fall back to full pool when local shard is all limited
+#   # Must remain false for auth sharding; startup rejects non-owner spillover.
+#   spillover: false
 #   ring-staleness: "30s"      # treat cluster_nodes row older than this as dead
-#   ring-poll-interval: "30s"  # safety-net re-query in case NOTIFY drops
+#   ring-poll-interval: "30s"  # safety-net re-query; capped to probe cadence when sharding is enabled
 
 # PG-backed cluster usage statistics. By default usage stats live in
 # per-node memory (memory mode), so /v0/management/usage shows only the

@@ -8,6 +8,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"golang.org/x/net/context"
@@ -138,6 +139,11 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 				return
 			}
 			if !ok {
+				if ctx != nil && ctx.Err() != nil {
+					completionOutcome = pluginapi.RequestCompletionCanceled
+					completionStatus = 0
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if chunk.Err != nil {
@@ -249,6 +255,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		return nil, nil, errChan
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+	if shouldEnableXAIResponseHandlerPhases(entryProtocol, alt, providers) {
+		ctx = coreusage.EnablePhases(ctx)
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
@@ -407,6 +416,10 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				chunk, ok = <-chunks
 			}
 			if !ok {
+				if ctx != nil && ctx.Err() != nil {
+					streamCanceledBeforeRead = true
+					return
+				}
 				streamClosedBeforeRead = true
 				applyStreamHeaderInit()
 				return
@@ -576,6 +589,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				return
 			}
 			if !ok {
+				if ctx != nil && ctx.Err() != nil {
+					completionOutcome = pluginapi.RequestCompletionCanceled
+					completionStatus = 0
+					completionErr = ctx.Err()
+				}
 				return
 			}
 			if chunk.Err != nil {

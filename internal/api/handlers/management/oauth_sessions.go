@@ -35,6 +35,7 @@ type oauthSession struct {
 	Status    string
 	Source    string
 	Metadata  map[string]any
+	AuthFence uint64
 	Completed bool
 	CreatedAt time.Time
 	ExpiresAt time.Time
@@ -142,6 +143,26 @@ func (s *oauthSessionStore) SetError(state, message string) {
 	session.Status = message
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
+}
+
+func (s *oauthSessionStore) SetAuthFence(state string, fence uint64) {
+	state = strings.TrimSpace(state)
+	if state == "" || fence == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.sessions[state]
+	if !ok {
+		return
+	}
+	session.AuthFence = fence
+	s.sessions[state] = session
+}
+
+func (s *oauthSessionStore) AuthFence(state string) (uint64, bool) {
+	session, ok := s.Get(state)
+	return session.AuthFence, ok && session.AuthFence > 0
 }
 
 func (s *oauthSessionStore) Complete(state string) {
@@ -265,6 +286,14 @@ func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state
 
 func RegisterPluginOAuthSession(state, provider string, metadata map[string]any) error {
 	return oauthSessions.RegisterPlugin(state, provider, metadata)
+}
+
+func SetOAuthSessionAuthFence(state string, fence uint64) {
+	oauthSessions.SetAuthFence(state, fence)
+}
+
+func GetOAuthSessionAuthFence(state string) (uint64, bool) {
+	return oauthSessions.AuthFence(state)
 }
 
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }

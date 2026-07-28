@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,7 @@ const (
 )
 
 // LeaderElector keeps one process holding a pg_try_advisory_lock so that
-// background tasks (token refresh loop, usage automations, model updater) only
+// background tasks (token refresh loop, usage cleanup, model updater) only
 // run on a single instance cluster-wide. It also records a heartbeat in the
 // cluster_nodes table so operators can inspect membership via SQL.
 //
@@ -103,13 +104,15 @@ func (le *LeaderElector) Run(ctx context.Context) error {
 
 	ticker := time.NewTicker(le.interval)
 	defer ticker.Stop()
+	defer le.isLeader.Store(false)
 
 	var conn *sql.Conn
 	defer func() {
 		if conn != nil {
-			_ = conn.Close()
+			discardSessionLockConn(conn)
 		}
 	}()
+	holdsLock := false
 
 	for {
 		// Ensure we have a live dedicated connection. Anything wrong with it
@@ -124,16 +127,26 @@ func (le *LeaderElector) Run(ctx context.Context) error {
 				continue
 			}
 			conn = c
+			holdsLock = false
 		}
 
-		if err := le.probe(ctx, conn); err != nil {
+		var errProbe error
+		if holdsLock {
+			errProbe = le.probeLeaderSession(ctx, conn)
+		} else {
+			holdsLock, errProbe = le.tryAcquireLeader(ctx, conn)
+		}
+		if errProbe != nil {
 			if ctx.Err() != nil {
+				le.isLeader.Store(false)
+				discardSessionLockConn(conn)
+				conn = nil
 				return ctx.Err()
 			}
-			le.demote("probe failed", err)
-			// Assume conn is toxic; drop it so next iteration rebuilds.
-			_ = conn.Close()
+			le.demote("probe failed", errProbe)
+			discardSessionLockConn(conn)
 			conn = nil
+			holdsLock = false
 		}
 
 		if sleepWithCtx(ctx, ticker) {
@@ -165,25 +178,42 @@ func (le *LeaderElector) demote(reason string, err error) {
 	}
 }
 
-func (le *LeaderElector) probe(ctx context.Context, conn *sql.Conn) error {
-	// Step 1: the authoritative signal — advisory lock. Any failure here is
-	// treated as a connection-level problem and bubbles up to Run() which
-	// will demote and rebuild the conn.
+func (le *LeaderElector) tryAcquireLeader(ctx context.Context, conn *sql.Conn) (bool, error) {
 	var got bool
 	if err := conn.QueryRowContext(ctx,
 		"SELECT pg_try_advisory_lock($1, $2)", leaderLockClass, leaderLockID,
 	).Scan(&got); err != nil {
-		return err
+		return false, err
 	}
 
 	was := le.isLeader.Swap(got)
+	le.heartbeat(ctx, conn, got)
+	if got && !was {
+		log.Infof("became leader: node=%s region=%s", le.nodeID, le.region)
+	}
+	return got, nil
+}
 
-	// Step 2: best-effort heartbeat row. The heartbeat is auxiliary (operator
-	// visibility only); a failure here must NOT cause us to demote and drop
-	// the conn, because that would release the advisory lock we just took
-	// and cause a spurious cluster-wide failover. Log and carry on.
+// probeLeaderSession checks that the dedicated PostgreSQL session remains
+// usable without reacquiring the session advisory lock. Repeated
+// pg_try_advisory_lock calls are reentrant and would otherwise increment the
+// server-side lock count on every tick.
+func (le *LeaderElector) probeLeaderSession(ctx context.Context, conn *sql.Conn) error {
+	var one int
+	if err := conn.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+		return err
+	}
+	if one != 1 {
+		return errors.New("cluster: invalid leader session probe result")
+	}
+	le.isLeader.Store(true)
+	le.heartbeat(ctx, conn, true)
+	return nil
+}
+
+func (le *LeaderElector) heartbeat(ctx context.Context, conn *sql.Conn, leader bool) {
 	role := "follower"
-	if got {
+	if leader {
 		role = "leader"
 	}
 	host, _ := os.Hostname()
@@ -199,16 +229,4 @@ func (le *LeaderElector) probe(ctx context.Context, conn *sql.Conn) error {
 	`, le.nodeID, role, le.region, meta); err != nil {
 		log.WithError(err).Warnf("cluster_nodes heartbeat upsert failed (keeping leader state); node=%s", le.nodeID)
 	}
-
-	switch {
-	case got && !was:
-		log.Infof("became leader: node=%s region=%s", le.nodeID, le.region)
-	case !got && was:
-		// Advisory lock was taken by someone else (e.g. we were idle too
-		// long and the server released our session-level lock). Fire
-		// onLoss out of band so a slow callback does not block the probe.
-		log.Warnf("lost leadership to another node; node=%s", le.nodeID)
-		go le.onLoss()
-	}
-	return nil
 }

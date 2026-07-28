@@ -91,6 +91,10 @@ type Hook interface {
 	OnResult(ctx context.Context, result Result)
 }
 
+type AuthRemovalHook interface {
+	OnAuthRemoved(ctx context.Context, authID string)
+}
+
 // NoopHook provides optional hook defaults.
 type NoopHook struct{}
 
@@ -105,16 +109,22 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store                     Store
-	cooldownStore             CooldownStateStore
-	pendingCooldownStateStore CooldownStateStore
-	executors                 map[string]ProviderExecutor
-	selector                  Selector
-	hook                      Hook
-	mu                        sync.RWMutex
-	configCooldownMu          sync.Mutex
-	auths                     map[string]*Auth
-	scheduler                 *authScheduler
+	store                        Store
+	cooldownStore                CooldownStateStore
+	pendingCooldownStateStore    CooldownStateStore
+	executors                    map[string]ProviderExecutor
+	selector                     Selector
+	hook                         Hook
+	mu                           sync.RWMutex
+	configCooldownMu             sync.Mutex
+	auths                        map[string]*Auth
+	authRevision                 uint64
+	authDurableRevision          uint64
+	persistenceInFlightRevisions map[string]uint64
+	persistenceInFlightDone      map[string]chan struct{}
+	pendingDisabledPersistence   map[string]struct{}
+	enablingTransitions          map[string]int
+	scheduler                    *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths retains legacy session auth lookups for non-execution callers.
@@ -143,7 +153,9 @@ type Manager struct {
 	apiKeyModelAlias atomic.Value
 
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
-	modelPoolOffsets map[string]int
+	modelPoolOffsets  map[string]int
+	xaiInflight       xaiInflightTracker
+	dispatchAuthority atomic.Pointer[dispatchAuthorityHolder]
 
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
@@ -165,6 +177,7 @@ type Manager struct {
 	spilloverEnabled    bool
 
 	requestPrepareLocks sync.Map
+	persistLocks        sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
@@ -258,16 +271,16 @@ func (m *Manager) OwnsAuth(authID string) bool {
 	m.clusterMu.RLock()
 	enabled, ring := m.authShardingEnabled, m.authRing
 	m.clusterMu.RUnlock()
-	return !enabled || ring == nil || ring.IsMine(authID)
-}
-func (m *Manager) OwnsAuthStrict(authID string) bool {
-	if m == nil {
+	if !enabled {
 		return true
 	}
-	m.clusterMu.RLock()
-	enabled, ring := m.authShardingEnabled, m.authRing
-	m.clusterMu.RUnlock()
-	return !enabled || ring == nil || (ring.Ready() && ring.IsMine(authID))
+	if ring == nil || !ring.Ready() {
+		return false
+	}
+	return ring.IsMine(authID)
+}
+func (m *Manager) OwnsAuthStrict(authID string) bool {
+	return m.OwnsAuth(authID)
 }
 func (m *Manager) ShouldRefreshLocally(authID string) bool {
 	if m == nil {
@@ -276,8 +289,8 @@ func (m *Manager) ShouldRefreshLocally(authID string) bool {
 	m.clusterMu.RLock()
 	enabled, ring, gate := m.authShardingEnabled, m.authRing, m.leaderGate
 	m.clusterMu.RUnlock()
-	if enabled && ring != nil && ring.Ready() {
-		return ring.IsMine(authID)
+	if enabled {
+		return ring != nil && ring.Ready() && ring.IsMine(authID)
 	}
 	return gate == nil || gate.IsLeader()
 }
@@ -293,44 +306,177 @@ type authByIDStore interface {
 
 // ReloadByID refreshes one auth from stores that support indexed lookup.
 func (m *Manager) ReloadByID(ctx context.Context, id string) error {
-	if m == nil || m.store == nil {
+	if m == nil {
 		return nil
 	}
-	if strings.TrimSpace(id) == "" {
-		return m.Load(ctx)
+	id = strings.TrimSpace(id)
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if store == nil {
+		return nil
 	}
-	byID, ok := m.store.(authByIDStore)
+	if id == "" {
+		return m.Reconcile(ctx)
+	}
+
+	byID, ok := store.(authByIDStore)
 	if !ok {
-		return m.Load(ctx)
+		return m.Reconcile(ctx)
 	}
-	fetched, err := byID.GetByID(ctx, id)
-	if err != nil {
-		return err
+	_, versionedStore := store.(VersionedAuthStore)
+
+	var (
+		fetched                 *Auth
+		baselineExisted         bool
+		baselineDurableRevision uint64
+	)
+	for {
+		m.mu.RLock()
+		baseline := m.auths[id]
+		baselineExisted = baseline != nil
+		baselineDurableRevision = 0
+		baselinePersistenceInFlight := false
+		var baselinePersistenceDone <-chan struct{}
+		if baseline != nil {
+			baselineDurableRevision = baseline.durableRevision
+			baselinePersistenceInFlight = baselineDurableRevision != 0 && m.persistenceInFlightRevisions[id] == baselineDurableRevision
+			if baselinePersistenceInFlight {
+				baselinePersistenceDone = m.persistenceInFlightDone[id]
+			}
+		}
+		m.mu.RUnlock()
+
+		var err error
+		fetched, err = byID.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+
+		m.mu.Lock()
+		existing := m.auths[id]
+		existed := existing != nil
+		currentDurableRevision := uint64(0)
+		currentPersistenceInFlight := false
+		var currentPersistenceDone <-chan struct{}
+		if existing != nil {
+			currentDurableRevision = existing.durableRevision
+			currentPersistenceInFlight = currentDurableRevision != 0 && m.persistenceInFlightRevisions[id] == currentDurableRevision
+			if currentPersistenceInFlight {
+				currentPersistenceDone = m.persistenceInFlightDone[id]
+			}
+		}
+		changedDuringRead := existed != baselineExisted || currentDurableRevision != baselineDurableRevision
+		if !changedDuringRead && (baselinePersistenceInFlight || currentPersistenceInFlight) {
+			done := baselinePersistenceDone
+			if currentPersistenceInFlight {
+				done = currentPersistenceDone
+			}
+			m.mu.Unlock()
+			if errWait := waitForPersistenceInFlight(ctx, done); errWait != nil {
+				return errWait
+			}
+			continue
+		}
+		if !changedDuringRead {
+			break
+		}
+		m.mu.Unlock()
+
+		if currentPersistenceInFlight {
+			if errWait := waitForPersistenceInFlight(ctx, currentPersistenceDone); errWait != nil {
+				return errWait
+			}
+			continue
+		}
+		if !versionedStore {
+			return nil
+		}
+		if ctx != nil {
+			if errCtx := ctx.Err(); errCtx != nil {
+				return errCtx
+			}
+		}
 	}
-	if fetched != nil {
-		fetched.EnsureIndex()
-	}
-	m.mu.Lock()
+
 	var schedulerCopy *Auth
-	if fetched == nil {
+	persistMergedDisabled := false
+	removalRevision := uint64(0)
+	existing := m.auths[id]
+	existed := existing != nil
+	removedProvider := ""
+	if merged, retained := m.mergeFailClosedStoreSnapshotLocked(id, fetched, existing); retained {
+		if fetched == nil {
+			m.mu.Unlock()
+			return nil
+		}
+		m.auths[id] = merged
+		schedulerCopy = merged.Clone()
+		_, pendingDisable := m.pendingDisabledPersistence[id]
+		persistMergedDisabled = pendingDisable && m.enablingTransitions[id] == 0
+	} else if fetched == nil {
+		removalRevision = m.nextAuthRevisionLocked()
+		m.clearPersistenceInFlightLocked(id, 0)
+		delete(m.pendingDisabledPersistence, id)
+		delete(m.enablingTransitions, id)
+		if existing != nil {
+			removedProvider = strings.TrimSpace(existing.Provider)
+		}
 		delete(m.auths, id)
+		delete(m.modelPoolOffsets, id)
+		for sessionID, sessionAuths := range m.homeRuntimeAuths {
+			delete(sessionAuths, id)
+			if len(sessionAuths) == 0 {
+				delete(m.homeRuntimeAuths, sessionID)
+			}
+		}
 	} else {
-		cloned := fetched.Clone()
+		cloned := mergePersistedAuthRuntime(fetched, m.auths[id])
+		cloned.revision = m.nextAuthRevisionLocked()
+		cloned.durableRevision = m.nextAuthDurableRevisionLocked()
 		m.auths[id] = cloned
 		schedulerCopy = cloned.Clone()
 	}
 	m.mu.Unlock()
+
 	if m.scheduler != nil {
 		if schedulerCopy != nil {
-			m.scheduler.upsertAuth(schedulerCopy)
+			m.schedulerUpsert(schedulerCopy)
 		} else {
-			m.scheduler.removeAuth(id)
+			m.scheduler.removeAuthAtRevision(id, removalRevision)
+		}
+	}
+	m.wakeDispatchAuthority()
+	if schedulerCopy != nil {
+		m.queueRefreshReschedule(id)
+		if existed {
+			m.hook.OnAuthUpdated(ctx, schedulerCopy.Clone())
+		} else {
+			m.hook.OnAuthRegistered(ctx, schedulerCopy.Clone())
+		}
+	} else if existed {
+		m.queueRefreshUnschedule(id)
+		m.invalidateSessionAffinity(id)
+		if removalHook, okRemoval := m.hook.(AuthRemovalHook); okRemoval {
+			removalHook.OnAuthRemoved(ctx, id)
+		}
+		if executor, okExecutor := m.Executor(removedProvider); okExecutor {
+			if closer, okCloser := executor.(ExecutionSessionCloser); okCloser {
+				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+			}
+		}
+	}
+	if persistMergedDisabled {
+		if errPersist := m.persistPendingDisabled(ctx, id); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", id).Warnf("failed to persist merged disabled auth: %v", errPersist)
 		}
 	}
 	return nil
 }
 
-const maxShardPickAttempts = 64
+func (m *Manager) pickWithShardFilter(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+	return m.pickWithShardFilterAndInflight(ctx, provider, model, opts, tried, nil, "")
+}
 
 func cloneTriedMap(src map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(src)+4)
@@ -340,85 +486,31 @@ func cloneTriedMap(src map[string]struct{}) map[string]struct{} {
 	return out
 }
 
-func (m *Manager) pickWithShardFilter(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
-	if !m.IsAuthShardingEnabled() {
-		selected, err := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-		if err != nil && model != "" && shouldRetrySchedulerPick(err) {
-			m.syncScheduler()
-			selected, err = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-		}
-		return selected, err
-	}
-	shardTried := cloneTriedMap(tried)
-	var selected *Auth
-	var errPick error
-	didModelSync := false
-	for attempt := 0; attempt < maxShardPickAttempts; attempt++ {
-		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, shardTried)
-		if errPick != nil && model != "" && !didModelSync && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
-			didModelSync = true
-			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, shardTried)
-		}
-		if errPick != nil || selected == nil {
-			break
-		}
-		if m.OwnsAuth(selected.ID) {
-			return selected, nil
-		}
-		shardTried[selected.ID] = struct{}{}
-		selected = nil
-	}
-	if m.IsSpilloverEnabled() {
-		globalSelected, globalErr := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-		if globalErr == nil && globalSelected != nil {
-			log.Warnf("cluster: spillover — local shard exhausted for provider=%s model=%s, using auth %s", provider, model, globalSelected.ID)
-			return globalSelected, nil
-		}
-		return nil, globalErr
-	}
-	return selected, errPick
-}
-
 func (m *Manager) pickMixedWithShardFilter(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
-	if !m.IsAuthShardingEnabled() {
-		selected, provider, err := m.scheduler.pickMixed(ctx, providers, model, opts, tried)
-		if err != nil && model != "" && shouldRetrySchedulerPick(err) {
+	ownership, spilloverEnabled := m.authOwnershipPredicate()
+	pick := func(filter func(string) bool) (*Auth, string, error) {
+		selected, providerKey, errPick := m.scheduler.pickMixedWithFilter(ctx, providers, model, opts, tried, filter)
+		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
-			selected, provider, err = m.scheduler.pickMixed(ctx, providers, model, opts, tried)
+			selected, providerKey, errPick = m.scheduler.pickMixedWithFilter(ctx, providers, model, opts, tried, filter)
 		}
-		return selected, provider, err
+		return selected, providerKey, errPick
 	}
-	shardTried := cloneTriedMap(tried)
-	var selected *Auth
-	var provider string
-	var errPick error
-	didModelSync := false
-	for attempt := 0; attempt < maxShardPickAttempts; attempt++ {
-		selected, provider, errPick = m.scheduler.pickMixed(ctx, providers, model, opts, shardTried)
-		if errPick != nil && model != "" && !didModelSync && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
-			didModelSync = true
-			selected, provider, errPick = m.scheduler.pickMixed(ctx, providers, model, opts, shardTried)
-		}
-		if errPick != nil || selected == nil {
-			break
-		}
-		if m.OwnsAuth(selected.ID) {
-			return selected, provider, nil
-		}
-		shardTried[selected.ID] = struct{}{}
-		selected = nil
+
+	selected, providerKey, errPick := pick(ownership)
+	if errPick == nil && selected != nil {
+		return selected, providerKey, nil
 	}
-	if m.IsSpilloverEnabled() {
+	if ownership != nil && spilloverEnabled {
 		globalSelected, globalProvider, globalErr := m.scheduler.pickMixed(ctx, providers, model, opts, tried)
 		if globalErr == nil && globalSelected != nil {
-			log.Warnf("cluster: spillover — local shard exhausted for providers=%v model=%s, using auth %s", providers, model, globalSelected.ID)
+			log.Warnf("cluster: spillover — local shard exhausted for providers=%v model=%s, using auth %s",
+				providers, model, globalSelected.ID)
 			return globalSelected, globalProvider, nil
 		}
 		return nil, "", globalErr
 	}
-	return selected, provider, errPick
+	return selected, providerKey, errPick
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -430,16 +522,20 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:                 store,
-		executors:             make(map[string]ProviderExecutor),
-		selector:              selector,
-		hook:                  hook,
-		auths:                 make(map[string]*Auth),
-		homeRuntimeAuths:      make(map[string]map[string]*Auth),
-		homeRuntimeAuthOwners: make(map[string]map[string]*HomeDispatchSelection),
-		homeSessionSelections: make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
-		providerOffsets:       make(map[string]int),
-		modelPoolOffsets:      make(map[string]int),
+		store:                        store,
+		executors:                    make(map[string]ProviderExecutor),
+		selector:                     selector,
+		hook:                         hook,
+		auths:                        make(map[string]*Auth),
+		persistenceInFlightRevisions: make(map[string]uint64),
+		persistenceInFlightDone:      make(map[string]chan struct{}),
+		pendingDisabledPersistence:   make(map[string]struct{}),
+		enablingTransitions:          make(map[string]int),
+		homeRuntimeAuths:             make(map[string]map[string]*Auth),
+		homeRuntimeAuthOwners:        make(map[string]map[string]*HomeDispatchSelection),
+		homeSessionSelections:        make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
+		providerOffsets:              make(map[string]int),
+		modelPoolOffsets:             make(map[string]int),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})

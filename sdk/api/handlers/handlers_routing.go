@@ -64,6 +64,24 @@ func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []
 	return excludeExecutionProvider(providers, GeminiInteractions)
 }
 
+func shouldEnableXAIResponseHandlerPhases(entryProtocol, alt string, providers []string) bool {
+	if entryProtocol != OpenaiResponse || alt == "responses/compact" {
+		return false
+	}
+	foundXAI := false
+	for _, provider := range providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "" {
+			continue
+		}
+		if provider != "xai" {
+			return false
+		}
+		foundXAI = true
+	}
+	return foundXAI
+}
+
 func supportsNativeInteractionsEntryProtocol(entryProtocol string) bool {
 	switch entryProtocol {
 	case Interactions, OpenAI, OpenaiResponse, Claude, Gemini:

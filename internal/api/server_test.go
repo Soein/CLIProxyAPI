@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -467,6 +469,140 @@ func TestCodexLiveRoutesRequireAuthAndAreRegistered(t *testing.T) {
 		if authorizedRecorder.Code != http.StatusUpgradeRequired {
 			t.Fatalf("%s authorized status = %d, want %d; body=%s", path, authorizedRecorder.Code, http.StatusUpgradeRequired, authorizedRecorder.Body.String())
 		}
+	}
+}
+
+func TestServerStartedSignalsAfterListenerInitialization(t *testing.T) {
+	server := newTestServer(t)
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start()
+	}()
+
+	select {
+	case errStarted := <-server.Started():
+		if errStarted != nil {
+			t.Fatalf("Started() error = %v, want nil", errStarted)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Started() did not report listener initialization")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if errStop := server.Stop(stopCtx); errStop != nil {
+		t.Fatalf("Stop() error = %v", errStop)
+	}
+	select {
+	case errStart := <-startErr:
+		if errStart != nil {
+			t.Fatalf("Start() error after Stop() = %v", errStart)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return after Stop()")
+	}
+}
+
+func TestServerStartedReportsListenerFailure(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen() error = %v", errListen)
+	}
+	defer listener.Close()
+
+	server := newTestServer(t)
+	server.server.Addr = listener.Addr().String()
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start()
+	}()
+
+	select {
+	case errStarted := <-server.Started():
+		if errStarted == nil {
+			t.Fatal("Started() error = nil, want occupied-listener failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Started() did not report listener failure")
+	}
+	select {
+	case errStart := <-startErr:
+		if errStart == nil {
+			t.Fatal("Start() error = nil, want occupied-listener failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return after listener failure")
+	}
+}
+
+func TestServerStopForceClosesActiveRequestsAndWaitsForExit(t *testing.T) {
+	server := newTestServer(t)
+	handlerStarted := make(chan struct{})
+	handlerExited := make(chan struct{})
+	server.engine.GET("/blocking-stop", func(c *gin.Context) {
+		close(handlerStarted)
+		<-c.Request.Context().Done()
+		close(handlerExited)
+	})
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start()
+	}()
+	select {
+	case errStarted := <-server.Started():
+		if errStarted != nil {
+			t.Fatalf("Started() error = %v, want nil", errStarted)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Started() did not report listener initialization")
+	}
+
+	tcpAddr, ok := server.muxBaseListener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address type = %T, want *net.TCPAddr", server.muxBaseListener.Addr())
+	}
+	requestDone := make(chan error, 1)
+	go func() {
+		client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+		response, errGet := client.Get(fmt.Sprintf("http://127.0.0.1:%d/blocking-stop", tcpAddr.Port))
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestDone <- errGet
+	}()
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking handler did not start")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	errStop := server.Stop(stopCtx)
+	cancel()
+	if !errors.Is(errStop, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v, want context deadline exceeded from graceful shutdown", errStop)
+	}
+	select {
+	case <-handlerExited:
+	default:
+		t.Fatal("Stop() returned before the force-closed handler exited")
+	}
+	if !server.IsStopped() {
+		t.Fatal("server did not prove serving loop and active handlers stopped")
+	}
+	select {
+	case errStart := <-startErr:
+		if errStart != nil {
+			t.Fatalf("Start() error after force-close = %v", errStart)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return after force-close")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client request did not return after force-close")
 	}
 }
 

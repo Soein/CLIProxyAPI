@@ -157,6 +157,7 @@ func (a *usageAdapter) HandleUsage(ctx context.Context, record coreusage.Record)
 		RequestedAt:     record.RequestedAt,
 		Latency:         record.Latency,
 		TTFT:            record.TTFT,
+		Phases:          usagePhasesToPluginPhases(record.Phases),
 		Failed:          record.Failed,
 		Failure: pluginapi.UsageFailure{
 			StatusCode: record.Fail.StatusCode,
@@ -173,6 +174,25 @@ func (a *usageAdapter) HandleUsage(ctx context.Context, record coreusage.Record)
 		},
 		ResponseHeaders: cloneHeader(record.ResponseHeaders),
 	})
+}
+
+func usagePhasesToPluginPhases(phases *coreusage.PhaseTimings) *pluginapi.UsagePhaseTimings {
+	if phases == nil {
+		return nil
+	}
+	return &pluginapi.UsagePhaseTimings{
+		Attempt:                       phases.Attempt,
+		RequestElapsedToUpstreamStart: phases.RequestElapsedToUpstreamStart,
+		AuthSelection:                 phases.AuthSelection,
+		ResponseHeaders:               phases.ResponseHeaders,
+		FirstEvent:                    phases.FirstEvent,
+		FirstSemanticToken:            phases.FirstSemanticToken,
+		Terminal:                      phases.Terminal,
+		ResponseHeadersObserved:       phases.ResponseHeadersObserved,
+		TransportReused:               phases.TransportReused,
+		AffinityOutcome:               string(phases.AffinityOutcome),
+		TerminalKind:                  phases.TerminalKind,
+	}
 }
 
 func (a *thinkingAdapter) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) (out []byte, err error) {

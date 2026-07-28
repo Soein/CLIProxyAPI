@@ -27,6 +27,12 @@ func DoVertexImport(cfg *config.Config, keyPath string, prefix string) {
 	if resolved, errResolve := util.ResolveAuthDir(cfg.AuthDir); errResolve == nil {
 		cfg.AuthDir = resolved
 	}
+	store := sdkAuth.GetTokenStore()
+	operationCtx, errFence := coreauth.BeginExplicitAuthOperation(context.Background(), store)
+	if errFence != nil {
+		log.Errorf("vertex-import: read auth lifecycle fence failed: %v", errFence)
+		return
+	}
 	rawPath := strings.TrimSpace(keyPath)
 	if rawPath == "" {
 		log.Errorf("vertex-import: missing service account key path")
@@ -102,11 +108,10 @@ func DoVertexImport(cfg *config.Config, keyPath string, prefix string) {
 		Metadata: metadata,
 	}
 
-	store := sdkAuth.GetTokenStore()
 	if setter, ok := store.(interface{ SetBaseDir(string) }); ok {
 		setter.SetBaseDir(cfg.AuthDir)
 	}
-	path, errSave := store.Save(context.Background(), record)
+	path, errSave := coreauth.PersistExplicitAuth(operationCtx, store, record)
 	if errSave != nil {
 		log.Errorf("vertex-import: save credential failed: %v", errSave)
 		return

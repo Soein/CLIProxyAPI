@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexhourly"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
@@ -99,26 +97,80 @@ type Service struct {
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
-	// shutdownOnce ensures shutdown is called only once.
-	shutdownOnce sync.Once
-
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
 
-	// codexWeeklyAutomation periodically disables and re-enables Codex auth files based on weekly usage.
-	codexWeeklyAutomation *codexweekly.Automation
+	// lifecycleMu serializes Run publication with shutdown initiation. Once
+	// stopping is set, Run may not publish or start a new API server.
+	lifecycleMu sync.Mutex
+	runCancel   context.CancelFunc
 
-	// codexHourlyAutomation periodically disables and re-enables Codex auth files based on 5h usage.
-	codexHourlyAutomation *codexhourly.Automation
+	// stopping marks shutdown as in progress so worker startup can bail out.
+	stopping bool
+
+	// shutdownStarted guards the one-time shutdown path.
+	shutdownStarted bool
+
+	// shutdownDone is closed when shutdown finishes.
+	shutdownDone chan struct{}
+
+	// shutdownErr stores the first shutdown error.
+	shutdownErr error
+
+	// startupDone is closed when startup work completes.
+	startupDone chan struct{}
+
+	// startupDoneOnce closes startupDone exactly once.
+	startupDoneOnce sync.Once
+
+	// leaseReleaseOnce ensures the delayed node lease release path runs once.
+	leaseReleaseOnce sync.Once
 
 	// clusterCancel stops the cluster-mode goroutines (leader elector +
 	// change subscriber). nil when cluster mode is disabled.
 	clusterCancel context.CancelFunc
 
-	// codexAutomationStateStore is the cluster-shared writer for
-	// codex weekly/hourly RunOnce timestamps.
-	codexAutomationStateStore *internalusage.PGStore
-	codexAutomationNodeID     string
+	// clusterErr carries fatal cluster lifecycle errors back to Run.
+	clusterErr chan error
+
+	// clusterNodeLease keeps the node-id advisory lock while cluster mode runs.
+	clusterNodeLease *clusterNodeLease
+
+	// clusterNodeLeaseProbeCancel stops the node-id lease probe loop.
+	clusterNodeLeaseProbeCancel context.CancelFunc
+
+	// clusterNodeLeaseProbeDone is closed when the node-id lease probe exits.
+	clusterNodeLeaseProbeDone chan struct{}
+
+	// clusterFatal marks a terminal cluster failure.
+	clusterFatal bool
+
+	// clusterFatalErr stores the first terminal cluster failure.
+	clusterFatalErr error
+
+	// fatalClusterCancel cancels the active cluster bootstrap context.
+	fatalClusterCancel context.CancelFunc
+
+	// clusterStopOnce closes the cluster dispatch authority once.
+	clusterStopOnce sync.Once
+
+	// clusterStopErr stores the first dispatch authority shutdown error.
+	clusterStopErr error
+
+	// coreAutoRefreshStartDone joins concurrent refresh startup and stop.
+	coreAutoRefreshStartDone chan struct{}
+
+	// clusterDispatchAuthority gates dispatch admission for strict cluster mode.
+	clusterDispatchAuthority *cluster.PgDispatchAuthority
+
+	// clusterDispatchFactory builds the dispatch authority used by cluster mode.
+	clusterDispatchFactory func(cluster.PgDispatchAuthorityConfig) (*cluster.PgDispatchAuthority, error)
+
+	// clusterSubscriberFactory overrides the default change subscriber.
+	clusterSubscriberFactory func(string, cluster.Handlers) *cluster.ChangeSubscriber
+
+	// clusterActivate runs the active cluster-serving path after bootstrap.
+	clusterActivate func(context.Context) error
 
 	// clusterRegistrar publishes this replica's routing metadata to the
 	// shared cluster_nodes table.
@@ -146,7 +198,6 @@ type Service struct {
 	homeDispatchBundle           *coreauth.HomeDispatchBundle
 	homeDrainBound               time.Duration
 	homeCancel                   context.CancelFunc
-	runCancel                    context.CancelFunc
 	homeLogForwarder             homeLogForwarder
 	homeLogForwarderClient       *home.Client
 	homePluginSyncMu             sync.Mutex

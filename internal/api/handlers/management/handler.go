@@ -15,8 +15,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexhourly"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
@@ -54,21 +52,14 @@ type Handler struct {
 	// pgUsage / usageQueryCache are wired in Sprint 1.4 but only consumed
 	// in Sprint 2 (the cluster-aggregated /usage read path). They are
 	// intentionally dead in Sprint 1; do not remove.
-	pgUsage             *usage.PGStore   // nil when usage.backend=memory
-	usageQueryCache     *usageQueryCache // 5s TTL for /usage cluster queries
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
-	codexWeeklyStatus   func() codexweekly.Status
-	codexHourlyStatus   func() codexhourly.Status
-	// Optional cluster-aware reader: when set, /codex-*-automation/status
-	// endpoints overlay the cluster-wide latest run timestamp from PG so
-	// follower nodes' UI no longer shows "等待首次检查" while the leader
-	// (or another shard owner) actually ran the check.
-	codexAutomationReader  CodexAutomationStatusReader
+	pgUsage                *usage.PGStore   // nil when usage.backend=memory
+	usageQueryCache        *usageQueryCache // 5s TTL for /usage cluster queries
+	tokenStore             coreauth.Store
+	localPassword          string
+	allowRemoteOverride    bool
+	envSecret              string
+	logDir                 string
+	postAuthHook           coreauth.PostAuthHook
 	postAuthPersistHook    coreauth.PostAuthHook
 	pluginHost             *pluginhost.Host
 	configReloadHook       func(context.Context, *config.Config)
@@ -81,21 +72,6 @@ type Handler struct {
 type configReloadSnapshot struct {
 	cfg        *config.Config
 	generation uint64
-}
-
-// CodexAutomationStatusReader is the read-side hook for cluster-shared
-// automation status. Implemented by internal/usage.PGStore.
-type CodexAutomationStatusReader interface {
-	GetCodexAutomationLatest(ctx context.Context, kind string) (time.Time, error)
-}
-
-// SetCodexAutomationStatusReader installs the cluster status reader. Pass
-// nil to disable (single-instance / no PG).
-func (h *Handler) SetCodexAutomationStatusReader(r CodexAutomationStatusReader) {
-	if h == nil {
-		return
-	}
-	h.codexAutomationReader = r
 }
 
 // NewHandler creates a new management handler instance.
@@ -294,16 +270,6 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
-}
-
-// SetCodexWeeklyAutomationStatusProvider registers a provider for Codex weekly automation status.
-func (h *Handler) SetCodexWeeklyAutomationStatusProvider(provider func() codexweekly.Status) {
-	h.codexWeeklyStatus = provider
-}
-
-// SetCodexHourlyAutomationStatusProvider registers a provider for Codex hourly (5h) automation status.
-func (h *Handler) SetCodexHourlyAutomationStatusProvider(provider func() codexhourly.Status) {
-	h.codexHourlyStatus = provider
 }
 
 // SetPostAuthPersistHook registers a hook to be called after auth persistence.

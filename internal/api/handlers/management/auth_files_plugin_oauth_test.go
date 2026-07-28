@@ -83,6 +83,281 @@ func TestSavePluginLoginRecordsRollsBackSavedAuthsOnFailure(t *testing.T) {
 	}
 }
 
+func TestSavePluginLoginRecordsRestoresExistingVersionedAuthOnFailure(t *testing.T) {
+	const existingID = "existing.json"
+	store := newPluginLoginVersionedRollbackStore(&coreauth.Auth{
+		ID:       existingID,
+		FileName: existingID,
+		Provider: "gemini-cli",
+		Metadata: map[string]any{"access_token": "old-token"},
+	})
+	store.rows[existingID].SetStoreGeneration(5)
+	store.failAt = 2
+
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), store.rows[existingID].Clone()); errRegister != nil {
+		t.Fatalf("seed existing runtime auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+	h.postAuthPersistHook = pluginLoginRuntimeSyncHook(manager)
+	errSave := h.savePluginLoginRecords(context.Background(), []*coreauth.Auth{
+		{
+			ID:       existingID,
+			FileName: existingID,
+			Provider: "gemini-cli",
+			Metadata: map[string]any{"access_token": "new-token"},
+		},
+		{
+			ID:       "fails.json",
+			FileName: "fails.json",
+			Provider: "gemini-cli",
+			Metadata: map[string]any{"access_token": "never-committed"},
+		},
+	})
+	if errSave == nil {
+		t.Fatal("savePluginLoginRecords() error = nil, want second-save failure")
+	}
+	restored, ok := store.rows[existingID]
+	if !ok || restored == nil {
+		t.Fatalf("existing auth %q was removed during rollback", existingID)
+	}
+	if got := restored.Metadata["access_token"]; got != "old-token" {
+		t.Fatalf("restored access_token = %#v, want old-token", got)
+	}
+	if restored.StoreGeneration() != 7 {
+		t.Fatalf("restored generation = %d, want CAS rollback generation 7", restored.StoreGeneration())
+	}
+	if store.tombstoned[existingID] != 0 {
+		t.Fatalf("existing auth was tombstoned at generation %d", store.tombstoned[existingID])
+	}
+	runtimeAuth, exists := manager.GetByID(existingID)
+	runtimeGeneration := uint64(0)
+	if runtimeAuth != nil {
+		runtimeGeneration = runtimeAuth.StoreGeneration()
+	}
+	if !exists || runtimeAuth == nil || runtimeAuth.Metadata["access_token"] != "old-token" || runtimeGeneration != 7 {
+		t.Fatalf("runtime rollback auth = %#v generation=%d", runtimeAuth, runtimeGeneration)
+	}
+}
+
+func TestSavePluginLoginRecordsTombstonesNewVersionedAuthOnFailure(t *testing.T) {
+	store := newPluginLoginVersionedRollbackStore()
+	store.failAt = 2
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+	h.postAuthPersistHook = pluginLoginRuntimeSyncHook(manager)
+
+	errSave := h.savePluginLoginRecords(context.Background(), []*coreauth.Auth{
+		{
+			ID:       "created.json",
+			FileName: "created.json",
+			Provider: "gemini-cli",
+			Metadata: map[string]any{"access_token": "new-token"},
+		},
+		{
+			ID:       "fails.json",
+			FileName: "fails.json",
+			Provider: "gemini-cli",
+			Metadata: map[string]any{"access_token": "never-committed"},
+		},
+	})
+	if errSave == nil {
+		t.Fatal("savePluginLoginRecords() error = nil, want second-save failure")
+	}
+	if _, ok := store.rows["created.json"]; ok {
+		t.Fatal("new auth remained active after rollback")
+	}
+	if store.tombstoned["created.json"] != 2 {
+		t.Fatalf("new auth tombstone generation = %d, want 2", store.tombstoned["created.json"])
+	}
+	if _, exists := manager.GetByID("created.json"); exists {
+		t.Fatal("new auth remained in runtime after rollback")
+	}
+}
+
+func TestSavePluginLoginRecordsRollsBackAfterRequestContextCancellation(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing *coreauth.Auth
+		assert   func(t *testing.T, store *pluginLoginVersionedRollbackStore)
+	}{
+		{
+			name: "restore existing auth",
+			existing: &coreauth.Auth{
+				ID:       "committed.json",
+				FileName: "committed.json",
+				Provider: "gemini-cli",
+				Metadata: map[string]any{"access_token": "old-token"},
+			},
+			assert: func(t *testing.T, store *pluginLoginVersionedRollbackStore) {
+				t.Helper()
+				restored := store.rows["committed.json"]
+				if restored == nil || restored.Metadata["access_token"] != "old-token" {
+					t.Fatalf("restored auth = %#v, want old snapshot", restored)
+				}
+			},
+		},
+		{
+			name: "tombstone new auth",
+			assert: func(t *testing.T, store *pluginLoginVersionedRollbackStore) {
+				t.Helper()
+				if _, exists := store.rows["committed.json"]; exists {
+					t.Fatal("new auth remained active after rollback")
+				}
+				if store.tombstoned["committed.json"] == 0 {
+					t.Fatal("new auth was not tombstoned during rollback")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newPluginLoginVersionedRollbackStore(tt.existing)
+			if tt.existing != nil {
+				store.rows[tt.existing.ID].SetStoreGeneration(5)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			store.cancelAt = 2
+			store.cancel = cancel
+
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+			h.tokenStore = store
+			errSave := h.savePluginLoginRecords(ctx, []*coreauth.Auth{
+				{
+					ID:       "committed.json",
+					FileName: "committed.json",
+					Provider: "gemini-cli",
+					Metadata: map[string]any{"access_token": "new-token"},
+				},
+				{
+					ID:       "fails.json",
+					FileName: "fails.json",
+					Provider: "gemini-cli",
+					Metadata: map[string]any{"access_token": "never-committed"},
+				},
+			})
+			if !errors.Is(errSave, context.Canceled) {
+				t.Fatalf("savePluginLoginRecords() error = %v, want context canceled", errSave)
+			}
+			tt.assert(t, store)
+		})
+	}
+}
+
+func TestSavePluginLoginRecordsRollsBackCommitUnknownCandidate(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing *coreauth.Auth
+		assert   func(t *testing.T, store *pluginLoginVersionedRollbackStore)
+	}{
+		{
+			name: "restore existing auth",
+			existing: &coreauth.Auth{
+				ID:       "unknown.json",
+				FileName: "unknown.json",
+				Provider: "gemini-cli",
+				Metadata: map[string]any{"access_token": "old-token"},
+			},
+			assert: func(t *testing.T, store *pluginLoginVersionedRollbackStore) {
+				t.Helper()
+				restored := store.rows["unknown.json"]
+				if restored == nil || restored.Metadata["access_token"] != "old-token" {
+					t.Fatalf("restored auth = %#v, want old snapshot", restored)
+				}
+			},
+		},
+		{
+			name: "tombstone new auth",
+			assert: func(t *testing.T, store *pluginLoginVersionedRollbackStore) {
+				t.Helper()
+				if _, exists := store.rows["unknown.json"]; exists {
+					t.Fatal("outcome-unknown auth remained active after rollback")
+				}
+				if store.tombstoned["unknown.json"] != 2 {
+					t.Fatalf("outcome-unknown auth tombstone generation = %d, want 2", store.tombstoned["unknown.json"])
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newPluginLoginVersionedRollbackStore(tt.existing)
+			if tt.existing != nil {
+				store.rows[tt.existing.ID].SetStoreGeneration(5)
+			}
+			store.commitUnknownAt = 1
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+			h.tokenStore = store
+
+			errSave := h.savePluginLoginRecords(context.Background(), []*coreauth.Auth{{
+				ID:       "unknown.json",
+				FileName: "unknown.json",
+				Provider: "gemini-cli",
+				Metadata: map[string]any{"access_token": "new-token"},
+			}})
+			if !errors.Is(errSave, coreauth.ErrAuthStoreCommitUnknown) {
+				t.Fatalf("savePluginLoginRecords() error = %v, want commit outcome unknown", errSave)
+			}
+			tt.assert(t, store)
+		})
+	}
+}
+
+func TestSavePluginLoginRecordsCommitUnknownWithoutCandidateFailsClosed(t *testing.T) {
+	const id = "unknown-without-candidate.json"
+	store := newPluginLoginVersionedRollbackStore(&coreauth.Auth{
+		ID:       id,
+		FileName: id,
+		Provider: "gemini-cli",
+		Metadata: map[string]any{"access_token": "old-token"},
+	})
+	store.rows[id].SetStoreGeneration(5)
+	store.commitUnknownAt = 1
+	store.omitCommitCandidate = true
+
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), store.rows[id].Clone()); errRegister != nil {
+		t.Fatalf("seed runtime auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	errSave := h.savePluginLoginRecords(context.Background(), []*coreauth.Auth{{
+		ID:       id,
+		FileName: id,
+		Provider: "gemini-cli",
+		Metadata: map[string]any{"access_token": "new-token"},
+	}})
+	if !errors.Is(errSave, coreauth.ErrAuthStoreCommitUnknown) {
+		t.Fatalf("savePluginLoginRecords() error = %v, want commit outcome unknown", errSave)
+	}
+	if !strings.Contains(errSave.Error(), "has no committed generation") {
+		t.Fatalf("savePluginLoginRecords() error = %v, want missing-generation rollback error", errSave)
+	}
+	if _, exists := manager.GetByID(id); exists {
+		t.Fatal("runtime auth remained available after commit candidate was unavailable")
+	}
+	if committed := store.rows[id]; committed == nil || committed.Metadata["access_token"] != "new-token" {
+		t.Fatalf("durable auth = %#v, want fake store to have committed before returning outcome unknown", committed)
+	}
+}
+
+func pluginLoginRuntimeSyncHook(manager *coreauth.Manager) coreauth.PostAuthHook {
+	return func(ctx context.Context, auth *coreauth.Auth) error {
+		ctx = coreauth.WithSkipPersist(ctx)
+		if _, exists := manager.GetByID(auth.ID); exists {
+			_, errUpdate := manager.Update(ctx, auth)
+			return errUpdate
+		}
+		_, errRegister := manager.Register(ctx, auth)
+		return errRegister
+	}
+}
+
 func TestPatchPluginVirtualAuthStatusReturnsConflictForVirtualChild(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := pluginVirtualAuthForTest(t.TempDir(), "source.json", "auth-1")
@@ -257,3 +532,138 @@ func (s *pluginLoginRollbackStore) Delete(_ context.Context, id string) error {
 }
 
 func (s *pluginLoginRollbackStore) SetBaseDir(string) {}
+
+type pluginLoginVersionedRollbackStore struct {
+	rows                map[string]*coreauth.Auth
+	tombstoned          map[string]uint64
+	attempts            int
+	failAt              int
+	cancelAt            int
+	cancel              context.CancelFunc
+	commitUnknownAt     int
+	omitCommitCandidate bool
+}
+
+func newPluginLoginVersionedRollbackStore(auths ...*coreauth.Auth) *pluginLoginVersionedRollbackStore {
+	store := &pluginLoginVersionedRollbackStore{
+		rows:       make(map[string]*coreauth.Auth, len(auths)),
+		tombstoned: make(map[string]uint64),
+	}
+	for _, auth := range auths {
+		if auth != nil {
+			store.rows[auth.ID] = auth.Clone()
+		}
+	}
+	return store
+}
+
+func (s *pluginLoginVersionedRollbackStore) List(context.Context) ([]*coreauth.Auth, error) {
+	auths := make([]*coreauth.Auth, 0, len(s.rows))
+	for _, auth := range s.rows {
+		auths = append(auths, auth.Clone())
+	}
+	return auths, nil
+}
+
+func (s *pluginLoginVersionedRollbackStore) GetByID(_ context.Context, id string) (*coreauth.Auth, error) {
+	auth := s.rows[id]
+	if auth == nil {
+		return nil, nil
+	}
+	return auth.Clone(), nil
+}
+
+func (s *pluginLoginVersionedRollbackStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	path, _, err := s.SaveVersioned(ctx, auth, auth.StoreGeneration())
+	return path, err
+}
+
+func (s *pluginLoginVersionedRollbackStore) SaveVersioned(ctx context.Context, auth *coreauth.Auth, expected uint64) (string, uint64, error) {
+	s.attempts++
+	if s.attempts == s.cancelAt {
+		s.cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	if s.attempts == s.failAt {
+		return "", 0, errors.New("injected versioned save failure")
+	}
+	current := s.rows[auth.ID]
+	if current == nil || current.StoreGeneration() != expected {
+		return "", 0, coreauth.ErrAuthStoreConflict
+	}
+	updated := auth.Clone()
+	generation := expected + 1
+	updated.SetStoreGeneration(generation)
+	s.rows[auth.ID] = updated
+	if s.attempts == s.commitUnknownAt {
+		candidates := map[string]uint64{auth.ID: generation}
+		if s.omitCommitCandidate {
+			candidates = nil
+		}
+		return "", 0, coreauth.NewAuthStoreCommitUnknown(candidates, errors.New("injected marker verification failure"))
+	}
+	return auth.ID, generation, nil
+}
+
+func (s *pluginLoginVersionedRollbackStore) Restore(ctx context.Context, auth *coreauth.Auth, expected uint64) (string, uint64, error) {
+	s.attempts++
+	if s.attempts == s.cancelAt {
+		s.cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	if s.attempts == s.failAt {
+		return "", 0, errors.New("injected versioned restore failure")
+	}
+	if current := s.rows[auth.ID]; current != nil {
+		return "", 0, coreauth.ErrAuthStoreConflict
+	}
+	if tombstoneGeneration := s.tombstoned[auth.ID]; tombstoneGeneration != expected {
+		if expected != 0 || tombstoneGeneration != 0 {
+			return "", 0, coreauth.ErrAuthStoreConflict
+		}
+	}
+	generation := uint64(1)
+	if expected > 0 {
+		generation = expected + 1
+	}
+	restored := auth.Clone()
+	restored.SetStoreGeneration(generation)
+	s.rows[auth.ID] = restored
+	delete(s.tombstoned, auth.ID)
+	if s.attempts == s.commitUnknownAt {
+		candidates := map[string]uint64{auth.ID: generation}
+		if s.omitCommitCandidate {
+			candidates = nil
+		}
+		return "", 0, coreauth.NewAuthStoreCommitUnknown(candidates, errors.New("injected marker verification failure"))
+	}
+	return auth.ID, generation, nil
+}
+
+func (s *pluginLoginVersionedRollbackStore) Tombstone(ctx context.Context, id string, expected uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	current := s.rows[id]
+	if current == nil || current.StoreGeneration() != expected {
+		return 0, coreauth.ErrAuthStoreConflict
+	}
+	delete(s.rows, id)
+	s.tombstoned[id] = expected + 1
+	return expected + 1, nil
+}
+
+func (s *pluginLoginVersionedRollbackStore) Delete(ctx context.Context, id string) error {
+	current := s.rows[id]
+	if current == nil {
+		return nil
+	}
+	_, err := s.Tombstone(ctx, id, current.StoreGeneration())
+	return err
+}
+
+func (*pluginLoginVersionedRollbackStore) SetBaseDir(string) {}

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -20,6 +22,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
@@ -172,14 +176,14 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
+func preferWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
 	if len(available) == 0 {
 		return available
 	}
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
 		return available
 	}
-	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+	if !providerPrefersWebsocketTransport(provider) {
 		return available
 	}
 
@@ -261,7 +265,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferWebsocketAuths(ctx, provider, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -298,7 +302,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferWebsocketAuths(ctx, provider, available)
 	return available[0], nil
 }
 
@@ -367,6 +371,13 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 type SessionAffinitySelector struct {
 	fallback Selector
 	cache    *SessionCache
+	hits     atomic.Uint64
+	failover atomic.Uint64
+}
+
+type sessionAffinityStats struct {
+	Hits      uint64
+	Failovers uint64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -405,11 +416,20 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	return s.pick(ctx, provider, model, opts, auths, nil, "")
+}
+
+func (s *SessionAffinitySelector) pickForExecution(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, inflight func(string) int, preferredAuthID string) (*Auth, error) {
+	return s.pick(ctx, provider, model, opts, auths, inflight, preferredAuthID)
+}
+
+func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, inflight func(string) int, preferredAuthID string) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	primaryID, fallbackID := extractSessionIDsForProvider(ctx, provider, opts)
 	if primaryID == "" {
+		usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeNone))
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		return s.pickFallback(ctx, provider, model, opts, auths, inflight, preferredAuthID)
 	}
 
 	now := time.Now()
@@ -435,16 +455,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				bind(auth.ID)
+				usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeHit))
+				s.hits.Add(1)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+		auth, err := s.pickFallback(ctx, provider, model, opts, auths, inflight, preferredAuthID)
 		if err != nil {
 			return nil, err
 		}
 		bind(auth.ID)
+		usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeFailover))
+		s.failover.Add(1)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -454,6 +478,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					bind(auth.ID)
+					usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeFallbackHit))
+					s.hits.Add(1)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -461,13 +487,38 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+	auth, err := s.pickFallback(ctx, provider, model, opts, auths, inflight, preferredAuthID)
 	if err != nil {
 		return nil, err
 	}
 	bind(auth.ID)
+	usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeMiss))
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) pickFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, inflight func(string) int, preferredAuthID string) (*Auth, error) {
+	if inflight == nil {
+		return s.fallback.Pick(ctx, provider, model, opts, auths)
+	}
+	available, err := getAvailableAuths(auths, provider, model, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	available = preferWebsocketAuths(ctx, provider, available)
+	if preferred := authByID(available, preferredAuthID); preferred != nil {
+		available = []*Auth{preferred}
+	} else {
+		available = leastInflightAuths(available, inflight)
+	}
+	return s.fallback.Pick(ctx, provider, model, opts, available)
+}
+
+func (s *SessionAffinitySelector) stats() sessionAffinityStats {
+	if s == nil {
+		return sessionAffinityStats{}
+	}
+	return sessionAffinityStats{Hits: s.hits.Load(), Failovers: s.failover.Load()}
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -554,6 +605,32 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 // fallbackID preserves an earlier binding when a stronger body identifier appears
 // later, and lets callers bind both identifiers when both are present.
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	if primaryID, fallbackID := extractExplicitSessionIDs(headers, payload); primaryID != "" {
+		return primaryID, fallbackID
+	}
+	if len(payload) > 0 {
+		if userID := normalizedSessionCandidate(gjson.GetBytes(payload, "metadata.user_id").String()); userID != "" {
+			return "user:" + userID, ""
+		}
+		if conversationID := normalizedSessionCandidate(gjson.GetBytes(payload, "conversation_id").String()); conversationID != "" {
+			return "conv:" + conversationID, ""
+		}
+	}
+	if executionID, ok := metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string); ok {
+		if executionID = normalizedSessionCandidate(executionID); executionID != "" {
+			return "execution:" + executionID, ""
+		}
+	}
+	if derivedID := normalizedSessionCandidate(cliproxysession.DerivedID(metadata)); derivedID != "" {
+		return "derived:" + derivedID, ""
+	}
+	if len(payload) == 0 {
+		return "", ""
+	}
+	return extractMessageHashIDs(payload)
+}
+
+func extractExplicitSessionIDs(headers http.Header, payload []byte) (string, string) {
 	if sid := sessionHeaderValue(headers, "X-Claude-Code-Session-Id"); sid != "" {
 		return "claude:" + sid, ""
 	}
@@ -575,50 +652,95 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	if sid := sessionHeaderValue(headers, "X-Client-Request-Id"); sid != "" {
 		return "clientreq:" + sid, ""
 	}
-
-	if len(payload) > 0 {
-		for _, path := range []string{"session_id", "sessionId"} {
-			if sid := normalizedSessionCandidate(gjson.GetBytes(payload, path).String()); sid != "" {
-				return "session:" + sid, ""
-			}
-		}
-
-		conversationID := ""
-		conversation := gjson.GetBytes(payload, "conversation")
-		if sid := normalizedSessionCandidate(conversation.Get("id").String()); sid != "" {
-			conversationID = "conv:" + sid
-		} else if conversation.Type == gjson.String {
-			if sid := normalizedSessionCandidate(conversation.String()); sid != "" {
-				conversationID = "conv:" + sid
-			}
-		}
-		if sid := normalizedSessionCandidate(gjson.GetBytes(payload, "prompt_cache_key").String()); sid != "" {
-			return "pck:" + sid, conversationID
-		}
-		if conversationID != "" {
-			return conversationID, ""
-		}
-
-		if userID := normalizedSessionCandidate(gjson.GetBytes(payload, "metadata.user_id").String()); userID != "" {
-			return "user:" + userID, ""
-		}
-		if conversationID := normalizedSessionCandidate(gjson.GetBytes(payload, "conversation_id").String()); conversationID != "" {
-			return "conv:" + conversationID, ""
-		}
-	}
-
-	if executionID, ok := metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string); ok {
-		if executionID = normalizedSessionCandidate(executionID); executionID != "" {
-			return "execution:" + executionID, ""
-		}
-	}
-	if derivedID := normalizedSessionCandidate(cliproxysession.DerivedID(metadata)); derivedID != "" {
-		return "derived:" + derivedID, ""
-	}
 	if len(payload) == 0 {
 		return "", ""
 	}
-	return extractMessageHashIDs(payload)
+	for _, path := range []string{"session_id", "sessionId"} {
+		if sid := normalizedSessionCandidate(gjson.GetBytes(payload, path).String()); sid != "" {
+			return "session:" + sid, ""
+		}
+	}
+	conversationID := ""
+	conversation := gjson.GetBytes(payload, "conversation")
+	if sid := normalizedSessionCandidate(conversation.Get("id").String()); sid != "" {
+		conversationID = "conv:" + sid
+	} else if conversation.Type == gjson.String {
+		if sid := normalizedSessionCandidate(conversation.String()); sid != "" {
+			conversationID = "conv:" + sid
+		}
+	}
+	if sid := normalizedSessionCandidate(gjson.GetBytes(payload, "prompt_cache_key").String()); sid != "" {
+		return "pck:" + sid, conversationID
+	}
+	if conversationID != "" {
+		return conversationID, ""
+	}
+	return "", ""
+}
+
+func extractSessionIDsForProvider(ctx context.Context, provider string, opts cliproxyexecutor.Options) (string, string) {
+	explicitPrimary, explicitFallback := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest)
+	if explicitPrimary != "" && !strings.HasPrefix(explicitPrimary, "pck:") {
+		return explicitPrimary, explicitFallback
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "xai") {
+		return extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	}
+	if executionSessionID := metadataStringValue(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); executionSessionID != "" {
+		return "xai:exec:" + executionSessionID, ""
+	}
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+		promptCacheKey := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "prompt_cache_key").String())
+		callerScope := callerAPIKeyScope(ctx)
+		if promptCacheKey != "" && callerScope != "" {
+			digest := sha256.Sum256([]byte("cli-proxy-api:xai:prompt-cache-affinity\x00" + callerScope + "\x00" + promptCacheKey))
+			return fmt.Sprintf("xai:pck:%x", digest), explicitFallback
+		}
+	}
+	if strings.HasPrefix(explicitPrimary, "pck:") {
+		if explicitFallback != "" {
+			return explicitFallback, ""
+		}
+		return "", ""
+	}
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if strings.HasPrefix(primaryID, "pck:") {
+		return "", ""
+	}
+	return primaryID, fallbackID
+}
+
+func metadataStringValue(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	switch value := metadata[key].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
+}
+
+func callerAPIKeyScope(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(interface{ Get(string) (any, bool) })
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	raw, exists := ginCtx.Get("userApiKey")
+	if !exists {
+		return ""
+	}
+	apiKey, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(apiKey)
 }
 
 func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {

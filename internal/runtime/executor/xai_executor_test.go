@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -376,6 +377,524 @@ func TestXAIExecutorPrepareResponsesRequestRewritesCodexAgentMessage(t *testing.
 	}
 	if turnID := message.Get("internal_chat_message_metadata_passthrough.turn_id").String(); turnID != "019f92c3-6772-7213-8aac-8bd154d528f1" {
 		t.Fatalf("turn_id = %q; body=%s", turnID, prepared.body)
+	}
+}
+
+func TestXAIExecutorExecuteAcceptsIncompleteResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_incomplete","object":"response","status":"incomplete","model":"grok-4.3","output":[],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "status").String(); got != "incomplete" {
+		t.Fatalf("response status = %q, want incomplete; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestXAIExecutorExecuteReturnsImmediatelyAfterTerminalFlush(t *testing.T) {
+	tests := []struct {
+		name       string
+		eventType  string
+		status     string
+		wantStatus string
+	}{
+		{name: "completed", eventType: "response.completed", status: "completed", wantStatus: "completed"},
+		{name: "incomplete", eventType: "response.incomplete", status: "incomplete", wantStatus: "incomplete"},
+		{name: "done normalized to completed", eventType: "response.done", status: "completed", wantStatus: "completed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flushed := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"type\":%q,\"response\":{\"id\":\"resp_terminal\",\"object\":\"response\",\"status\":%q,\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n", tt.eventType, tt.status)
+				w.(http.Flusher).Flush()
+				close(flushed)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
+			}))
+			defer func() {
+				close(release)
+				server.Close()
+			}()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider:   "xai",
+				Attributes: map[string]string{"base_url": server.URL},
+				Metadata:   map[string]any{"access_token": "xai-token"},
+			}
+			type executeResult struct {
+				resp cliproxyexecutor.Response
+				err  error
+			}
+			result := make(chan executeResult, 1)
+			go func() {
+				resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+					Model:   "grok-4.3",
+					Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+				}, cliproxyexecutor.Options{
+					SourceFormat:   sdktranslator.FormatOpenAIResponse,
+					ResponseFormat: sdktranslator.FormatOpenAIResponse,
+				})
+				result <- executeResult{resp: resp, err: err}
+			}()
+
+			select {
+			case <-flushed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for upstream terminal flush")
+			}
+			select {
+			case got := <-result:
+				if got.err != nil {
+					t.Fatalf("Execute() error = %v", got.err)
+				}
+				if status := gjson.GetBytes(got.resp.Payload, "status").String(); status != tt.wantStatus {
+					t.Fatalf("response status = %q, want %q; payload=%s", status, tt.wantStatus, got.resp.Payload)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("Execute() waited for EOF after %s was flushed", tt.eventType)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteRequiresTerminalResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cutoff\",\"status\":\"in_progress\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+	})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want missing terminal response error")
+	}
+	if got := statusCodeFromTestError(t, err); got != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d; err=%v", got, http.StatusRequestTimeout, err)
+	}
+	if !strings.Contains(err.Error(), "disconnected before terminal response") {
+		t.Fatalf("Execute() error = %v, want missing terminal response error", err)
+	}
+}
+
+func TestXAIExecutorExecuteContextCancellationDoesNotReportDisconnect(t *testing.T) {
+	flushed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancelled\",\"status\":\"in_progress\"}}\n\n"))
+		w.(http.Flusher).Flush()
+		close(flushed)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{
+			Model:   "grok-4.3",
+			Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+		}, cliproxyexecutor.Options{
+			SourceFormat:   sdktranslator.FormatOpenAIResponse,
+			ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		})
+		result <- err
+	}()
+
+	select {
+	case <-flushed:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for upstream event flush")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute() error = %v, want context canceled", err)
+		}
+		if strings.Contains(err.Error(), "disconnected before terminal response") {
+			t.Fatalf("context cancellation was misclassified as disconnect: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute() did not return after context cancellation")
+	}
+}
+
+func TestXAIExecutorExecuteReturnsTerminalFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		event      string
+		wantStatus int
+	}{
+		{
+			name:       "response failed",
+			event:      `{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"authentication_error","code":"invalid_api_key","message":"invalid token"}}}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "error event",
+			event:      `{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"invalid input"}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", tt.event)
+			}))
+			defer server.Close()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider:   "xai",
+				Attributes: map[string]string{"base_url": server.URL},
+				Metadata:   map[string]any{"access_token": "xai-token"},
+			}
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "grok-4.3",
+				Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FormatOpenAIResponse,
+				ResponseFormat: sdktranslator.FormatOpenAIResponse,
+			})
+			if err == nil {
+				t.Fatal("Execute() error = nil, want terminal failure")
+			}
+			if got := statusCodeFromTestError(t, err); got != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; err=%v", got, tt.wantStatus, err)
+			}
+			if strings.Contains(err.Error(), "disconnected before terminal response") {
+				t.Fatalf("terminal failure was misclassified as disconnect: %v", err)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteStreamRequiresTerminalResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_cutoff","status":"in_progress"}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"partial"}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+	result, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var gotPayload bool
+	var gotErr error
+	for chunk := range result.Chunks {
+		gotPayload = gotPayload || len(chunk.Payload) > 0
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	if !gotPayload {
+		t.Fatal("stream returned no payload before disconnect")
+	}
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "disconnected before terminal response") {
+		t.Fatalf("stream error = %v, want missing terminal response error", gotErr)
+	}
+}
+
+func TestXAIExecutorExecuteStreamAcceptsIncompleteTerminalResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+	result, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var gotIncomplete bool
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		if gjson.GetBytes(bytes.TrimSpace(bytes.TrimPrefix(chunk.Payload, xaiDataTag)), "type").String() == "response.incomplete" {
+			gotIncomplete = true
+		}
+	}
+	if !gotIncomplete {
+		t.Fatal("stream did not forward response.incomplete")
+	}
+}
+
+func TestXAIExecutorExecuteStreamClosesImmediatelyAfterSuccessfulTerminalResponse(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		response  string
+	}{
+		{
+			name:      "completed",
+			eventType: "response.completed",
+			response:  `{"id":"resp_completed","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+		},
+		{
+			name:      "incomplete",
+			eventType: "response.incomplete",
+			response:  `{"id":"resp_incomplete","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: {\"type\":%q,\"response\":%s}\n\n", tt.eventType, tt.eventType, tt.response)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
+			}))
+			defer server.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider:   "xai",
+				Attributes: map[string]string{"base_url": server.URL},
+				Metadata:   map[string]any{"access_token": "xai-token"},
+			}
+			result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+				Model:   "grok-4.3",
+				Payload: []byte(`{"model":"grok-4.3","input":"hello","stream":true}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FormatOpenAIResponse,
+				ResponseFormat: sdktranslator.FormatOpenAIResponse,
+				Stream:         true,
+			})
+			if err != nil {
+				t.Fatalf("ExecuteStream() error = %v", err)
+			}
+
+			gotTerminalEvent := false
+			gotTerminalData := false
+			deadline := time.After(2 * time.Second)
+			for {
+				select {
+				case chunk, ok := <-result.Chunks:
+					if !ok {
+						if !gotTerminalEvent || !gotTerminalData {
+							t.Fatalf("stream closed before forwarding complete %s event/data pair: event=%t data=%t", tt.eventType, gotTerminalEvent, gotTerminalData)
+						}
+						return
+					}
+					if chunk.Err != nil {
+						t.Fatalf("stream chunk error = %v", chunk.Err)
+					}
+					line := bytes.TrimSpace(chunk.Payload)
+					if bytes.HasPrefix(line, xaiEventTag) && strings.TrimSpace(string(line[len(xaiEventTag):])) == tt.eventType {
+						gotTerminalEvent = true
+					}
+					data := bytes.TrimSpace(bytes.TrimPrefix(line, xaiDataTag))
+					if gjson.GetBytes(data, "type").String() == tt.eventType {
+						gotTerminalData = true
+					}
+				case <-deadline:
+					cancel()
+					t.Fatalf("stream did not close promptly after %s", tt.eventType)
+				}
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteStreamReturnsTerminalFailure(t *testing.T) {
+	tests := []struct {
+		name           string
+		event          string
+		wantStatus     int
+		wantRetryAfter time.Duration
+	}{
+		{
+			name:       "response failed",
+			event:      `{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"authentication_error","code":"invalid_api_key","message":"invalid token"}}}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "free usage error",
+			event:          `{"type":"error","error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for now."}}`,
+			wantStatus:     http.StatusTooManyRequests,
+			wantRetryAfter: xaiFreeUsageExhaustedCooldown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", tt.event)
+			}))
+			defer server.Close()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider:   "xai",
+				Attributes: map[string]string{"base_url": server.URL},
+				Metadata:   map[string]any{"access_token": "xai-token"},
+			}
+			result, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "grok-4.3",
+				Payload: []byte(`{"model":"grok-4.3","input":"hello","stream":true}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat:   sdktranslator.FormatOpenAIResponse,
+				ResponseFormat: sdktranslator.FormatOpenAIResponse,
+				Stream:         true,
+			})
+			if err != nil {
+				t.Fatalf("ExecuteStream() error = %v", err)
+			}
+
+			var gotErr error
+			for chunk := range result.Chunks {
+				if len(chunk.Payload) > 0 {
+					t.Fatalf("failure event was forwarded as successful payload: %s", chunk.Payload)
+				}
+				if chunk.Err != nil {
+					gotErr = chunk.Err
+				}
+			}
+			if gotErr == nil {
+				t.Fatal("stream chunk error = nil, want terminal failure")
+			}
+			if got := statusCodeFromTestError(t, gotErr); got != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; err=%v", got, tt.wantStatus, gotErr)
+			}
+			if tt.wantRetryAfter > 0 {
+				retryable, ok := gotErr.(interface{ RetryAfter() *time.Duration })
+				if !ok || retryable.RetryAfter() == nil || *retryable.RetryAfter() != tt.wantRetryAfter {
+					t.Fatalf("RetryAfter = %#v, want %v; err=%v", retryable, tt.wantRetryAfter, gotErr)
+				}
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteStreamContextCancellationDoesNotReportDisconnect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_cancelled","status":"in_progress"}}` + "\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err != nil {
+		cancel()
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	select {
+	case chunk := <-result.Chunks:
+		if chunk.Err != nil {
+			cancel()
+			t.Fatalf("first stream chunk error = %v", chunk.Err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for first stream chunk")
+	}
+	cancel()
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream reported error after context cancellation: %v", chunk.Err)
+		}
 	}
 }
 
@@ -2045,6 +2564,7 @@ func TestXAIExecutorCompactClearsReplayBeforePostCompactTurn(t *testing.T) {
 
 	exec := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
+		ID:       "xai-compact",
 		Provider: "xai",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -2056,6 +2576,9 @@ func TestXAIExecutorCompactClearsReplayBeforePostCompactTurn(t *testing.T) {
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Alt:          "responses/compact",
 		Stream:       false,
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthMetadataKey: auth.ID,
+		},
 	}
 	compactEncryptedContent := testValidGrokEncryptedContentForSeed(41)
 	compactPayload := []byte(`{"model":"grok-4.3","prompt_cache_key":"compact-session","input":[{"type":"compaction","encrypted_content":""},{"type":"message","role":"user","content":[{"type":"input_text","text":"compact"}]}]}`)
@@ -2089,6 +2612,9 @@ func TestXAIExecutorCompactClearsReplayBeforePostCompactTurn(t *testing.T) {
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Stream:       false,
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthMetadataKey: auth.ID,
+		},
 	}, false)
 	if errPrepare != nil {
 		t.Fatalf("prepare post-compact request: %v", errPrepare)
@@ -2112,6 +2638,7 @@ func TestXAIExecutorCompactFailureRetainsReplay(t *testing.T) {
 
 	exec := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
+		ID:       "xai-compact-failure",
 		Provider: "xai",
 		Attributes: map[string]string{
 			"base_url": server.URL,
@@ -2119,7 +2646,13 @@ func TestXAIExecutorCompactFailureRetainsReplay(t *testing.T) {
 		},
 	}
 	ctx := testContextWithAPIKey("xai-compact-failure-caller")
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Alt: "responses/compact"}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Alt:          "responses/compact",
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthMetadataKey: auth.ID,
+		},
+	}
 	payload := []byte(`{"model":"grok-4.3","prompt_cache_key":"compact-failure-session","input":[{"type":"message","role":"user","content":"compact"}]}`)
 	req := cliproxyexecutor.Request{Model: "grok-4.3", Payload: payload}
 	scope := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, opts, payload)
@@ -2805,6 +3338,97 @@ func TestXAIExecutorExecuteImagesPublishesRequestBuildFailureUsage(t *testing.T)
 type captureXAIUsagePlugin struct {
 	model   string
 	records chan usage.Record
+}
+
+func TestXAIExecutorCompletedOnlyResponsePublishesSemanticPhases(t *testing.T) {
+	const model = "grok-phase-completed-only"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_phase","status":"completed","model":"grok-phase-completed-only","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"completed answer"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	plugin := &captureXAIUsagePlugin{model: model, records: make(chan usage.Record, 1)}
+	usage.RegisterPlugin(plugin)
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:         "xai-phase-http",
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+
+	_, errExec := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"grok-phase-completed-only","input":"hello"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	record := waitForXAIUsageRecord(t, plugin.records)
+	if record.Phases == nil {
+		t.Fatal("phases = nil, want direct xAI tracking")
+	}
+	if record.Phases.FirstEvent <= 0 || record.Phases.FirstSemanticToken <= 0 {
+		t.Fatalf("completed-only phases = %+v, want event and semantic fallback", record.Phases)
+	}
+	if record.Phases.TerminalKind != "completed" || record.Phases.Terminal <= 0 {
+		t.Fatalf("terminal phases = %+v, want completed", record.Phases)
+	}
+}
+
+func TestXAIExecutorStreamCreatedIsNotSemanticAndDeltaPublishesPhases(t *testing.T) {
+	const model = "grok-phase-stream-delta"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_phase","status":"in_progress","output":[]}}` + "\n\n"))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"hello"}` + "\n\n"))
+		flusher.Flush()
+		time.Sleep(10 * time.Millisecond)
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_phase","status":"completed","model":"grok-phase-stream-delta","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	plugin := &captureXAIUsagePlugin{model: model, records: make(chan usage.Record, 1)}
+	usage.RegisterPlugin(plugin)
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:         "xai-phase-stream",
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+
+	result, errStream := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"grok-phase-stream-delta","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	record := waitForXAIUsageRecord(t, plugin.records)
+	if record.Phases == nil {
+		t.Fatal("phases = nil, want stream tracking")
+	}
+	if record.Phases.FirstEvent <= 0 || record.Phases.FirstSemanticToken <= record.Phases.FirstEvent {
+		t.Fatalf("stream phases = %+v, want created event before first semantic delta", record.Phases)
+	}
+	if record.Phases.TerminalKind != "completed" || record.Phases.Terminal < record.Phases.FirstSemanticToken {
+		t.Fatalf("terminal phases = %+v, want completed after semantic delta", record.Phases)
+	}
 }
 
 func (p *captureXAIUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
@@ -4568,7 +5192,12 @@ func TestCacheXAIReasoningReplayFromCompletedClearsPreviousEntryWhenNoReplayable
 
 func TestXAIReasoningReplayScopeIsolatesOpenAIResponsePromptCacheKeyByAPIKey(t *testing.T) {
 	payload := []byte(`{"model":"grok-4.5","prompt_cache_key":"shared-session","input":[]}`)
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthMetadataKey: "auth-a",
+		},
+	}
 	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}
 
 	scopeA := xaiReasoningReplayScopeFromRequest(testContextWithAPIKey("api-key-a"), sdktranslator.FormatOpenAIResponse, req, opts, payload)
@@ -4579,7 +5208,7 @@ func TestXAIReasoningReplayScopeIsolatesOpenAIResponsePromptCacheKeyByAPIKey(t *
 	if scopeA.sessionKey == scopeB.sessionKey {
 		t.Fatalf("session keys must differ across callers, both %q", scopeA.sessionKey)
 	}
-	if !strings.HasPrefix(scopeA.sessionKey, "caller:") || !strings.Contains(scopeA.sessionKey, "prompt-cache:shared-session") {
+	if !strings.HasPrefix(scopeA.sessionKey, "auth:") || !strings.Contains(scopeA.sessionKey, ":caller:") || !strings.Contains(scopeA.sessionKey, "prompt-cache:shared-session") {
 		t.Fatalf("session key A = %q, want caller-isolated prompt-cache key", scopeA.sessionKey)
 	}
 
@@ -4591,7 +5220,12 @@ func TestXAIReasoningReplayScopeIsolatesOpenAIResponsePromptCacheKeyByAPIKey(t *
 
 func TestXAIReasoningReplayScopeDisablesClaudeWithoutAPIKey(t *testing.T) {
 	payload := []byte(`{"model":"grok-4.3","metadata":{"user_id":"{\"session_id\":\"shared-session\"}"},"messages":[{"role":"user","content":"hello"}]}`)
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthMetadataKey: "auth-a",
+		},
+	}
 	req := cliproxyexecutor.Request{Model: "grok-4.3", Payload: payload}
 
 	scopeNoKey := xaiReasoningReplayScopeFromRequest(context.Background(), sdktranslator.FormatClaude, req, opts, payload)
@@ -4603,7 +5237,7 @@ func TestXAIReasoningReplayScopeDisablesClaudeWithoutAPIKey(t *testing.T) {
 	if !scopeWithKey.valid() {
 		t.Fatal("Claude with caller API key must enable replay")
 	}
-	if !strings.HasPrefix(scopeWithKey.sessionKey, "caller:") || !strings.Contains(scopeWithKey.sessionKey, "claude:shared-session") {
+	if !strings.HasPrefix(scopeWithKey.sessionKey, "auth:") || !strings.Contains(scopeWithKey.sessionKey, ":caller:") || !strings.Contains(scopeWithKey.sessionKey, "claude:shared-session") {
 		t.Fatalf("session key = %q, want caller-isolated Claude session key", scopeWithKey.sessionKey)
 	}
 }
@@ -4617,13 +5251,14 @@ func TestXAIReasoningReplayScopeAllowsTrustedExecutionSessionWithoutAPIKey(t *te
 		SourceFormat: sdktranslator.FormatClaude,
 		Metadata: map[string]any{
 			cliproxyexecutor.ExecutionSessionMetadataKey: "trusted-session",
+			cliproxyexecutor.SelectedAuthMetadataKey:     "auth-a",
 		},
 	}, payload)
 	if !scope.valid() {
 		t.Fatal("trusted execution session must remain replayable without caller API key")
 	}
-	if scope.sessionKey != "execution:trusted-session" {
-		t.Fatalf("session key = %q, want execution:trusted-session", scope.sessionKey)
+	if !strings.HasPrefix(scope.sessionKey, "auth:") || !strings.HasSuffix(scope.sessionKey, ":execution:trusted-session") {
+		t.Fatalf("session key = %q, want auth-scoped execution:trusted-session", scope.sessionKey)
 	}
 }
 
@@ -4660,6 +5295,7 @@ func TestApplyXAIReasoningReplayCacheFallsBackWhenReadFails(t *testing.T) {
 		SourceFormat: sdktranslator.FormatClaude,
 		Metadata: map[string]any{
 			cliproxyexecutor.ExecutionSessionMetadataKey: "xai-read-error",
+			cliproxyexecutor.SelectedAuthMetadataKey:     "auth-a",
 		},
 	}, body)
 	if err != nil {
@@ -4678,21 +5314,22 @@ func TestXAIReasoningReplayCacheReplaysFunctionCallWithoutReasoning(t *testing.T
 	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
 
 	const executionSessionID = "xai-tool-call-only"
-	cacheXAIReasoningReplayFromCompleted(context.Background(), xaiReasoningReplayScope{
-		modelName:  "grok-4.3",
-		sessionKey: "execution:" + executionSessionID,
-	}, []byte(`{"response":{"output":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"weather\"}"}]}}`))
-
 	body := []byte(`{"model":"grok-4.3","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"call lookup"}]},{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
-	updated, scope, errReplay := applyXAIReasoningReplayCacheRequired(context.Background(), sdktranslator.FormatClaude, cliproxyexecutor.Request{
+	req := cliproxyexecutor.Request{
 		Model:   "grok-4.3",
 		Payload: body,
-	}, cliproxyexecutor.Options{
+	}
+	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatClaude,
 		Metadata: map[string]any{
 			cliproxyexecutor.ExecutionSessionMetadataKey: executionSessionID,
+			cliproxyexecutor.SelectedAuthMetadataKey:     "auth-a",
 		},
-	}, body)
+	}
+	scope := xaiReasoningReplayScopeFromRequest(context.Background(), sdktranslator.FormatClaude, req, opts, body)
+	cacheXAIReasoningReplayFromCompleted(context.Background(), scope, []byte(`{"response":{"output":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"weather\"}"}]}}`))
+
+	updated, scope, errReplay := applyXAIReasoningReplayCacheRequired(context.Background(), sdktranslator.FormatClaude, req, opts, body)
 	if errReplay != nil {
 		t.Fatalf("applyXAIReasoningReplayCacheRequired() error = %v", errReplay)
 	}
@@ -5202,6 +5839,621 @@ func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
 	}
 	if gotClientVersion != "" {
 		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiClientVersionHeader, gotClientVersion)
+	}
+}
+
+func TestXAIHTTPResponseContinuityDecisionMatrix(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	internalcache.ClearXAIReasoningReplayCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
+
+	ctx := testContextWithAPIKey("continuity-caller")
+	baseURL := "https://custom.example.test/v1/"
+	model := "grok-4.5"
+	previousID := "resp_previous"
+	callerScope := internalcache.XAIResponseContinuityCallerScope("continuity-caller", "")
+	validEncrypted := testValidGrokEncryptedContentForSeed(71)
+	basePayload := []byte(`{"model":"grok-4.5","store":true,"previous_response_id":"resp_previous","instructions":"do not duplicate","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"kept summary"}],"encrypted_content":""},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"kept assistant"}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"kept tool"}]}`)
+	basePayload, _ = sjson.SetBytes(basePayload, "input.0.encrypted_content", validEncrypted)
+
+	tests := []struct {
+		name              string
+		auth              *cliproxyauth.Auth
+		requestBaseURL    string
+		seed              bool
+		opaqueReusable    bool
+		wantPrevious      bool
+		wantEncrypted     bool
+		wantPromptCache   bool
+		wantInstructions  bool
+		wantReplaySkipped bool
+	}{
+		{
+			name:              "same auth and kind with reusable opaque id",
+			auth:              &cliproxyauth.Auth{ID: "auth-a"},
+			requestBaseURL:    baseURL,
+			seed:              true,
+			opaqueReusable:    true,
+			wantPrevious:      true,
+			wantEncrypted:     true,
+			wantPromptCache:   true,
+			wantInstructions:  false,
+			wantReplaySkipped: true,
+		},
+		{
+			name:             "same auth and kind without upstream storage",
+			auth:             &cliproxyauth.Auth{ID: "auth-a"},
+			requestBaseURL:   baseURL,
+			seed:             true,
+			opaqueReusable:   false,
+			wantEncrypted:    true,
+			wantPromptCache:  true,
+			wantInstructions: true,
+		},
+		{
+			name:              "auth changed",
+			auth:              &cliproxyauth.Auth{ID: "auth-b"},
+			requestBaseURL:    baseURL,
+			seed:              true,
+			opaqueReusable:    true,
+			wantInstructions:  true,
+			wantReplaySkipped: true,
+		},
+		{
+			name:              "upstream kind changed",
+			auth:              &cliproxyauth.Auth{ID: "auth-a"},
+			requestBaseURL:    "https://other.example.test/v1",
+			seed:              true,
+			opaqueReusable:    true,
+			wantInstructions:  true,
+			wantReplaySkipped: true,
+		},
+		{
+			name:              "cache miss",
+			auth:              &cliproxyauth.Auth{ID: "auth-a"},
+			requestBaseURL:    baseURL,
+			wantInstructions:  true,
+			wantReplaySkipped: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			internalcache.ClearXAIResponseContinuityCache()
+			internalcache.ClearXAIReasoningReplayCache()
+			if tt.seed {
+				if !internalcache.StoreXAIResponseContinuity(context.Background(), callerScope, "xai", model, previousID, internalcache.XAIResponseContinuity{
+					AuthID:         "auth-a",
+					PromptCacheKey: "restored-pck",
+					UpstreamKind:   xaiHTTPUpstreamKind(baseURL),
+					OpaqueReusable: tt.opaqueReusable,
+				}) {
+					t.Fatal("failed to seed response continuity")
+				}
+			}
+			req := cliproxyexecutor.Request{Model: model, Payload: bytes.Clone(basePayload)}
+			opts := xaiOptionsWithSelectedAuth(cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}, tt.auth)
+			req, opts, decision := prepareXAIHTTPResponseContinuity(ctx, tt.auth, req, opts, tt.requestBaseURL)
+			replayEncrypted := testValidGrokEncryptedContentForSeed(75)
+			if tt.wantPrevious {
+				replayScope := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, opts, req.Payload)
+				replayItem := []byte(`{"type":"reasoning","summary":[],"encrypted_content":""}`)
+				replayItem, _ = sjson.SetBytes(replayItem, "encrypted_content", replayEncrypted)
+				if !internalcache.CacheXAIReasoningReplayItems(replayScope.modelName, replayScope.sessionKey, [][]byte{replayItem}) {
+					t.Fatal("failed to seed local reasoning replay")
+				}
+			}
+
+			if tt.wantReplaySkipped != xaiMetadataBool(opts.Metadata, xaiSkipReasoningReplayMetadataKey) {
+				t.Fatalf("replay skip = %v, want %v", xaiMetadataBool(opts.Metadata, xaiSkipReasoningReplayMetadataKey), tt.wantReplaySkipped)
+			}
+			prepared, errPrepare := NewXAIExecutor(&config.Config{}).prepareResponsesRequest(ctx, req, opts, false)
+			if errPrepare != nil {
+				t.Fatalf("prepareResponsesRequest() error = %v", errPrepare)
+			}
+			applyXAIHTTPResponseContinuityToPrepared(prepared, decision)
+
+			if got := gjson.GetBytes(prepared.body, "previous_response_id").String(); (got != "") != tt.wantPrevious {
+				t.Fatalf("previous_response_id = %q, want present=%v; body=%s", got, tt.wantPrevious, prepared.body)
+			}
+			if got := gjson.GetBytes(prepared.body, "prompt_cache_key").String(); (got != "") != tt.wantPromptCache {
+				t.Fatalf("prompt_cache_key = %q, want present=%v; body=%s", got, tt.wantPromptCache, prepared.body)
+			}
+			if got := gjson.GetBytes(prepared.body, "instructions").String(); (got != "") != tt.wantInstructions {
+				t.Fatalf("instructions = %q, want present=%v; body=%s", got, tt.wantInstructions, prepared.body)
+			}
+			input := gjson.GetBytes(prepared.body, "input").Array()
+			encryptedFound := false
+			summaryFound := false
+			assistantFound := false
+			toolStateFound := false
+			for _, item := range input {
+				encryptedFound = encryptedFound || item.Get("encrypted_content").String() != ""
+				if item.Get("encrypted_content").String() == replayEncrypted {
+					t.Fatalf("local reasoning replay duplicated opaque previous response: %s", prepared.body)
+				}
+				summaryFound = summaryFound || item.Get("summary.0.text").String() == "kept summary"
+				assistantFound = assistantFound || item.Get("role").String() == "assistant"
+				toolStateFound = toolStateFound || item.Get("type").String() == "function_call_output"
+			}
+			if encryptedFound != tt.wantEncrypted {
+				t.Fatalf("encrypted_content present=%v, want %v; body=%s", encryptedFound, tt.wantEncrypted, prepared.body)
+			}
+			if !summaryFound || !assistantFound || !toolStateFound {
+				t.Fatalf("fail-closed scrub removed non-opaque state; body=%s", prepared.body)
+			}
+		})
+	}
+}
+
+func TestXAIHTTPInputContinuityWithoutPreviousResponseID(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+
+	baseURL := "https://custom.example.test/v1?tenant=a"
+	model := "grok-4.5"
+	callerAPIKey := "input-continuity-caller"
+	callerScope := internalcache.XAIResponseContinuityCallerScope(callerAPIKey, "")
+	bindingID := internalcache.XAIResponseContinuitySessionBindingID("shared-pck", "")
+	validEncrypted := testValidGrokEncryptedContentForSeed(76)
+	payload := []byte(`{"model":"grok-4.5","prompt_cache_key":"shared-pck","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"kept summary"}],"encrypted_content":""},{"type":"compaction","encrypted_content":""},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"kept assistant"}]},{"type":"function_call_output","call_id":"call_1","output":"kept tool"}]}`)
+	payload, _ = sjson.SetBytes(payload, "input.0.encrypted_content", validEncrypted)
+	payload, _ = sjson.SetBytes(payload, "input.1.encrypted_content", validEncrypted)
+
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		auth        *cliproxyauth.Auth
+		baseURL     string
+		payload     []byte
+		seed        bool
+		readError   bool
+		wantOpaque  bool
+		wantBinding bool
+	}{
+		{name: "same auth and upstream", ctx: testContextWithAPIKey(callerAPIKey), auth: &cliproxyauth.Auth{ID: "auth-a"}, baseURL: baseURL, payload: payload, seed: true, wantOpaque: true, wantBinding: true},
+		{name: "auth mismatch", ctx: testContextWithAPIKey(callerAPIKey), auth: &cliproxyauth.Auth{ID: "auth-b"}, baseURL: baseURL, payload: payload, seed: true, wantBinding: true},
+		{name: "upstream mismatch", ctx: testContextWithAPIKey(callerAPIKey), auth: &cliproxyauth.Auth{ID: "auth-a"}, baseURL: "https://custom.example.test/v1?tenant=b", payload: payload, seed: true, wantBinding: true},
+		{name: "cache miss", ctx: testContextWithAPIKey(callerAPIKey), auth: &cliproxyauth.Auth{ID: "auth-a"}, baseURL: baseURL, payload: payload, wantBinding: true},
+		{name: "cache read error", ctx: testContextWithAPIKey(callerAPIKey), auth: &cliproxyauth.Auth{ID: "auth-a"}, baseURL: baseURL, payload: payload, readError: true, wantBinding: true},
+		{name: "missing input identity", ctx: testContextWithAPIKey(callerAPIKey), auth: &cliproxyauth.Auth{ID: "auth-a"}, baseURL: baseURL, payload: xaiDeleteJSONPath(payload, "prompt_cache_key")},
+		{name: "missing caller scope", ctx: context.Background(), auth: &cliproxyauth.Auth{ID: "auth-a"}, baseURL: baseURL, payload: payload, wantBinding: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			internalcache.ClearXAIResponseContinuityCache()
+			if tt.seed {
+				if !internalcache.StoreXAIResponseContinuity(context.Background(), callerScope, "xai", model, bindingID, internalcache.XAIResponseContinuity{
+					AuthID:       "auth-a",
+					UpstreamKind: xaiHTTPUpstreamKind(baseURL),
+				}) {
+					t.Fatal("failed to seed input continuity")
+				}
+			}
+			previousGetter := getXAIResponseContinuityRequired
+			if tt.readError {
+				getXAIResponseContinuityRequired = func(context.Context, string, string, string, string) (internalcache.XAIResponseContinuity, bool, error) {
+					return internalcache.XAIResponseContinuity{}, false, errors.New("kv unavailable")
+				}
+			}
+			req := cliproxyexecutor.Request{Model: model, Payload: bytes.Clone(tt.payload)}
+			opts := xaiOptionsWithSelectedAuth(cliproxyexecutor.Options{
+				SourceFormat:    sdktranslator.FormatOpenAIResponse,
+				OriginalRequest: bytes.Clone(tt.payload),
+			}, tt.auth)
+			req, opts, decision := prepareXAIHTTPResponseContinuity(tt.ctx, tt.auth, req, opts, tt.baseURL)
+			getXAIResponseContinuityRequired = previousGetter
+
+			if (decision.sessionBindingID != "") != tt.wantBinding {
+				t.Fatalf("session binding = %q, want present=%v", decision.sessionBindingID, tt.wantBinding)
+			}
+			if xaiMetadataBool(opts.Metadata, xaiSkipReasoningReplayMetadataKey) {
+				t.Fatal("session fail-closed path must still allow selected-auth local replay")
+			}
+			for label, body := range map[string][]byte{"payload": req.Payload, "original": opts.OriginalRequest} {
+				input := gjson.GetBytes(body, "input").Array()
+				encryptedFound := false
+				compactionFound := false
+				summaryFound := false
+				assistantFound := false
+				toolFound := false
+				for _, item := range input {
+					encryptedFound = encryptedFound || item.Get("encrypted_content").Exists()
+					compactionFound = compactionFound || item.Get("type").String() == "compaction"
+					summaryFound = summaryFound || item.Get("summary.0.text").String() == "kept summary"
+					assistantFound = assistantFound || item.Get("role").String() == "assistant"
+					toolFound = toolFound || item.Get("type").String() == "function_call_output"
+				}
+				if encryptedFound != tt.wantOpaque || compactionFound != tt.wantOpaque {
+					t.Fatalf("%s opaque state encrypted=%v compaction=%v, want %v; body=%s", label, encryptedFound, compactionFound, tt.wantOpaque, body)
+				}
+				if !summaryFound || !assistantFound || !toolFound {
+					t.Fatalf("%s scrub removed explicit history: %s", label, body)
+				}
+			}
+		})
+	}
+}
+
+func TestXAIHTTPInputContinuityScrubAllowsSelectedAuthReplay(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	internalcache.ClearXAIReasoningReplayCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
+
+	ctx := testContextWithAPIKey("local-replay-caller")
+	auth := &cliproxyauth.Auth{ID: "auth-a"}
+	encryptedInput := testValidGrokEncryptedContentForSeed(77)
+	encryptedReplay := testValidGrokEncryptedContentForSeed(78)
+	payload := []byte(`{"model":"grok-4.5","prompt_cache_key":"local-replay-pck","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"client summary"}],"encrypted_content":""},{"type":"compaction","encrypted_content":""},{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "input.0.encrypted_content", encryptedInput)
+	payload, _ = sjson.SetBytes(payload, "input.1.encrypted_content", encryptedInput)
+	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}
+	opts := xaiOptionsWithSelectedAuth(cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: bytes.Clone(payload)}, auth)
+
+	replayScope := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, opts, payload)
+	replayItem := []byte(`{"type":"reasoning","summary":[],"encrypted_content":""}`)
+	replayItem, _ = sjson.SetBytes(replayItem, "encrypted_content", encryptedReplay)
+	if !internalcache.CacheXAIReasoningReplayItems(replayScope.modelName, replayScope.sessionKey, [][]byte{replayItem}) {
+		t.Fatal("failed to seed selected-auth local replay")
+	}
+
+	req, opts, decision := prepareXAIHTTPResponseContinuity(ctx, auth, req, opts, "https://custom.example.test/v1")
+	prepared, errPrepare := NewXAIExecutor(&config.Config{}).prepareResponsesRequest(ctx, req, opts, false)
+	if errPrepare != nil {
+		t.Fatalf("prepareResponsesRequest() error = %v", errPrepare)
+	}
+	applyXAIHTTPResponseContinuityToPrepared(prepared, decision)
+	if xaiInputHasEncryptedValue(prepared.body, encryptedInput) || xaiInputHasItemType(prepared.body, "compaction") {
+		t.Fatalf("unproven client opaque state survived: %s", prepared.body)
+	}
+	if !xaiInputHasEncryptedValue(prepared.body, encryptedReplay) {
+		t.Fatalf("selected-auth local replay was not injected after scrub: %s", prepared.body)
+	}
+}
+
+func TestXAIHTTPInputContinuityScrubsPayloadConfigBeforeSelectedAuthReplay(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	internalcache.ClearXAIReasoningReplayCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
+
+	ctx := testContextWithAPIKey("config-reinjection-caller")
+	auth := &cliproxyauth.Auth{ID: "auth-config"}
+	clientEncrypted := testValidGrokEncryptedContentForSeed(83)
+	configEncrypted := testValidGrokEncryptedContentForSeed(84)
+	replayEncrypted := testValidGrokEncryptedContentForSeed(85)
+	payload := []byte(`{"model":"grok-4.5","prompt_cache_key":"config-reinjection-pck","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"client summary"}],"encrypted_content":""},{"type":"compaction","encrypted_content":""},{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "input.0.encrypted_content", clientEncrypted)
+	payload, _ = sjson.SetBytes(payload, "input.1.encrypted_content", clientEncrypted)
+	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}
+	opts := xaiOptionsWithSelectedAuth(cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: bytes.Clone(payload)}, auth)
+
+	replayScope := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, opts, payload)
+	replayItem := []byte(`{"type":"reasoning","summary":[],"encrypted_content":""}`)
+	replayItem, _ = sjson.SetBytes(replayItem, "encrypted_content", replayEncrypted)
+	if !internalcache.CacheXAIReasoningReplayItems(replayScope.modelName, replayScope.sessionKey, [][]byte{replayItem}) {
+		t.Fatal("failed to seed selected-auth replay")
+	}
+
+	configuredInput := fmt.Sprintf(`[{"type":"reasoning","summary":[{"type":"summary_text","text":"config summary"}],"encrypted_content":%q},{"type":"compaction","encrypted_content":%q},{"type":"message","role":"user","content":[{"type":"input_text","text":"configured next"}]}]`, configEncrypted, configEncrypted)
+	exec := NewXAIExecutor(&config.Config{Payload: config.PayloadConfig{OverrideRaw: []config.PayloadRule{{
+		Models: []config.PayloadModelRule{{Name: "grok-4.5"}},
+		Params: map[string]any{"input": configuredInput},
+	}}}})
+	req, opts, decision := prepareXAIHTTPResponseContinuity(ctx, auth, req, opts, "https://custom.example.test/v1")
+	if !xaiMetadataBool(opts.Metadata, xaiScrubUntrustedInputMetadataKey) {
+		t.Fatal("cache miss did not mark untrusted input for post-config scrub")
+	}
+	prepared, errPrepare := exec.prepareResponsesRequest(ctx, req, opts, false)
+	if errPrepare != nil {
+		t.Fatalf("prepareResponsesRequest() error = %v", errPrepare)
+	}
+	applyXAIHTTPResponseContinuityToPrepared(prepared, decision)
+
+	if xaiInputHasEncryptedValue(prepared.body, clientEncrypted) || xaiInputHasEncryptedValue(prepared.body, configEncrypted) || xaiInputHasItemType(prepared.body, "compaction") {
+		t.Fatalf("payload config reintroduced untrusted opaque state: %s", prepared.body)
+	}
+	if !xaiInputHasEncryptedValue(prepared.body, replayEncrypted) {
+		t.Fatalf("trusted selected-auth replay was removed by post-config scrub: %s", prepared.body)
+	}
+	if !bytes.Contains(prepared.body, []byte("config summary")) || !bytes.Contains(prepared.body, []byte("configured next")) {
+		t.Fatalf("post-config scrub removed explicit configured history: %s", prepared.body)
+	}
+}
+
+func xaiDeleteJSONPath(payload []byte, path string) []byte {
+	out, _ := sjson.DeleteBytes(payload, path)
+	return out
+}
+
+func xaiInputHasEncryptedValue(payload []byte, value string) bool {
+	for _, item := range gjson.GetBytes(payload, "input").Array() {
+		if item.Get("encrypted_content").String() == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestXAIHTTPResponseContinuityCacheReadErrorFailsClosed(t *testing.T) {
+	previousGetter := getXAIResponseContinuityRequired
+	getXAIResponseContinuityRequired = func(context.Context, string, string, string, string) (internalcache.XAIResponseContinuity, bool, error) {
+		return internalcache.XAIResponseContinuity{}, false, errors.New("kv unavailable")
+	}
+	t.Cleanup(func() { getXAIResponseContinuityRequired = previousGetter })
+
+	encrypted := testValidGrokEncryptedContentForSeed(72)
+	payload := []byte(`{"model":"grok-4.5","previous_response_id":"resp_previous","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"keep"}],"encrypted_content":""}]}`)
+	payload, _ = sjson.SetBytes(payload, "input.0.encrypted_content", encrypted)
+	auth := &cliproxyauth.Auth{ID: "auth-a"}
+	opts := xaiOptionsWithSelectedAuth(cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}, auth)
+	req, opts, decision := prepareXAIHTTPResponseContinuity(testContextWithAPIKey("caller"), auth, cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}, opts, "https://api.x.ai/v1")
+	prepared, errPrepare := NewXAIExecutor(&config.Config{}).prepareResponsesRequest(testContextWithAPIKey("caller"), req, opts, false)
+	if errPrepare != nil {
+		t.Fatalf("prepareResponsesRequest() error = %v", errPrepare)
+	}
+	applyXAIHTTPResponseContinuityToPrepared(prepared, decision)
+	if gjson.GetBytes(prepared.body, "previous_response_id").Exists() || gjson.GetBytes(prepared.body, "input.0.encrypted_content").Exists() {
+		t.Fatalf("cache read error leaked opaque state: %s", prepared.body)
+	}
+	if got := gjson.GetBytes(prepared.body, "input.0.summary.0.text").String(); got != "keep" {
+		t.Fatalf("summary = %q, want keep; body=%s", got, prepared.body)
+	}
+}
+
+func TestXAIHTTPResponseContinuityStoresOnlyCompletedResponses(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+
+	var requestNumber int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestNumber++
+		w.Header().Set("Content-Type", "text/event-stream")
+		eventType := "response.completed"
+		responseID := "resp_nonstream"
+		if requestNumber == 2 {
+			eventType = "response.incomplete"
+			responseID = "resp_incomplete"
+		} else if requestNumber == 3 {
+			responseID = "resp_stream"
+		}
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: {\"type\":%q,\"response\":{\"id\":%q,\"status\":%q,\"output\":[]}}\n\n", eventType, eventType, responseID, strings.TrimPrefix(eventType, "response."))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+	ctx := testContextWithAPIKey("store-caller")
+	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: []byte(`{"model":"grok-4.5","store":true,"prompt_cache_key":"stored-pck","input":"hello"}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+
+	if _, errExecute := exec.Execute(ctx, auth, req, opts); errExecute != nil {
+		t.Fatalf("Execute completed error = %v", errExecute)
+	}
+	if _, errExecute := exec.Execute(ctx, auth, req, opts); errExecute != nil {
+		t.Fatalf("Execute incomplete error = %v", errExecute)
+	}
+	stream, errStream := exec.ExecuteStream(ctx, auth, req, opts)
+	if errStream != nil {
+		t.Fatalf("ExecuteStream completed error = %v", errStream)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	scope := internalcache.XAIResponseContinuityCallerScope("store-caller", "")
+	kind := xaiHTTPUpstreamKind(server.URL)
+	for _, responseID := range []string{"resp_nonstream", "resp_stream"} {
+		entry, found := internalcache.GetXAIResponseContinuity(scope, "xai", "grok-4.5", responseID)
+		if !found || entry.AuthID != auth.ID || entry.PromptCacheKey != "stored-pck" || entry.UpstreamKind != kind || !entry.OpaqueReusable {
+			t.Fatalf("continuity %s = %+v, found=%v", responseID, entry, found)
+		}
+	}
+	bindingID := internalcache.XAIResponseContinuitySessionBindingID("stored-pck", "")
+	if entry, found := internalcache.GetXAIResponseContinuity(scope, "xai", "grok-4.5", bindingID); !found || entry.AuthID != auth.ID || entry.UpstreamKind != kind {
+		t.Fatalf("session continuity = %+v, found=%v", entry, found)
+	}
+	if _, found := internalcache.GetXAIResponseContinuity(scope, "xai", "grok-4.5", "resp_incomplete"); found {
+		t.Fatal("incomplete response must not create continuity state")
+	}
+}
+
+func TestXAIHTTPUpstreamKindIncludesCustomRawQuery(t *testing.T) {
+	kindA := xaiHTTPUpstreamKind("https://gateway.example.test/v1?tenant=a")
+	kindB := xaiHTTPUpstreamKind("https://gateway.example.test/v1?tenant=b")
+	if kindA == kindB {
+		t.Fatalf("query-only custom targets share kind %q", kindA)
+	}
+	if got := xaiHTTPUpstreamKind("HTTPS://GATEWAY.EXAMPLE.TEST/v1/?tenant=a#fragment"); got != kindA {
+		t.Fatalf("normalized custom kind = %q, want %q", got, kindA)
+	}
+}
+
+func TestXAIHTTPResponseDoneNormalizesWithoutCachingContinuityOrReplay(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	internalcache.ClearXAIReasoningReplayCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
+
+	encrypted := testValidGrokEncryptedContentForSeed(79)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestNumber := requests.Add(1)
+		responseID := "resp_done_nonstream"
+		if requestNumber == 2 {
+			responseID = "resp_done_stream"
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: response.done\ndata: {\"type\":\"response.done\",\"response\":{\"id\":%q,\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":%q}]}}\n\n", responseID, encrypted)
+	}))
+	defer server.Close()
+
+	ctx := testContextWithAPIKey("done-caller")
+	auth := &cliproxyauth.Auth{ID: "auth-done", Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: []byte(`{"model":"grok-4.5","store":true,"prompt_cache_key":"done-pck","input":"hello"}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse}
+	if _, errExecute := NewXAIExecutor(&config.Config{}).Execute(ctx, auth, req, opts); errExecute != nil {
+		t.Fatalf("Execute response.done error = %v", errExecute)
+	}
+	stream, errStream := NewXAIExecutor(&config.Config{}).ExecuteStream(ctx, auth, req, opts)
+	if errStream != nil {
+		t.Fatalf("ExecuteStream response.done error = %v", errStream)
+	}
+	var chunks [][]byte
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		chunks = append(chunks, chunk.Payload)
+	}
+	streamOutput := bytes.Join(chunks, []byte("\n"))
+	if bytes.Contains(streamOutput, []byte("response.done")) || !bytes.Contains(streamOutput, []byte("response.completed")) {
+		t.Fatalf("stream response.done was not normalized: %s", streamOutput)
+	}
+
+	callerScope := internalcache.XAIResponseContinuityCallerScope("done-caller", "")
+	for _, cacheID := range []string{
+		"resp_done_nonstream",
+		"resp_done_stream",
+		internalcache.XAIResponseContinuitySessionBindingID("done-pck", ""),
+	} {
+		if _, found := internalcache.GetXAIResponseContinuity(callerScope, "xai", "grok-4.5", cacheID); found {
+			t.Fatalf("response.done wrote continuity entry %q", cacheID)
+		}
+	}
+	replayOpts := xaiOptionsWithSelectedAuth(opts, auth)
+	replayScope := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, replayOpts, req.Payload)
+	if _, found := internalcache.GetXAIReasoningReplayItems(replayScope.modelName, replayScope.sessionKey); found {
+		t.Fatal("response.done wrote reasoning replay state")
+	}
+}
+
+func TestXAIHTTPResponseContinuityExecuteStreamReusesOpaqueID(t *testing.T) {
+	internalcache.ClearXAIResponseContinuityCache()
+	t.Cleanup(internalcache.ClearXAIResponseContinuityCache)
+
+	bodyCh := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read body: %v", errRead)
+		}
+		bodyCh <- upstreamBody
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_next\",\"status\":\"completed\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	auth := &cliproxyauth.Auth{ID: "auth-stream", Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "token"}}
+	ctx := testContextWithAPIKey("stream-caller")
+	scope := internalcache.XAIResponseContinuityCallerScope("stream-caller", "")
+	if !internalcache.StoreXAIResponseContinuity(context.Background(), scope, "xai", "grok-4.5", "resp_previous", internalcache.XAIResponseContinuity{
+		AuthID:         auth.ID,
+		PromptCacheKey: "stream-pck",
+		UpstreamKind:   xaiHTTPUpstreamKind(server.URL),
+		OpaqueReusable: true,
+	}) {
+		t.Fatal("failed to seed stream continuity")
+	}
+	encrypted := testValidGrokEncryptedContentForSeed(74)
+	payload := []byte(`{"model":"grok-4.5","store":true,"previous_response_id":"resp_previous","instructions":"drop me","input":[{"type":"reasoning","summary":[],"encrypted_content":""},{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "input.0.encrypted_content", encrypted)
+	result, errStream := NewXAIExecutor(&config.Config{}).ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	upstreamBody := <-bodyCh
+	if got := gjson.GetBytes(upstreamBody, "previous_response_id").String(); got != "resp_previous" {
+		t.Fatalf("previous_response_id = %q, want resp_previous; body=%s", got, upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "prompt_cache_key").String(); got != "stream-pck" {
+		t.Fatalf("prompt_cache_key = %q, want stream-pck; body=%s", got, upstreamBody)
+	}
+	if gjson.GetBytes(upstreamBody, "instructions").Exists() {
+		t.Fatalf("instructions must be removed with opaque previous_response_id: %s", upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "input.0.encrypted_content").String(); got != encrypted {
+		t.Fatalf("encrypted_content = %q, want preserved same-auth value; body=%s", got, upstreamBody)
+	}
+}
+
+func TestXAIReasoningReplayIsolatedBySelectedAuth(t *testing.T) {
+	internalcache.ClearXAIReasoningReplayCache()
+	t.Cleanup(internalcache.ClearXAIReasoningReplayCache)
+
+	ctx := context.Background()
+	payload := []byte(`{"model":"grok-4.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}
+	baseOpts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "trusted-session",
+		},
+	}
+	optsA := xaiOptionsWithSelectedAuth(baseOpts, &cliproxyauth.Auth{ID: "auth-a"})
+	optsB := xaiOptionsWithSelectedAuth(baseOpts, &cliproxyauth.Auth{ID: "auth-b"})
+	scopeA := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, optsA, payload)
+	scopeB := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, optsB, payload)
+	if !scopeA.valid() || !scopeB.valid() || scopeA.sessionKey == scopeB.sessionKey {
+		t.Fatalf("auth scopes not isolated: A=%+v B=%+v", scopeA, scopeB)
+	}
+	reasoning := []byte(`{"type":"reasoning","summary":[],"encrypted_content":""}`)
+	reasoning, _ = sjson.SetBytes(reasoning, "encrypted_content", testValidGrokEncryptedContentForSeed(73))
+	if !internalcache.CacheXAIReasoningReplayItems(scopeA.modelName, scopeA.sessionKey, [][]byte{reasoning}) {
+		t.Fatal("failed to seed auth A reasoning replay")
+	}
+
+	bodyA, _, errA := applyXAIReasoningReplayCacheRequired(ctx, sdktranslator.FormatOpenAIResponse, req, optsA, payload)
+	if errA != nil || len(gjson.GetBytes(bodyA, "input").Array()) != 2 {
+		t.Fatalf("same auth replay failed: err=%v body=%s", errA, bodyA)
+	}
+	bodyB, _, errB := applyXAIReasoningReplayCacheRequired(ctx, sdktranslator.FormatOpenAIResponse, req, optsB, payload)
+	if errB != nil || len(gjson.GetBytes(bodyB, "input").Array()) != 1 {
+		t.Fatalf("auth B received auth A replay: err=%v body=%s", errB, bodyB)
+	}
+	missingAuthScope := xaiReasoningReplayScopeFromRequest(ctx, sdktranslator.FormatOpenAIResponse, req, baseOpts, payload)
+	if missingAuthScope.valid() {
+		t.Fatalf("missing selected auth must fail closed: %+v", missingAuthScope)
+	}
+}
+
+func TestXAIExecutorCountTokensInjectsSelectedAuthProvenance(t *testing.T) {
+	previousGetter := getXAIReasoningReplayItemsRequired
+	calledSessionKey := ""
+	getXAIReasoningReplayItemsRequired = func(_ context.Context, _ string, sessionKey string) ([][]byte, bool, error) {
+		calledSessionKey = sessionKey
+		return nil, false, nil
+	}
+	t.Cleanup(func() { getXAIReasoningReplayItemsRequired = previousGetter })
+
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "count-session",
+		},
+	}
+	_, errCount := NewXAIExecutor(&config.Config{}).CountTokens(context.Background(), &cliproxyauth.Auth{ID: "auth-count"}, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":"hello"}`),
+	}, opts)
+	if errCount != nil {
+		t.Fatalf("CountTokens() error = %v", errCount)
+	}
+	if !strings.HasPrefix(calledSessionKey, "auth:") || !strings.HasSuffix(calledSessionKey, ":execution:count-session") {
+		t.Fatalf("replay session key = %q, want selected-auth provenance", calledSessionKey)
+	}
+	if _, mutated := opts.Metadata[cliproxyexecutor.SelectedAuthMetadataKey]; mutated {
+		t.Fatal("CountTokens mutated caller-owned options metadata")
 	}
 }
 

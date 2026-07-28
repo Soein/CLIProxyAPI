@@ -1,12 +1,91 @@
 package auth
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestManagerRegisterRejectsUntrustedPostgresStoreGenerationMetadata(t *testing.T) {
+	auth := &Auth{
+		ID:       "watcher-round-trip.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":                                 "codex",
+			"__cliproxy_internal_postgres_version": float64(9),
+		},
+	}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register() error: %v", err)
+	}
+
+	got, ok := manager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%q) found = false", auth.ID)
+	}
+	if got.StoreGeneration() != 0 {
+		t.Fatalf("StoreGeneration() = %d, want untrusted metadata to be ignored", got.StoreGeneration())
+	}
+	if _, leaked := got.Metadata["__cliproxy_internal_postgres_version"]; leaked {
+		t.Fatal("postgres mirror generation leaked into Metadata")
+	}
+	if _, leaked := got.Attributes["__cliproxy_internal_postgres_version"]; leaked {
+		t.Fatal("postgres mirror generation leaked into Attributes")
+	}
+	raw, errMarshal := json.Marshal(got)
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal() error: %v", errMarshal)
+	}
+	if strings.Contains(string(raw), "postgres_version") {
+		t.Fatalf("private generation leaked into JSON: %s", raw)
+	}
+	if clone := got.Clone(); clone.StoreGeneration() != 0 {
+		t.Fatalf("Clone().StoreGeneration() = %d, want 0", clone.StoreGeneration())
+	}
+}
+
+func TestManagerUpdateRejectsStaleActiveWatcherGeneration(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	current := &Auth{
+		ID:       "stale-active.json",
+		Provider: "codex",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Metadata: map[string]any{"type": "codex", "disabled": true},
+	}
+	current.SetStoreGeneration(10)
+	if _, err := manager.Register(WithSkipPersist(context.Background()), current); err != nil {
+		t.Fatalf("Register() error: %v", err)
+	}
+
+	stale := current.Clone()
+	stale.Disabled = false
+	stale.Status = StatusActive
+	stale.Metadata["disabled"] = false
+	stale.SetStoreGeneration(9)
+	if _, err := manager.Update(WithSkipPersist(context.Background()), stale); err != nil {
+		t.Fatalf("Update(stale generation) error: %v", err)
+	}
+	got, _ := manager.GetByID(current.ID)
+	if !got.Disabled || got.Status != StatusDisabled || got.StoreGeneration() != 10 {
+		t.Fatalf("runtime auth after stale active watcher update = %#v, generation %d", got, got.StoreGeneration())
+	}
+
+	unknown := stale.Clone()
+	unknown.SetStoreGeneration(0)
+	if _, err := manager.Update(WithSkipPersist(context.Background()), unknown); err != nil {
+		t.Fatalf("Update(without generation) error: %v", err)
+	}
+	got, _ = manager.GetByID(current.ID)
+	if !got.Disabled || got.Status != StatusDisabled || got.StoreGeneration() != 10 {
+		t.Fatalf("runtime auth after unversioned active watcher update = %#v, generation %d", got, got.StoreGeneration())
+	}
+}
 
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth

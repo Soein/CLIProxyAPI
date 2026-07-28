@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -17,6 +18,26 @@ import (
 
 type memoryAuthStorage struct {
 	payload []byte
+}
+
+type pathLockingAuthStore struct {
+	path  string
+	saved bool
+}
+
+func (s *pathLockingAuthStore) List(context.Context) ([]*coreauth.Auth, error) {
+	return nil, nil
+}
+
+func (s *pathLockingAuthStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	releaseFile := authfilelock.Lock(s.path)
+	releaseFile()
+	s.saved = true
+	return s.path, nil
+}
+
+func (s *pathLockingAuthStore) Delete(context.Context, string) error {
+	return nil
 }
 
 func (s *memoryAuthStorage) RawJSON() []byte {
@@ -245,5 +266,70 @@ func TestHostAuthSaveCallbackWritesPhysicalFile(t *testing.T) {
 	auths := host.currentAuthManager().List()
 	if len(auths) != 1 || auths[0].FileName != "saved.json" {
 		t.Fatalf("auths = %#v, want one registered auth", auths)
+	}
+}
+
+func TestHostAuthSaveReleasesPathLockBeforeManagerPersistence(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "saved.json")
+	store := &pathLockingAuthStore{path: path}
+	host := New()
+	host.runtimeConfig = &config.Config{AuthDir: authDir}
+	host.SetAuthManager(coreauth.NewManager(store, nil, nil))
+
+	done := make(chan error, 1)
+	go func() {
+		_, errSave := host.saveAuthFile(context.Background(), "saved.json", []byte(`{"type":"demo","api_key":"saved-key"}`))
+		done <- errSave
+	}()
+
+	select {
+	case errSave := <-done:
+		if errSave != nil {
+			t.Fatalf("saveAuthFile() error = %v", errSave)
+		}
+		if !store.saved {
+			t.Fatal("saveAuthFile() did not enter manager persistence")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("saveAuthFile() blocked while manager persistence reacquired the auth file path lock")
+	}
+}
+
+func TestHostAuthSaveHonorsSharedPathLock(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "saved.json")
+	host := New()
+	host.runtimeConfig = &config.Config{AuthDir: authDir}
+
+	releaseFile := authfilelock.Lock(path)
+	done := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, errSave := host.saveAuthFile(context.Background(), "saved.json", []byte(`{"type":"demo","api_key":"saved-key"}`))
+		done <- errSave
+	}()
+	<-started
+
+	select {
+	case errSave := <-done:
+		releaseFile()
+		t.Fatalf("saveAuthFile() completed before the shared path lock was released: %v", errSave)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+		releaseFile()
+		t.Fatalf("auth file was written while the shared path lock was held: %v", errStat)
+	}
+
+	releaseFile()
+	select {
+	case errSave := <-done:
+		if errSave != nil {
+			t.Fatalf("saveAuthFile() error = %v", errSave)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("saveAuthFile() remained blocked after the shared path lock was released")
 	}
 }

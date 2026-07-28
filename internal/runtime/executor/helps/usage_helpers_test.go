@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -516,6 +518,129 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 		t.Fatalf("ttft = %v, want >= %v", got, delay)
 	}
 }
+
+func TestExecutorUsageReporterPhaseMarksAreFirstWins(t *testing.T) {
+	ctx := usage.EnablePhases(context.Background())
+	selection := usage.BeginAuthSelection(ctx)
+	usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeFallbackHit))
+	selection.Complete()
+	reporter := NewExecutorUsageReporter(ctx, &TestUsageExecutor{}, "gpt-5.4", nil)
+
+	reporter.phaseMu.Lock()
+	reporter.phaseStart = time.Now().Add(-time.Second)
+	reporter.phaseMu.Unlock()
+	reporter.MarkResponseHeaders()
+	reporter.MarkFirstEvent()
+	reporter.MarkFirstSemanticToken()
+	reporter.MarkTerminal("completed")
+	reporter.MarkTransportReused(true)
+	first := reporter.phaseSnapshot()
+
+	reporter.phaseMu.Lock()
+	reporter.phaseStart = time.Now().Add(-2 * time.Second)
+	reporter.phaseMu.Unlock()
+	reporter.MarkResponseHeaders()
+	reporter.MarkFirstEvent()
+	reporter.MarkFirstSemanticToken()
+	reporter.MarkTerminal("failed")
+	reporter.MarkTransportReused(false)
+	second := reporter.phaseSnapshot()
+
+	if first == nil || second == nil {
+		t.Fatal("phase snapshot = nil")
+	}
+	if *first != *second {
+		t.Fatalf("phase marks changed after first observation: first=%+v second=%+v", first, second)
+	}
+	if second.Attempt != 1 || second.AffinityOutcome != usage.AffinityOutcomeFallbackHit {
+		t.Fatalf("phase seed = %+v", second)
+	}
+	if !second.ResponseHeadersObserved || !second.TransportReused || second.TerminalKind != "completed" {
+		t.Fatalf("phase marks = %+v", second)
+	}
+}
+
+func TestExecutorUsageReporterPhaseMarksConcurrent(t *testing.T) {
+	reporter := NewExecutorUsageReporter(usage.EnablePhases(context.Background()), &TestUsageExecutor{}, "gpt-5.4", nil)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reporter.MarkResponseHeaders()
+			reporter.MarkFirstEvent()
+			reporter.MarkFirstSemanticToken()
+			reporter.MarkTerminal("completed")
+			reporter.MarkTransportReused(true)
+			_ = reporter.buildRecord(usage.Detail{}, false)
+		}()
+	}
+	wg.Wait()
+	phases := reporter.phaseSnapshot()
+	if phases == nil || !phases.ResponseHeadersObserved || phases.TerminalKind != "completed" {
+		t.Fatalf("phases = %+v", phases)
+	}
+}
+
+func TestUsageReporterWithoutTrackerOmitsPhases(t *testing.T) {
+	reporter := NewExecutorUsageReporter(context.Background(), &TestUsageExecutor{}, "gpt-5.4", nil)
+	if phases := reporter.buildRecord(usage.Detail{}, false).Phases; phases != nil {
+		t.Fatalf("phases = %+v, want nil", phases)
+	}
+}
+
+func TestUsageReporterTrackHTTPClientMarksHeadersWithoutChangingTTFT(t *testing.T) {
+	const bodyDelay = 30 * time.Millisecond
+	reporter := NewExecutorUsageReporter(usage.EnablePhases(context.Background()), &TestUsageExecutor{}, "gpt-5.4", nil)
+	client := reporter.TrackHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.GotConn != nil {
+				trace.GotConn(httptrace.GotConnInfo{Reused: true})
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       &delayedReadCloser{delay: bodyDelay, reader: strings.NewReader("ok")},
+				Request:    req,
+			}, nil
+		}),
+	})
+	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.invalid", nil)
+	if errNewRequest != nil {
+		t.Fatal(errNewRequest)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatal(errDo)
+	}
+	beforeRead := reporter.buildRecord(usage.Detail{}, false)
+	if beforeRead.TTFT != 0 {
+		t.Fatalf("TTFT before body read = %v, want zero", beforeRead.TTFT)
+	}
+	if beforeRead.Phases == nil || !beforeRead.Phases.ResponseHeadersObserved || !beforeRead.Phases.TransportReused {
+		t.Fatalf("phases before body read = %+v", beforeRead.Phases)
+	}
+	if _, errRead := io.ReadAll(resp.Body); errRead != nil {
+		t.Fatal(errRead)
+	}
+	if got := reporter.ttftDuration(); got < bodyDelay {
+		t.Fatalf("TTFT after body read = %v, want >= %v", got, bodyDelay)
+	}
+}
+
+type delayedReadCloser struct {
+	delay  time.Duration
+	reader io.Reader
+	once   sync.Once
+}
+
+func (r *delayedReadCloser) Read(p []byte) (int, error) {
+	r.once.Do(func() { time.Sleep(r.delay) })
+	return r.reader.Read(p)
+}
+
+func (r *delayedReadCloser) Close() error { return nil }
 
 func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	ctx := usage.WithRequestedModelAlias(context.Background(), "client-gpt")

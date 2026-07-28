@@ -4,7 +4,7 @@
 //
 //   - LeaderElector: pg_try_advisory_lock(1, 1) keeps one process holding a
 //     server-side lock so singleton background loops (auto refresh, usage
-//     automations, model updater) run on exactly one replica. Heartbeat rows
+//     cleanup, model updater) run on exactly one replica. Heartbeat rows
 //     are written to cluster_nodes for operator visibility.
 //
 //   - PgAuthRefreshLocker: pg_try_advisory_lock(2, hash32(authID)) serializes

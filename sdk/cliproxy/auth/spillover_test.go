@@ -40,7 +40,7 @@ func newManagerForSpilloverTest(auths ...*Auth) (*Manager, *trackingSelector) {
 	sel := &trackingSelector{}
 	m := NewManager(nil, sel, nil)
 	m.scheduler = newAuthScheduler(sel)
-	m.scheduler.rebuild(auths)
+	m.scheduler.rebuild(auths, 0)
 	m.mu.Lock()
 	for _, a := range auths {
 		if a == nil {

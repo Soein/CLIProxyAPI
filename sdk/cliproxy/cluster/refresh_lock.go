@@ -3,8 +3,10 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"hash/fnv"
+	"sync"
 	"time"
 )
 
@@ -40,7 +42,7 @@ func NewPgAuthRefreshLocker(db *sql.DB) *PgAuthRefreshLocker {
 //
 //	ok == true  -> caller holds the lock, MUST call release()
 //	ok == false -> another node holds it, caller should skip this round
-//	err != nil  -> db error; caller should log and proceed without lock
+//	err != nil  -> lock outcome is unavailable; caller must fail closed
 //
 // A nil receiver or zero-value locker returns ErrNilDB rather than silently
 // succeeding — callers that legitimately want single-instance semantics
@@ -58,23 +60,40 @@ func (p *PgAuthRefreshLocker) TryLock(ctx context.Context, authID string) (func(
 	if err := conn.QueryRowContext(ctx,
 		"SELECT pg_try_advisory_lock($1, $2)", classKey, idKey,
 	).Scan(&got); err != nil {
-		_ = conn.Close()
+		discardSessionLockConn(conn)
 		return nil, false, err
 	}
 	if !got {
 		_ = conn.Close()
 		return nil, false, nil
 	}
+	var releaseOnce sync.Once
 	release := func() {
-		// Use a bounded background context so we release even if the caller's
-		// ctx is cancelled, but don't hang forever if PG is unresponsive.
-		rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
-		defer cancel()
-		_, _ = conn.ExecContext(rctx,
-			"SELECT pg_advisory_unlock($1, $2)", classKey, idKey)
-		_ = conn.Close()
+		releaseOnce.Do(func() {
+			// Use a bounded background context so we release even if the caller's
+			// ctx is cancelled, but don't hang forever if PG is unresponsive.
+			rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+			defer cancel()
+			var unlocked bool
+			errUnlock := conn.QueryRowContext(rctx,
+				"SELECT pg_advisory_unlock($1, $2)", classKey, idKey,
+			).Scan(&unlocked)
+			if errUnlock != nil || !unlocked {
+				discardSessionLockConn(conn)
+				return
+			}
+			_ = conn.Close()
+		})
 	}
 	return release, true, nil
+}
+
+func discardSessionLockConn(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
 }
 
 // authIDLockKeys returns the (int4, int4) pair used as the advisory lock key

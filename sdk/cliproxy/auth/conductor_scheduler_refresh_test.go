@@ -45,6 +45,43 @@ func (e unauthorizedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth
 	return nil, errors.New("token refresh failed with status 401: invalid_grant")
 }
 
+type failingAuthRefreshLocker struct {
+	err error
+}
+
+func (l failingAuthRefreshLocker) TryLock(context.Context, string) (func(), bool, error) {
+	return nil, false, l.err
+}
+
+type countingRefreshExecutor struct {
+	schedulerProviderTestExecutor
+	refreshCalls int
+}
+
+func (e *countingRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	e.refreshCalls++
+	return auth, nil
+}
+
+func TestManager_RefreshAuthLockerErrorFailsClosed(t *testing.T) {
+	lockErr := errors.New("refresh lock backend unavailable")
+	executor := &countingRefreshExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"}}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetAuthRefreshLocker(failingAuthRefreshLocker{err: lockErr})
+	auth := &Auth{ID: "locked-refresh", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() error: %v", errRegister)
+	}
+
+	if _, errRefresh := manager.refreshAuthForRequest(context.Background(), auth.ID, ""); !errors.Is(errRefresh, lockErr) {
+		t.Fatalf("refreshAuthForRequest() error = %v, want lock error", errRefresh)
+	}
+	if executor.refreshCalls != 0 {
+		t.Fatalf("Refresh() calls = %d, want 0 when cluster lock state is unknown", executor.refreshCalls)
+	}
+}
+
 func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)

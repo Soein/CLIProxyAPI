@@ -46,9 +46,12 @@ type Record struct {
 	RequestedAt time.Time
 	Latency     time.Duration
 	TTFT        time.Duration
-	Failed      bool
-	Fail        Failure
-	Detail      Detail
+	// Phases contains optional per-attempt timing details. Nil preserves the
+	// legacy record shape for providers that do not enable phase tracking.
+	Phases *PhaseTimings
+	Failed bool
+	Fail   Failure
+	Detail Detail
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
 	ResponseHeaders http.Header
 }

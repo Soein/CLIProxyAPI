@@ -49,6 +49,11 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 	if !ok {
 		return nil, "", fmt.Errorf("cliproxy auth: authenticator %s not registered", provider)
 	}
+	var errFence error
+	ctx, errFence = coreauth.BeginExplicitAuthOperation(ctx, m.store)
+	if errFence != nil {
+		return nil, "", errFence
+	}
 
 	record, err := auth.Login(ctx, cfg, opts)
 	if err != nil {
@@ -68,7 +73,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		}
 	}
 
-	savedPath, err := m.store.Save(ctx, record)
+	savedPath, err := coreauth.PersistExplicitAuth(ctx, m.store, record)
 	if err != nil {
 		return record, "", err
 	}

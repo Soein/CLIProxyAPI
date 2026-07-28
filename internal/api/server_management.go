@@ -76,22 +76,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 		mgmt.POST("/reset-quota", s.mgmt.ResetQuota)
 
-		mgmt.GET("/codex-weekly-automation/enabled", s.mgmt.GetCodexWeeklyAutomationEnabled)
-		mgmt.PUT("/codex-weekly-automation/enabled", s.mgmt.PutCodexWeeklyAutomationEnabled)
-		mgmt.PATCH("/codex-weekly-automation/enabled", s.mgmt.PutCodexWeeklyAutomationEnabled)
-		mgmt.GET("/codex-weekly-automation/interval-seconds", s.mgmt.GetCodexWeeklyAutomationIntervalSeconds)
-		mgmt.PUT("/codex-weekly-automation/interval-seconds", s.mgmt.PutCodexWeeklyAutomationIntervalSeconds)
-		mgmt.PATCH("/codex-weekly-automation/interval-seconds", s.mgmt.PutCodexWeeklyAutomationIntervalSeconds)
-		mgmt.GET("/codex-weekly-automation/status", s.mgmt.GetCodexWeeklyAutomationStatus)
-
-		mgmt.GET("/codex-hourly-automation/enabled", s.mgmt.GetCodexHourlyAutomationEnabled)
-		mgmt.PUT("/codex-hourly-automation/enabled", s.mgmt.PutCodexHourlyAutomationEnabled)
-		mgmt.PATCH("/codex-hourly-automation/enabled", s.mgmt.PutCodexHourlyAutomationEnabled)
-		mgmt.GET("/codex-hourly-automation/interval-seconds", s.mgmt.GetCodexHourlyAutomationIntervalSeconds)
-		mgmt.PUT("/codex-hourly-automation/interval-seconds", s.mgmt.PutCodexHourlyAutomationIntervalSeconds)
-		mgmt.PATCH("/codex-hourly-automation/interval-seconds", s.mgmt.PutCodexHourlyAutomationIntervalSeconds)
-		mgmt.GET("/codex-hourly-automation/status", s.mgmt.GetCodexHourlyAutomationStatus)
-
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)

@@ -933,11 +933,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		if !ok {
 			continue
 		}
-		candidates = append(candidates, creditsCandidateEntry{
-			auth:     auth.Clone(),
-			executor: executor,
-			provider: providerKey,
-		})
+		candidates = append(candidates, creditsCandidateEntry{auth: auth.Clone(), executor: executor, provider: providerKey})
 	}
 	m.mu.RUnlock()
 
@@ -957,12 +953,8 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		}
 		unknown = append(unknown, candidate)
 	}
-	sort.Slice(known, func(i, j int) bool {
-		return known[i].auth.ID < known[j].auth.ID
-	})
-	sort.Slice(unknown, func(i, j int) bool {
-		return unknown[i].auth.ID < unknown[j].auth.ID
-	})
+	sort.Slice(known, func(i, j int) bool { return known[i].auth.ID < known[j].auth.ID })
+	sort.Slice(unknown, func(i, j int) bool { return unknown[i].auth.ID < unknown[j].auth.ID })
 	return append(known, unknown...), nil
 }
 
@@ -982,7 +974,7 @@ func hasAntigravityProvider(providers []string) bool {
 }
 
 func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, providers []string) bool {
-	if isRequestTerminatedError(lastErr) {
+	if errors.Is(lastErr, ErrDispatchAdmissionRejected) || isRequestTerminatedError(lastErr) {
 		return false
 	}
 	status := statusCodeFromError(lastErr)
@@ -1041,6 +1033,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		creditsCtx = contextWithRequestedModelAlias(creditsCtx, creditsOpts, routeModel)
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
+			if errors.Is(errPrepare, ErrDispatchAdmissionRejected) {
+				return cliproxyexecutor.Response{}, false, errPrepare
+			}
 			continue
 		}
 		c.auth = preparedAuth
@@ -1053,7 +1048,10 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
+			resp, errExec := m.executeWithDispatchAdmission(creditsCtx, c.executor, c.auth, execReq, creditsOpts)
+			if errors.Is(errExec, ErrDispatchAdmissionRejected) {
+				return cliproxyexecutor.Response{}, false, errExec
+			}
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
@@ -1095,6 +1093,9 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
 		preparedAuth, errPrepare := m.prepareRequestAuth(creditsCtx, c.executor, c.auth)
 		if errPrepare != nil {
+			if errors.Is(errPrepare, ErrDispatchAdmissionRejected) {
+				return nil, false, errPrepare
+			}
 			continue
 		}
 		c.auth = preparedAuth
@@ -1103,8 +1104,11 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, true, false)
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, true, false, nil)
 		if errStream != nil {
+			if errors.Is(errStream, ErrDispatchAdmissionRejected) {
+				return nil, false, errStream
+			}
 			continue
 		}
 		return result, true, nil

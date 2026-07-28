@@ -17,6 +17,7 @@ import (
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -362,6 +363,16 @@ func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Con
 	if strings.TrimSpace(accessToken) == "" {
 		return
 	}
+	dispatchRelease, admitted := cliproxyexecutor.AdmitDispatch(ctx, authID)
+	if !admitted {
+		return
+	}
+	dispatchOwned := true
+	defer func() {
+		if dispatchOwned {
+			dispatchRelease()
+		}
+	}()
 
 	if client, homeMode, errClient := currentAntigravityKVClient(); homeMode {
 		if errClient != nil {
@@ -376,18 +387,15 @@ func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Con
 		if !written {
 			return
 		}
-		refreshCtx := context.Background()
-		if ctx != nil {
-			if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-				refreshCtx = context.WithValue(refreshCtx, "cliproxy.roundtripper", rt)
-			}
-		}
+		refreshCtx := detachedAntigravityContext(ctx)
 		refreshCtx, cancel := context.WithTimeout(refreshCtx, antigravityCreditsHintRefreshTimeout)
 		authCopy := auth.Clone()
-		go func(auth *cliproxyauth.Auth, token string) {
+		dispatchOwned = false
+		go func(auth *cliproxyauth.Auth, token string, release func()) {
+			defer release()
 			defer cancel()
 			e.updateAntigravityCreditsBalance(refreshCtx, auth, token)
-		}(authCopy, accessToken)
+		}(authCopy, accessToken, dispatchRelease)
 		return
 	}
 
@@ -411,20 +419,24 @@ func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Con
 	}
 	state.lastAttempt = now
 
-	refreshCtx := context.Background()
-	if ctx != nil {
-		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-			refreshCtx = context.WithValue(refreshCtx, "cliproxy.roundtripper", rt)
-		}
-	}
+	refreshCtx := detachedAntigravityContext(ctx)
 	refreshCtx, cancel := context.WithTimeout(refreshCtx, antigravityCreditsHintRefreshTimeout)
 	authCopy := auth.Clone()
 
-	go func(state *antigravityCreditsHintRefreshState, auth *cliproxyauth.Auth, token string) {
+	dispatchOwned = false
+	go func(state *antigravityCreditsHintRefreshState, auth *cliproxyauth.Auth, token string, release func()) {
+		defer release()
 		defer cancel()
 		defer state.mu.Unlock()
 		e.updateAntigravityCreditsBalance(refreshCtx, auth, token)
-	}(state, authCopy, accessToken)
+	}(state, authCopy, accessToken, dispatchRelease)
+}
+
+func detachedAntigravityContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
 }
 
 func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) {

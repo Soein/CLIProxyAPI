@@ -28,6 +28,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	if shouldEnableXAIResponsePhases(normalized, opts) {
+		ctx = coreusage.EnablePhases(ctx)
+	}
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, false)
 	}
@@ -116,6 +119,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	if shouldEnableXAIResponsePhases(normalized, opts) {
+		ctx = coreusage.EnablePhases(ctx)
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
@@ -310,6 +316,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errors.Is(errPrepare, ErrDispatchAdmissionRejected) {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -330,15 +339,25 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if errIntercept != nil {
 				return cliproxyexecutor.Response{}, errIntercept
 			}
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.executeWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
+			if errors.Is(errExec, ErrDispatchAdmissionRejected) {
+				return cliproxyexecutor.Response{}, errExec
+			}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+				refreshed, okRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
+				if errRefresh != nil {
+					return cliproxyexecutor.Response{}, errRefresh
+				}
+				if okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+					resp, errExec = m.executeWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
+					if errors.Is(errExec, ErrDispatchAdmissionRejected) {
+						return cliproxyexecutor.Response{}, errExec
+					}
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
@@ -427,6 +446,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errors.Is(errPrepare, ErrDispatchAdmissionRejected) {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -447,15 +469,25 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if errIntercept != nil {
 				return cliproxyexecutor.Response{}, errIntercept
 			}
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.countTokensWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
+			if errors.Is(errExec, ErrDispatchAdmissionRejected) {
+				return cliproxyexecutor.Response{}, errExec
+			}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+				refreshed, okRefresh, errRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized)
+				if errRefresh != nil {
+					return cliproxyexecutor.Response{}, errRefresh
+				}
+				if okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
+					resp, errExec = m.countTokensWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
+					if errors.Is(errExec, ErrDispatchAdmissionRejected) {
+						return cliproxyexecutor.Response{}, errExec
+					}
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
@@ -530,6 +562,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		var auth *Auth
 		var executor ProviderExecutor
 		var provider string
+		var lease *authLease
 		var errPick error
 		if homeMode {
 			selection, errPick = m.pickHomeDispatchSelection(ctx, routeModel, pickOpts)
@@ -539,7 +572,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				provider = selection.Provider
 			}
 		} else {
-			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+			auth, executor, provider, lease, errPick = m.pickNextMixedForExecution(ctx, providers, routeModel, pickOpts, req.Payload, tried)
 		}
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
@@ -589,6 +622,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "no_execution_models"); errEnd != nil {
 					return nil, errEnd
 				}
+			} else {
+				lease.Release()
 			}
 			continue
 		}
@@ -600,12 +635,21 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		}
 		if errPrepare != nil {
+			if errors.Is(errPrepare, ErrDispatchAdmissionRejected) {
+				if selection != nil {
+					releaseAttempt()
+				} else {
+					lease.Release()
+				}
+				return nil, errPrepare
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			if selection != nil {
 				m.reportHomeResult(execCtx, result, auth)
 				releaseAttempt()
 			} else {
 				m.MarkResult(execCtx, result)
+				lease.Release()
 			}
 			lastErr = errPrepare
 			if selection != nil {
@@ -628,13 +672,16 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, !homeMode, selection != nil)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, !homeMode, selection != nil, lease)
 		if errStream != nil {
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "stream_start_failed"); errEnd != nil {
 					return nil, errEnd
 				}
+			}
+			if errors.Is(errStream, ErrDispatchAdmissionRejected) {
+				return nil, errStream
 			}
 			if errCtx := execCtx.Err(); errCtx != nil && ctx != nil && ctx.Err() != nil {
 				return nil, errCtx
@@ -823,13 +870,13 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 
 	id := strings.TrimSpace(auth.ID)
 	if id == "" {
-		return preparer.PrepareRequestAuth(ctx, auth.Clone())
+		return m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, auth.Clone())
 	}
 
 	lockValue, _ := m.requestPrepareLocks.LoadOrStore(id, &requestAuthPrepareLock{})
 	lock, ok := lockValue.(*requestAuthPrepareLock)
 	if !ok || lock == nil {
-		return preparer.PrepareRequestAuth(ctx, auth.Clone())
+		return m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, auth.Clone())
 	}
 
 	lock.mu.Lock()
@@ -846,7 +893,7 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return target, nil
 	}
 
-	updated, errPrepare := preparer.PrepareRequestAuth(ctx, target)
+	updated, errPrepare := m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, target)
 	if errPrepare != nil {
 		return auth, errPrepare
 	}
@@ -1246,5 +1293,5 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	if exec == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
-	return exec.HttpRequest(ctx, auth, req)
+	return m.httpRequestWithDispatchAdmission(ctx, exec, auth, req)
 }

@@ -3,14 +3,17 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -36,6 +39,22 @@ type xaiPreparedRequest struct {
 	replayScope           xaiReasoningReplayScope
 	filterInternalXSearch bool
 }
+
+type xaiHTTPResponseContinuity struct {
+	enabled          bool
+	callerScope      string
+	authID           string
+	upstreamKind     string
+	previousID       string
+	sessionBindingID string
+	opaqueAllowed    bool
+	scrubOpaque      bool
+}
+
+var (
+	getXAIResponseContinuityRequired = internalcache.GetXAIResponseContinuityRequired
+	storeXAIResponseContinuity       = internalcache.StoreXAIResponseContinuity
+)
 
 type xaiNamespaceToolRef struct {
 	namespace string
@@ -82,6 +101,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if xaiMetadataBool(opts.Metadata, xaiScrubUntrustedInputMetadataKey) {
+		body = xaiStripOpaqueContinuityState(body)
+	}
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -141,6 +163,216 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		replayScope:           replayScope,
 		filterInternalXSearch: xaiRequestHasNativeXSearch(body),
 	}, nil
+}
+
+func xaiOptionsWithSelectedAuth(opts cliproxyexecutor.Options, auth *cliproxyauth.Auth) cliproxyexecutor.Options {
+	selectedAuthID := ""
+	if auth != nil {
+		selectedAuthID = strings.TrimSpace(auth.ID)
+	}
+	if len(opts.Metadata) == 0 && selectedAuthID == "" {
+		return opts
+	}
+	metadata := make(map[string]any, len(opts.Metadata)+1)
+	for key, value := range opts.Metadata {
+		metadata[key] = value
+	}
+	if selectedAuthID == "" {
+		delete(metadata, cliproxyexecutor.SelectedAuthMetadataKey)
+	} else {
+		metadata[cliproxyexecutor.SelectedAuthMetadataKey] = selectedAuthID
+	}
+	opts.Metadata = metadata
+	return opts
+}
+
+func prepareXAIHTTPResponseContinuity(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL string) (cliproxyexecutor.Request, cliproxyexecutor.Options, xaiHTTPResponseContinuity) {
+	decision := xaiHTTPResponseContinuity{}
+	if !sourceFormatEqual(opts.SourceFormat, sdktranslator.FormatOpenAIResponse) || opts.Alt == "responses/compact" {
+		return req, opts, decision
+	}
+	if strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()) == "" {
+		if promptCacheKey := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "prompt_cache_key").String()); promptCacheKey != "" {
+			req.Payload, _ = sjson.SetBytes(req.Payload, "prompt_cache_key", promptCacheKey)
+		}
+	}
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	callerScope := internalcache.XAIResponseContinuityCallerScope(helps.APIKeyFromContext(ctx), xaiTrustedExecutionSessionID(req, opts))
+	decision = xaiHTTPResponseContinuity{
+		enabled: true, callerScope: callerScope, authID: authID,
+		upstreamKind: xaiHTTPUpstreamKind(baseURL), sessionBindingID: xaiHTTPContinuitySessionBindingID(req, opts),
+	}
+	previousID := xaiRequestString(req.Payload, opts.OriginalRequest, "previous_response_id")
+	if previousID == "" {
+		if !xaiInputHasCredentialBoundState(req.Payload) && !xaiInputHasCredentialBoundState(opts.OriginalRequest) {
+			return req, opts, decision
+		}
+		if callerScope == "" || authID == "" || decision.sessionBindingID == "" {
+			return xaiScrubHTTPInputContinuity(req, opts, decision)
+		}
+		entry, found, errGet := getXAIResponseContinuityRequired(ctx, callerScope, "xai", thinking.ParseSuffix(req.Model).ModelName, decision.sessionBindingID)
+		if errGet != nil {
+			log.Warnf("xai response session continuity cache read failed; dropping credential-bound input: %v", errGet)
+		}
+		if errGet != nil || !found || entry.AuthID != authID || entry.UpstreamKind != decision.upstreamKind {
+			return xaiScrubHTTPInputContinuity(req, opts, decision)
+		}
+		return req, opts, decision
+	}
+	entry, found, errGet := getXAIResponseContinuityRequired(ctx, callerScope, "xai", thinking.ParseSuffix(req.Model).ModelName, previousID)
+	if errGet != nil {
+		log.Warnf("xai response continuity cache read failed; dropping opaque state: %v", errGet)
+	}
+	if errGet != nil || !found || callerScope == "" || authID == "" || entry.AuthID != authID || entry.UpstreamKind != decision.upstreamKind {
+		req.Payload = xaiStripOpaqueContinuityState(req.Payload)
+		opts = xaiOptionsWithMetadataBool(opts, xaiSkipReasoningReplayMetadataKey, true)
+		decision.scrubOpaque = true
+		return req, opts, decision
+	}
+	promptCacheKey := xaiRequestString(req.Payload, opts.OriginalRequest, "prompt_cache_key")
+	if promptCacheKey == "" {
+		promptCacheKey = strings.TrimSpace(entry.PromptCacheKey)
+	}
+	if promptCacheKey != "" && strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()) == "" {
+		req.Payload, _ = sjson.SetBytes(req.Payload, "prompt_cache_key", promptCacheKey)
+	}
+	if entry.OpaqueReusable {
+		decision.previousID = previousID
+		decision.opaqueAllowed = true
+		opts = xaiOptionsWithMetadataBool(opts, xaiSkipReasoningReplayMetadataKey, true)
+	}
+	return req, opts, decision
+}
+
+func xaiScrubHTTPInputContinuity(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, decision xaiHTTPResponseContinuity) (cliproxyexecutor.Request, cliproxyexecutor.Options, xaiHTTPResponseContinuity) {
+	req.Payload = xaiStripOpaqueContinuityState(req.Payload)
+	opts.OriginalRequest = xaiStripOpaqueContinuityState(opts.OriginalRequest)
+	opts = xaiOptionsWithMetadataBool(opts, xaiScrubUntrustedInputMetadataKey, true)
+	return req, opts, decision
+}
+
+func applyXAIHTTPResponseContinuityToPrepared(prepared *xaiPreparedRequest, continuity xaiHTTPResponseContinuity) {
+	if prepared == nil {
+		return
+	}
+	if continuity.scrubOpaque {
+		prepared.body = xaiStripOpaqueContinuityState(prepared.body)
+		return
+	}
+	if !continuity.opaqueAllowed || continuity.previousID == "" {
+		return
+	}
+	prepared.body, _ = sjson.SetBytes(prepared.body, "previous_response_id", continuity.previousID)
+	prepared.body, _ = sjson.DeleteBytes(prepared.body, "instructions")
+}
+
+func cacheXAIHTTPResponseContinuity(ctx context.Context, continuity xaiHTTPResponseContinuity, prepared *xaiPreparedRequest, completedData []byte) {
+	if !continuity.enabled || continuity.callerScope == "" || continuity.authID == "" || continuity.upstreamKind == "" || prepared == nil {
+		return
+	}
+	storeResult := gjson.GetBytes(prepared.body, "store")
+	entry := internalcache.XAIResponseContinuity{
+		AuthID: continuity.authID, PromptCacheKey: strings.TrimSpace(gjson.GetBytes(prepared.body, "prompt_cache_key").String()),
+		UpstreamKind: continuity.upstreamKind, OpaqueReusable: continuity.upstreamKind != "http:cli-chat-proxy" && storeResult.Type == gjson.True,
+	}
+	if responseID := strings.TrimSpace(gjson.GetBytes(completedData, "response.id").String()); responseID != "" {
+		storeXAIResponseContinuity(ctx, continuity.callerScope, "xai", prepared.baseModel, responseID, entry)
+	}
+	bindingID := continuity.sessionBindingID
+	if bindingID == "" && entry.PromptCacheKey != "" {
+		bindingID = internalcache.XAIResponseContinuitySessionBindingID(entry.PromptCacheKey, "")
+	}
+	if bindingID != "" {
+		storeXAIResponseContinuity(ctx, continuity.callerScope, "xai", prepared.baseModel, bindingID, entry)
+	}
+}
+
+func xaiTrustedExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if value := xaiMetadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
+		return value
+	}
+	return xaiMetadataString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
+}
+
+func xaiRequestString(primary, fallback []byte, path string) string {
+	if value := strings.TrimSpace(gjson.GetBytes(primary, path).String()); value != "" {
+		return value
+	}
+	return strings.TrimSpace(gjson.GetBytes(fallback, path).String())
+}
+
+func xaiHTTPContinuitySessionBindingID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	return internalcache.XAIResponseContinuitySessionBindingID(xaiRequestString(req.Payload, opts.OriginalRequest, "prompt_cache_key"), xaiTrustedExecutionSessionID(req, opts))
+}
+
+func xaiInputHasCredentialBoundState(payload []byte) bool {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "compaction" || item.Get("encrypted_content").Exists() {
+			return true
+		}
+	}
+	return false
+}
+
+func xaiStripOpaqueContinuityState(payload []byte) []byte {
+	updated, _ := sjson.DeleteBytes(payload, "previous_response_id")
+	input := gjson.GetBytes(updated, "input")
+	if !input.IsArray() {
+		return updated
+	}
+	items := make([]json.RawMessage, 0, len(input.Array()))
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "compaction" {
+			continue
+		}
+		itemRaw, errDelete := sjson.DeleteBytes([]byte(item.Raw), "encrypted_content")
+		if errDelete != nil {
+			itemRaw = []byte(item.Raw)
+		}
+		items = append(items, json.RawMessage(itemRaw))
+	}
+	rawInput, errMarshal := json.Marshal(items)
+	if errMarshal != nil {
+		return updated
+	}
+	out, errSet := sjson.SetRawBytes(updated, "input", rawInput)
+	if errSet != nil {
+		return updated
+	}
+	return out
+}
+
+func xaiOptionsWithMetadataBool(opts cliproxyexecutor.Options, key string, value bool) cliproxyexecutor.Options {
+	metadata := make(map[string]any, len(opts.Metadata)+1)
+	for metadataKey, metadataValue := range opts.Metadata {
+		metadata[metadataKey] = metadataValue
+	}
+	metadata[key] = value
+	opts.Metadata = metadata
+	return opts
+}
+
+func xaiMetadataBool(metadata map[string]any, key string) bool {
+	value, ok := metadata[key]
+	if !ok {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, errParse := strconv.ParseBool(strings.TrimSpace(typed))
+		return errParse == nil && parsed
+	default:
+		return false
+	}
 }
 
 func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.Auth, url string, headers http.Header, body []byte) {
@@ -261,6 +493,33 @@ func xaiIsDefaultAPIBaseURL(baseURL string) bool {
 
 func xaiIsCLIChatProxyBaseURL(baseURL string) bool {
 	return xaiNormalizeBaseURL(baseURL) == xaiNormalizeBaseURL(xaiauth.CLIChatProxyBaseURL)
+}
+
+func xaiHTTPUpstreamKind(baseURL string) string {
+	normalized := xaiContinuityNormalizedBaseURL(baseURL)
+	switch normalized {
+	case xaiContinuityNormalizedBaseURL(xaiauth.DefaultAPIBaseURL):
+		return "http:official"
+	case xaiContinuityNormalizedBaseURL(xaiauth.CLIChatProxyBaseURL):
+		return "http:cli-chat-proxy"
+	default:
+		sum := sha256.Sum256([]byte(normalized))
+		return fmt.Sprintf("http:custom:%x", sum[:])
+	}
+}
+
+func xaiContinuityNormalizedBaseURL(baseURL string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	parsed, errParse := url.Parse(baseURL)
+	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.ToLower(baseURL)
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 // xaiBaseURLSource classifies a resolved xAI base URL for logging.

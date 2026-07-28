@@ -1,12 +1,18 @@
 package auth
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-const maxStableSessionAliases = 64
+const (
+	maxStableSessionAliases          = 64
+	defaultSessionCacheMaxEntries    = 10_240
+	defaultSessionCacheEvictionBatch = 128
+	defaultSessionCacheMaxKeyBytes   = 4 * 1024
+)
 
 // sessionEntry stores an auth binding, its identifier aliases, and expiration.
 type sessionEntry struct {
@@ -17,22 +23,42 @@ type sessionEntry struct {
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
 type SessionCache struct {
-	mu      sync.RWMutex
-	entries map[string]sessionEntry
-	ttl     time.Duration
-	stopCh  chan struct{}
+	mu            sync.RWMutex
+	entries       map[string]sessionEntry
+	ttl           time.Duration
+	maxEntries    int
+	evictionBatch int
+	maxKeyBytes   int
+	stopCh        chan struct{}
+	stopOnce      sync.Once
 }
 
 // NewSessionCache creates a cache with the specified TTL.
 // A background goroutine periodically cleans expired entries.
 func NewSessionCache(ttl time.Duration) *SessionCache {
+	return newSessionCache(ttl, defaultSessionCacheMaxEntries, defaultSessionCacheEvictionBatch, defaultSessionCacheMaxKeyBytes)
+}
+
+func newSessionCache(ttl time.Duration, maxEntries, evictionBatch, maxKeyBytes int) *SessionCache {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
+	if maxEntries <= 0 {
+		maxEntries = defaultSessionCacheMaxEntries
+	}
+	if evictionBatch <= 0 {
+		evictionBatch = defaultSessionCacheEvictionBatch
+	}
+	if maxKeyBytes <= 0 {
+		maxKeyBytes = defaultSessionCacheMaxKeyBytes
+	}
 	c := &SessionCache{
-		entries: make(map[string]sessionEntry),
-		ttl:     ttl,
-		stopCh:  make(chan struct{}),
+		entries:       make(map[string]sessionEntry),
+		ttl:           ttl,
+		maxEntries:    maxEntries,
+		evictionBatch: evictionBatch,
+		maxKeyBytes:   maxKeyBytes,
+		stopCh:        make(chan struct{}),
 	}
 	go c.cleanupLoop()
 	return c
@@ -41,7 +67,7 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 // Get retrieves the auth ID bound to a session, if still valid.
 // Does NOT refresh the TTL on access.
 func (c *SessionCache) Get(sessionID string) (string, bool) {
-	if sessionID == "" {
+	if !c.validSessionID(sessionID) {
 		return "", false
 	}
 	now := time.Now()
@@ -55,7 +81,6 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok = c.entries[sessionID]
@@ -72,7 +97,7 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 // GetAndRefresh retrieves the auth ID bound to a session and refreshes the TTL
 // for every identifier known to represent the same logical session.
 func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
-	if sessionID == "" {
+	if !c.validSessionID(sessionID) {
 		return "", false
 	}
 	now := time.Now()
@@ -107,7 +132,13 @@ func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	aliases := mergeSessionAliases(nil, sessionIDs...)
+	validSessionIDs := make([]string, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if c.validSessionID(sessionID) {
+			validSessionIDs = append(validSessionIDs, sessionID)
+		}
+	}
+	aliases := mergeSessionAliases(nil, validSessionIDs...)
 	previousGroups := make([]sessionEntry, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
 		entry, ok := c.entries[sessionID]
@@ -125,6 +156,9 @@ func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 	if len(aliases) == 0 {
 		return
 	}
+	if len(aliases) > c.maxEntries {
+		aliases = aliases[:c.maxEntries]
+	}
 	c.replaceAliasGroupsLocked(authID, now.Add(c.ttl), aliases, previousGroups...)
 }
 
@@ -133,6 +167,13 @@ func (c *SessionCache) replaceAliasGroupsLocked(authID string, expiresAt time.Ti
 		c.removeAliasGroupLocked(previous)
 	}
 	entry := sessionEntry{authID: authID, expiresAt: expiresAt, aliases: aliases}
+	for len(c.entries)+len(aliases) > c.maxEntries {
+		before := len(c.entries)
+		c.evictForInsertLocked(time.Now())
+		if len(c.entries) >= before {
+			break
+		}
+	}
 	for _, alias := range aliases {
 		c.entries[alias] = entry
 	}
@@ -225,7 +266,7 @@ func mergeSessionAliases(existing []string, candidates ...string) []string {
 // Invalidate removes a specific session binding without allowing another alias
 // in the same group to recreate it on its next refresh.
 func (c *SessionCache) Invalidate(sessionID string) {
-	if sessionID == "" {
+	if !c.validSessionID(sessionID) {
 		return
 	}
 	c.mu.Lock()
@@ -270,15 +311,15 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 
 // Stop terminates the background cleanup goroutine.
 func (c *SessionCache) Stop() {
-	select {
-	case <-c.stopCh:
-	default:
-		close(c.stopCh)
-	}
+	c.stopOnce.Do(func() { close(c.stopCh) })
 }
 
 func (c *SessionCache) cleanupLoop() {
-	ticker := time.NewTicker(c.ttl / 2)
+	interval := c.ttl / 2
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -299,4 +340,43 @@ func (c *SessionCache) cleanup() {
 		}
 	}
 	c.mu.Unlock()
+}
+
+func (c *SessionCache) validSessionID(sessionID string) bool {
+	return sessionID != "" && len(sessionID) <= c.maxKeyBytes
+}
+
+func (c *SessionCache) evictForInsertLocked(now time.Time) {
+	for sessionID, entry := range c.entries {
+		if !entry.expiresAt.After(now) {
+			delete(c.entries, sessionID)
+		}
+	}
+	if len(c.entries) < c.maxEntries {
+		return
+	}
+
+	type candidate struct {
+		sessionID string
+		expiresAt time.Time
+	}
+	candidates := make([]candidate, 0, len(c.entries))
+	for sessionID, entry := range c.entries {
+		candidates = append(candidates, candidate{sessionID: sessionID, expiresAt: entry.expiresAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].expiresAt.Before(candidates[j].expiresAt)
+	})
+
+	removeCount := c.evictionBatch
+	minimumRemoval := len(c.entries) - c.maxEntries + 1
+	if removeCount < minimumRemoval {
+		removeCount = minimumRemoval
+	}
+	if removeCount > len(candidates) {
+		removeCount = len(candidates)
+	}
+	for i := 0; i < removeCount; i++ {
+		delete(c.entries, candidates[i].sessionID)
+	}
 }

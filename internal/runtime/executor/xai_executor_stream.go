@@ -11,29 +11,42 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	opts = xaiOptionsWithSelectedAuth(opts, auth)
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
 	if xaiInputHasItemType(req.Payload, "compaction_trigger") {
 		return e.executeCompactionTriggerStream(ctx, auth, req, opts)
 	}
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+		ctx = cliproxyusage.EnablePhases(ctx)
+	}
 
 	token, _ := xaiCreds(auth)
 	baseURL := xaiChatBaseURL(auth)
 	logXAIResolvedBaseURL(ctx, baseURL)
+	req, opts, continuity := prepareXAIHTTPResponseContinuity(ctx, auth, req, opts, baseURL)
 
 	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
+	applyXAIHTTPResponseContinuityToPrepared(prepared, continuity)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
+	defer func() {
+		if err != nil {
+			reporter.MarkTerminal(xaiFailureTerminalKind(ctx, err))
+		}
+		reporter.TrackFailure(ctx, &err)
+	}()
 	reporter.SetTranslatedReasoningEffort(prepared.body, e.Identifier())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -70,6 +83,12 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	go func() {
 		defer close(out)
 		defer func() {
+			if ctx.Err() != nil {
+				reporter.MarkTerminal("canceled")
+				reporter.PublishFailure(ctx, ctx.Err())
+			}
+		}()
+		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("xai executor: close response body error: %v", errClose)
 			}
@@ -81,6 +100,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
+		phaseMarker := xaiResponsePhaseMarker{reporter: reporter}
 		var pendingEventLine []byte
 		emitTranslatedLine := func(translatedLine []byte) bool {
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, translatedLine, &param, claudeInputTokens)
@@ -117,17 +137,36 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						}
 						continue
 					}
+					upstreamEventType := gjson.GetBytes(eventData, "type").String()
+					phaseMarker.mark(upstreamEventType, eventData, false)
+					if terminalKind := xaiTerminalKind(upstreamEventType); terminalKind != "" {
+						reporter.MarkTerminal(terminalKind)
+					}
+					eventData = xaiNormalizeTerminalResponseData(eventData)
+					if terminalErr, ok := xaiTerminalFailureErr(eventData); ok {
+						helps.RecordAPIResponseError(ctx, e.cfg, terminalErr)
+						reporter.PublishFailure(ctx, terminalErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: terminalErr}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					normalizedEventName := gjson.GetBytes(eventData, "type").String()
+					terminalEvent := isXAITerminalResponseEvent(normalizedEventName)
 					switch normalizedEventName {
 					case "response.output_item.done":
 						xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
-					case "response.completed":
+					case "response.completed", "response.incomplete":
 						if detail, ok := helps.ParseCodexUsage(eventData); ok {
 							reporter.Publish(ctx, detail)
 						}
 						eventData = xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 						eventData = xaiNormalizeReasoningSummaryData(eventData)
-						cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, eventData)
+						if upstreamEventType == "response.completed" {
+							cacheXAIHTTPResponseContinuity(ctx, continuity, prepared, eventData)
+							cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, eventData)
+						}
 						normalizedEventName = gjson.GetBytes(eventData, "type").String()
 					}
 
@@ -142,6 +181,10 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						}
 					}
 					if !emitTranslatedLine(append([]byte("data: "), eventData...)) {
+						return
+					}
+					if terminalEvent {
+						reporter.EnsurePublished(ctx)
 						return
 					}
 				}
@@ -162,12 +205,32 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 			emitTranslatedLine(xaiNormalizeReasoningSummaryEventLine(pendingEventLine, ""))
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			if ctx.Err() != nil {
+				reporter.MarkTerminal("canceled")
+				reporter.PublishFailure(ctx, ctx.Err())
+				return
+			}
+			reporter.MarkTerminal("disconnect")
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
+			return
+		}
+		if ctx.Err() == nil {
+			errDisconnect := statusErr{code: http.StatusRequestTimeout, msg: "xai stream error: stream disconnected before terminal response"}
+			reporter.MarkTerminal("disconnect")
+			helps.RecordAPIResponseError(ctx, e.cfg, errDisconnect)
+			reporter.PublishFailure(ctx, errDisconnect)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errDisconnect}:
+			case <-ctx.Done():
+			}
+		} else {
+			reporter.MarkTerminal("canceled")
+			reporter.PublishFailure(ctx, ctx.Err())
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

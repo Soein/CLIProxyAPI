@@ -379,20 +379,23 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 
 // tryRefreshAfterUnauthorized refreshes OAuth credentials once after a 401 so the
 // current auth can be retried before fallback/suspend.
-func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool) {
+func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool, error) {
 	if m == nil || auth == nil || alreadyTried || execErr == nil {
-		return auth, false
+		return auth, false, nil
 	}
 	if !isUnauthorizedError(execErr) || !authHasRefreshCredential(auth) {
-		return auth, false
+		return auth, false, nil
 	}
 	log.Debugf("unauthorized response for %s (%s), refreshing credentials before fallback", auth.Provider, auth.ID)
 	refreshed, errRefresh := m.refreshAuthForRequest(ctx, auth.ID, authAccessToken(auth))
+	if errors.Is(errRefresh, ErrDispatchAdmissionRejected) {
+		return auth, false, errRefresh
+	}
 	if errRefresh != nil || refreshed == nil {
 		log.Debugf("credential refresh before fallback failed for %s (%s): %v", auth.Provider, auth.ID, errRefresh)
-		return auth, false
+		return auth, false, nil
 	}
-	return refreshed, true
+	return refreshed, true, nil
 }
 
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
@@ -466,7 +469,10 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	}
 
 	cloned := auth.Clone()
-	updated, err := exec.Refresh(ctx, cloned)
+	updated, err := m.refreshWithDispatchAdmission(ctx, exec, cloned)
+	if errors.Is(err, ErrDispatchAdmissionRejected) {
+		return nil, err
+	}
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		return nil, err

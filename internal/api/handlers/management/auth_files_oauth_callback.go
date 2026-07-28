@@ -10,12 +10,15 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	anthropicCallbackPort = 54545
-	codexCallbackPort     = 1455
+	anthropicCallbackPort         = 54545
+	codexCallbackPort             = 1455
+	pluginLoginRollbackTimeout    = 5 * time.Second
+	authStatusCompensationTimeout = 5 * time.Second
 )
 
 type callbackForwarder struct {
@@ -184,6 +187,12 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 	}
 
 	ctx := PopulateAuthContext(context.Background(), c)
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return true
+	}
 	baseURL, errBaseURL := h.managementCallbackURL("/v0/management/oauth-callback")
 	if errBaseURL != nil {
 		log.WithError(errBaseURL).Error("failed to compute plugin auth callback URL")
@@ -214,6 +223,9 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 		log.WithError(errRegister).WithField("provider", provider).Error("failed to register plugin oauth session")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to generate authorization url"})
 		return true
+	}
+	if fence, okFence := coreauth.ExplicitAuthOperationFence(ctx); okFence {
+		SetOAuthSessionAuthFence(state, fence)
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": resp.URL, "state": state})
 	return true

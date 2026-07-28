@@ -109,26 +109,25 @@ func TestAuthRing_WeightRespected(t *testing.T) {
 	}
 }
 
-// Nil receiver and unbuilt ring both degrade to IsMine=true so bootstrap
-// never black-holes requests.
-func TestAuthRing_IsMineDegradation(t *testing.T) {
+// A nil, unbuilt, or empty ring cannot prove ownership and must fail closed.
+func TestAuthRing_IsMineFailsClosedUntilReady(t *testing.T) {
 	var nilRing *AuthRing
-	if !nilRing.IsMine("anything") {
-		t.Error("nil ring must IsMine=true (degradation)")
+	if nilRing.IsMine("anything") {
+		t.Error("nil ring must not claim ownership")
 	}
 
 	empty := NewAuthRing("sj")
-	if !empty.IsMine("anything") {
-		t.Error("unbuilt ring must IsMine=true (bootstrap window)")
+	if empty.IsMine("anything") {
+		t.Error("unbuilt ring must not claim ownership")
 	}
 	if empty.Ready() {
 		t.Error("unbuilt ring must Ready=false")
 	}
 
-	// Empty member list after Rebuild — still treated as not ready.
+	// Empty member list after Rebuild is still not ready.
 	empty.Rebuild(nil)
-	if !empty.IsMine("anything") {
-		t.Error("empty-membership ring must IsMine=true")
+	if empty.IsMine("anything") {
+		t.Error("empty-membership ring must not claim ownership")
 	}
 	if empty.Ready() {
 		t.Error("empty-membership ring must Ready=false")
@@ -146,19 +145,21 @@ func TestAuthRing_IsMineFalseWhenSelfAbsent(t *testing.T) {
 	if r.IsMine("codex-001") {
 		t.Error("IsMine must be false when my NodeID is absent from membership")
 	}
-	if !r.Ready() {
-		t.Error("Ready must be true when membership is non-empty")
+	if r.Ready() {
+		t.Error("Ready must be false when the local node is absent")
 	}
 }
 
-// Empty myNodeID is a misconfig (no way to claim) — degrade to IsMine=true
-// so the replica falls back to pre-sharding behavior rather than silently
-// serving nothing.
-func TestAuthRing_EmptyMyNodeIDDegrades(t *testing.T) {
+// Empty myNodeID is a misconfiguration: the replica cannot prove that it is
+// any member in the ring and therefore must not claim ownership.
+func TestAuthRing_EmptyMyNodeIDFailsClosed(t *testing.T) {
 	r := NewAuthRing("") // misconfig
 	r.Rebuild([]RingMember{{NodeID: "la", Weight: 100}})
-	if !r.IsMine("anything") {
-		t.Error("empty myNodeID must degrade to IsMine=true")
+	if r.IsMine("anything") {
+		t.Error("empty myNodeID must not claim ownership")
+	}
+	if r.Ready() {
+		t.Error("ring with empty myNodeID must not be ready")
 	}
 }
 
@@ -260,9 +261,123 @@ func TestAuthRing_ConcurrentSafe(t *testing.T) {
 	wg.Wait()
 }
 
+func TestAuthRing_FailClosedIsTerminal(t *testing.T) {
+	r := NewAuthRing("sj")
+	members := []RingMember{{NodeID: "sj", Weight: 100}}
+	r.Rebuild(members)
+	if !r.Ready() {
+		t.Fatal("ring should be ready before terminal fail-close")
+	}
+
+	r.FailClosed()
+	r.Rebuild(members)
+
+	if r.Ready() {
+		t.Fatal("terminal fail-close must reject later rebuilds")
+	}
+	if got := r.Owner("auth-a"); got != "" {
+		t.Fatalf("Owner() after terminal fail-close = %q, want empty", got)
+	}
+	if got := r.Members(); len(got) != 0 {
+		t.Fatalf("Members() after terminal fail-close = %+v, want empty", got)
+	}
+}
+
+func TestAuthRing_FailClosedLinearizesWithConcurrentRebuild(t *testing.T) {
+	r := NewAuthRing("sj")
+	members := []RingMember{{NodeID: "sj", Weight: 100}}
+	r.Rebuild(members)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 1000; j++ {
+				r.Rebuild(members)
+			}
+		}()
+	}
+	close(start)
+	r.FailClosed()
+	wg.Wait()
+
+	if r.Ready() || r.Owner("auth-a") != "" || len(r.Members()) != 0 {
+		t.Fatal("concurrent rebuild restored a terminally failed ring")
+	}
+}
+
 func TestAuthRing_OwnerEmptyWhenUnbuilt(t *testing.T) {
 	r := NewAuthRing("sj")
 	if got := r.Owner("x"); got != "" {
 		t.Errorf("unbuilt ring Owner should be empty, got %q", got)
+	}
+}
+
+func TestAuthRingDecisionPublishesEpochOwnerAndReadinessAtomically(t *testing.T) {
+	r := NewAuthRing("sj")
+	r.RebuildAt(41, []RingMember{{NodeID: "sj", Weight: 100}})
+
+	decision := r.Decision("auth-a")
+	if decision.Epoch != 41 || decision.Owner != "sj" || !decision.Ready {
+		t.Fatalf("Decision() = %+v, want epoch=41 owner=sj ready=true", decision)
+	}
+}
+
+func TestAuthRingRebuildAtRejectsOlderEpoch(t *testing.T) {
+	r := NewAuthRing("sj")
+	r.RebuildAt(9, []RingMember{{NodeID: "sj", Weight: 100}})
+	r.RebuildAt(8, []RingMember{{NodeID: "la", Weight: 100}})
+
+	decision := r.Decision("auth-a")
+	if decision.Epoch != 9 || decision.Owner != "sj" || !decision.Ready {
+		t.Fatalf("older publication replaced current snapshot: %+v", decision)
+	}
+}
+
+func TestAuthRingDecisionFailsClosedWhenLocalNodeAbsent(t *testing.T) {
+	r := NewAuthRing("sj")
+	r.RebuildAt(12, []RingMember{{NodeID: "la", Weight: 100}})
+
+	decision := r.Decision("auth-a")
+	if decision.Epoch != 12 || decision.Owner != "la" || decision.Ready {
+		t.Fatalf("Decision() = %+v, want epoch=12 owner=la ready=false", decision)
+	}
+}
+
+func TestAuthRingDecisionNeverMixesEpochAndOwner(t *testing.T) {
+	r := NewAuthRing("sj")
+	r.RebuildAt(1, []RingMember{{NodeID: "sj", Weight: 100}})
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for epoch := int64(2); epoch <= 2000; epoch++ {
+			member := RingMember{NodeID: "la", Weight: 100}
+			if epoch%2 == 1 {
+				member.NodeID = "sj"
+			}
+			r.RebuildAt(epoch, []RingMember{member})
+		}
+		close(stop)
+	}()
+	for {
+		decision := r.Decision("auth-a")
+		if decision.Epoch%2 == 1 {
+			if decision.Owner != "sj" || !decision.Ready {
+				t.Fatalf("mixed odd-epoch decision: %+v", decision)
+			}
+		} else if decision.Owner != "la" || decision.Ready {
+			t.Fatalf("mixed even-epoch decision: %+v", decision)
+		}
+		select {
+		case <-stop:
+			writer.Wait()
+			return
+		default:
+		}
 	}
 }

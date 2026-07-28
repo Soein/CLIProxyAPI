@@ -111,7 +111,7 @@ func (s *trackingSelector) Pick(ctx context.Context, provider, model string, opt
 
 func newSchedulerForTest(selector Selector, auths ...*Auth) *authScheduler {
 	scheduler := newAuthScheduler(selector)
-	scheduler.rebuild(auths)
+	scheduler.rebuild(auths, 0)
 	return scheduler
 }
 
@@ -150,6 +150,184 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
+	}
+}
+
+func TestSchedulerRebuildRetainsNewerActiveAuthWhenSnapshotIsStaleDisabled(t *testing.T) {
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	active := &Auth{ID: "newer-active", Provider: "gemini", Status: StatusActive, revision: 2}
+	scheduler.upsertAuth(active)
+
+	scheduler.rebuild([]*Auth{{
+		ID:       active.ID,
+		Provider: active.Provider,
+		Status:   StatusDisabled,
+		Disabled: true,
+		revision: 1,
+	}}, 1)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != active.ID || got.Disabled || got.Status == StatusDisabled {
+		t.Fatalf("pickSingle() auth = %#v, want newer active auth", got)
+	}
+}
+
+func TestSchedulerRebuildAppliesEqualAndNewerSnapshots(t *testing.T) {
+	t.Run("equal revision disables active auth", func(t *testing.T) {
+		scheduler := newAuthScheduler(&RoundRobinSelector{})
+		scheduler.upsertAuth(&Auth{ID: "equal", Provider: "gemini", Status: StatusActive, revision: 2})
+
+		scheduler.rebuild([]*Auth{{
+			ID:       "equal",
+			Provider: "gemini",
+			Status:   StatusDisabled,
+			Disabled: true,
+			revision: 2,
+		}}, 2)
+
+		if got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); errPick == nil || got != nil {
+			t.Fatalf("pickSingle() = (%#v, %v), want no auth after equal-revision disable", got, errPick)
+		}
+	})
+
+	t.Run("status-only disable is an equal-revision tombstone", func(t *testing.T) {
+		scheduler := newAuthScheduler(&RoundRobinSelector{})
+		scheduler.upsertAuth(&Auth{ID: "status-only", Provider: "gemini", Status: StatusActive, revision: 2})
+
+		scheduler.rebuild([]*Auth{{
+			ID:       "status-only",
+			Provider: "gemini",
+			Status:   StatusDisabled,
+			revision: 2,
+		}}, 2)
+		scheduler.upsertAuth(&Auth{ID: "status-only", Provider: "gemini", Status: StatusActive, revision: 2})
+
+		if got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); errPick == nil || got != nil {
+			t.Fatalf("pickSingle() = (%#v, %v), want status-only disable to reject equal-revision active auth", got, errPick)
+		}
+
+		newer := &Auth{ID: "status-only", Provider: "gemini", Status: StatusActive, revision: 3}
+		scheduler.upsertAuth(newer)
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil || got != newer {
+			t.Fatalf("pickSingle() after newer active auth = (%#v, %v), want (%#v, nil)", got, errPick, newer)
+		}
+	})
+
+	t.Run("newer revision replaces active auth", func(t *testing.T) {
+		scheduler := newAuthScheduler(&RoundRobinSelector{})
+		scheduler.upsertAuth(&Auth{ID: "newer", Provider: "gemini", Status: StatusActive, revision: 2})
+		newer := &Auth{ID: "newer", Provider: "claude", Status: StatusActive, revision: 3}
+
+		scheduler.rebuild([]*Auth{newer}, 3)
+
+		got, errPick := scheduler.pickSingle(context.Background(), "claude", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() error = %v", errPick)
+		}
+		if got != newer {
+			t.Fatalf("pickSingle() auth = %#v, want newer snapshot %#v", got, newer)
+		}
+		if stale, errStale := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); errStale == nil || stale != nil {
+			t.Fatalf("pickSingle() old provider = (%#v, %v), want no auth", stale, errStale)
+		}
+	})
+}
+
+func TestSchedulerRebuildRemovesAuthAbsentFromSnapshot(t *testing.T) {
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	removed := &Auth{ID: "removed", Provider: "gemini", Status: StatusActive, revision: 2}
+	scheduler.upsertAuth(removed)
+
+	scheduler.rebuild(nil, 5)
+
+	if got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); errPick == nil || got != nil {
+		t.Fatalf("pickSingle() = (%#v, %v), want absent auth removed", got, errPick)
+	}
+	delayed := removed.Clone()
+	delayed.revision = 5
+	scheduler.upsertAuth(delayed)
+	if got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); errPick == nil || got != nil {
+		t.Fatalf("pickSingle() after equal-revision upsert = (%#v, %v), want removed auth to stay absent", got, errPick)
+	}
+	if version := scheduler.authVersions[removed.ID]; version.revision != 5 || !version.disabled {
+		t.Fatalf("absent auth version = %#v, want disabled tombstone at snapshot watermark 5", version)
+	}
+
+	scheduler.rebuild([]*Auth{{ID: "removed", Provider: "gemini", Status: StatusActive, revision: 1}}, 5)
+	if got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); errPick == nil || got != nil {
+		t.Fatalf("pickSingle() after stale rebuild = (%#v, %v), want removed auth to stay absent", got, errPick)
+	}
+
+	newer := &Auth{ID: "removed", Provider: "gemini", Status: StatusActive, revision: 6}
+	scheduler.rebuild([]*Auth{newer}, 6)
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after newer rebuild error = %v", errPick)
+	}
+	if got != newer {
+		t.Fatalf("pickSingle() after newer rebuild auth = %#v, want %#v", got, newer)
+	}
+}
+
+func TestManagerSyncSchedulerBlockedRebuildPreservesConcurrentRegister(t *testing.T) {
+	ctx := WithSkipPersist(context.Background())
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "snapshot-auth", Provider: "gemini", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register(snapshot-auth) error = %v", errRegister)
+	}
+
+	snapshotReady := make(chan struct{})
+	releaseRebuild := make(chan struct{})
+	rebuildDone := make(chan struct{})
+	go func() {
+		auths, snapshotWatermark := manager.snapshotAuths()
+		close(snapshotReady)
+		<-releaseRebuild
+		manager.syncSchedulerFromSnapshot(auths, snapshotWatermark)
+		close(rebuildDone)
+	}()
+
+	<-snapshotReady
+	registered, errRegister := manager.Register(ctx, &Auth{ID: "concurrent-auth", Provider: "gemini", Status: StatusActive})
+	if errRegister != nil {
+		t.Fatalf("Register(concurrent-auth) error = %v", errRegister)
+	}
+	close(releaseRebuild)
+	<-rebuildDone
+
+	manager.scheduler.mu.Lock()
+	provider := manager.scheduler.authProviders[registered.ID]
+	version := manager.scheduler.authVersions[registered.ID]
+	manager.scheduler.mu.Unlock()
+	if provider != "gemini" {
+		t.Fatalf("concurrent auth provider after stale rebuild = %q, want gemini", provider)
+	}
+	if version.revision != registered.revision || version.disabled {
+		t.Fatalf("concurrent auth version after stale rebuild = %#v, want active revision %d", version, registered.revision)
+	}
+}
+
+func TestSchedulerRemovalWatermarkRejectsStaleUpsertButPreservesNewerRegistration(t *testing.T) {
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	old := &Auth{ID: "delete-watermark", Provider: "gemini", Status: StatusActive, revision: 4}
+	scheduler.upsertAuth(old)
+	scheduler.removeAuthAtRevision(old.ID, 5)
+
+	scheduler.upsertAuth(old.Clone())
+	if _, scheduled := scheduler.authProviders[old.ID]; scheduled {
+		t.Fatalf("old revision %d restored auth after deletion watermark", old.revision)
+	}
+
+	newer := old.Clone()
+	newer.revision = 6
+	scheduler.upsertAuth(newer)
+	scheduler.removeAuthAtRevision(old.ID, 5)
+	if provider := scheduler.authProviders[old.ID]; provider != "gemini" {
+		t.Fatalf("deferred old deletion removed newer registration: provider = %q", provider)
 	}
 }
 

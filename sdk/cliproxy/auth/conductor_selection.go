@@ -49,28 +49,43 @@ func isBuiltInSelector(selector Selector) bool {
 	}
 }
 
-func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {
+func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth, snapshotWatermark uint64) {
 	if m == nil || m.scheduler == nil {
 		return
 	}
-	m.scheduler.rebuild(auths)
+	m.scheduler.rebuild(auths, snapshotWatermark)
+	m.wakeDispatchAuthority()
+}
+
+func (m *Manager) schedulerUpsert(a *Auth) {
+	if m == nil || m.scheduler == nil || a == nil {
+		return
+	}
+	m.scheduler.upsertAuth(a)
+}
+
+func (m *Manager) nextAuthRevisionLocked() uint64 { m.authRevision++; return m.authRevision }
+func (m *Manager) nextAuthDurableRevisionLocked() uint64 {
+	m.authDurableRevision++
+	return m.authDurableRevision
 }
 
 func (m *Manager) syncScheduler() {
 	if m == nil || m.scheduler == nil {
 		return
 	}
-	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+	auths, snapshotWatermark := m.snapshotAuths()
+	m.syncSchedulerFromSnapshot(auths, snapshotWatermark)
 }
 
-func (m *Manager) snapshotAuths() []*Auth {
+func (m *Manager) snapshotAuths() ([]*Auth, uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]*Auth, 0, len(m.auths))
 	for _, a := range m.auths {
 		out = append(out, a.Clone())
 	}
-	return out
+	return out, m.authRevision
 }
 
 // RefreshSchedulerEntry re-upserts a single auth into the scheduler so that its
@@ -174,16 +189,14 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				auth.Status = StatusActive
 			}
 			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
+			auth.revision = m.nextAuthRevisionLocked()
 			snapshot = auth.Clone()
 		}
 	}
 	m.mu.Unlock()
 
 	if m.scheduler != nil && snapshot != nil {
-		m.scheduler.upsertAuth(snapshot)
+		m.schedulerUpsert(snapshot)
 	}
 }
 
@@ -720,6 +733,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	if errors.Is(err, ErrDispatchAdmissionRejected) {
+		return 0, false
+	}
 	var homeBusy *HomeConcurrencyBusyError
 	if errors.As(err, &homeBusy) && homeBusy != nil {
 		return 0, false
@@ -930,19 +946,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
 	}
+	if tried == nil {
+		tried = make(map[string]struct{})
+	}
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
-
-	m.mu.RLock()
-	selector := m.selector
-	pluginScheduler := m.pluginScheduler
-	executor, okExecutor := m.executors[provider]
-	if !okExecutor {
-		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
-	}
-	candidates := make([]*Auth, 0, len(m.auths))
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
@@ -952,59 +961,83 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
-	for _, candidate := range m.auths {
-		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
-			continue
+	ownership, spilloverEnabled := m.authOwnershipPredicate()
+	spillover := func() bool {
+		if ownership == nil || !spilloverEnabled {
+			return false
 		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
-			continue
-		}
-		if disallowFreeAuth && isFreeCodexAuth(candidate) {
-			continue
-		}
-		if _, used := tried[candidate.ID]; used {
-			continue
-		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
-			continue
-		}
-		candidates = append(candidates, candidate)
+		ownership = nil
+		return true
 	}
-	if len(candidates) == 0 {
+	for {
+		m.mu.RLock()
+		selector := m.selector
+		pluginScheduler := m.pluginScheduler
+		executor, okExecutor := m.executors[provider]
+		if !okExecutor {
+			m.mu.RUnlock()
+			return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		candidates := make([]*Auth, 0, len(m.auths))
+		for _, candidate := range m.auths {
+			if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+				continue
+			}
+			if ownership != nil && !ownership(candidate.ID) {
+				continue
+			}
+			if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+				continue
+			}
+			if disallowFreeAuth && isFreeCodexAuth(candidate) {
+				continue
+			}
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+				continue
+			}
+			candidates = append(candidates, candidate)
+		}
+		if len(candidates) == 0 {
+			m.mu.RUnlock()
+			if spillover() {
+				continue
+			}
+			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+		if errAvailable != nil {
+			m.mu.RUnlock()
+			if spillover() {
+				continue
+			}
+			return nil, nil, errAvailable
+		}
+		available = cloneAuthSlice(available)
 		m.mu.RUnlock()
-		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, errAvailable
-	}
-	available = cloneAuthSlice(available)
-	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
-	if errPick != nil {
-		return nil, nil, errPick
-	}
-	if !handled {
-		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
+		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 		if errPick != nil {
 			return nil, nil, errPick
 		}
-	}
-	if selected == nil {
-		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-	}
-	authCopy := selected.Clone()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-			current.EnsureIndex()
-			authCopy = current.Clone()
+		if !handled {
+			selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
+			if errPick != nil {
+				return nil, nil, errPick
+			}
 		}
-		m.mu.Unlock()
+		if selected == nil {
+			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if authCopy := m.admitScheduledAuth(selected, provider, model); authCopy != nil {
+			return authCopy, executor, nil
+		}
+		if !markRejectedAuthTried(tried, selected) {
+			return nil, nil, &Error{Code: "auth_not_found", Message: "selector repeatedly returned an ineligible auth"}
+		}
 	}
-	return authCopy, executor, nil
 }
 
 // SelectAuth selects one credential through the configured scheduling strategy.
@@ -1144,210 +1177,31 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		if selected == nil {
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
-		if disallowFreeAuth && isFreeCodexAuth(selected) {
+		authCopy := m.admitScheduledAuth(selected, provider, model)
+		if authCopy == nil {
 			if tried == nil {
 				tried = make(map[string]struct{})
 			}
-			tried[selected.ID] = struct{}{}
+			if selected.ID != "" {
+				tried[selected.ID] = struct{}{}
+			}
 			continue
 		}
-		authCopy := selected.Clone()
-		if !selected.indexAssigned {
-			m.mu.Lock()
-			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-				current.EnsureIndex()
-				authCopy = current.Clone()
+		if disallowFreeAuth && isFreeCodexAuth(authCopy) {
+			if tried == nil {
+				tried = make(map[string]struct{})
 			}
-			m.mu.Unlock()
+			tried[authCopy.ID] = struct{}{}
+			continue
 		}
 		return authCopy, executor, nil
 	}
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
-	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts, tried)
-	}
-
-	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
-
-	providerSet := make(map[string]struct{}, len(providers))
-	for _, provider := range providers {
-		p := strings.TrimSpace(strings.ToLower(provider))
-		if p == "" {
-			continue
-		}
-		providerSet[p] = struct{}{}
-	}
-	if len(providerSet) == 0 {
-		return nil, nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-
-	m.mu.RLock()
-	selector := m.selector
-	pluginScheduler := m.pluginScheduler
-	candidates := make([]*Auth, 0, len(m.auths))
-	modelKey := strings.TrimSpace(model)
-	// Always use base model name (without thinking suffix) for auth matching.
-	if modelKey != "" {
-		parsed := thinking.ParseSuffix(modelKey)
-		if parsed.ModelName != "" {
-			modelKey = strings.TrimSpace(parsed.ModelName)
-		}
-	}
-	registryRef := registry.GetGlobalRegistry()
-	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
-			continue
-		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
-			continue
-		}
-		if disallowFreeAuth && isFreeCodexAuth(candidate) {
-			continue
-		}
-		providerKey := executorKeyFromAuth(candidate)
-		if providerKey == "" {
-			continue
-		}
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		if _, used := tried[candidate.ID]; used {
-			continue
-		}
-		if _, ok := m.executors[providerKey]; !ok {
-			continue
-		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
-	if len(candidates) == 0 {
-		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, "", errAvailable
-	}
-	available = cloneAuthSlice(available)
-	m.mu.RUnlock()
-
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
-	if errPick != nil {
-		return nil, nil, "", errPick
-	}
-	if !handled {
-		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, available)
-		if errPick != nil {
-			return nil, nil, "", errPick
-		}
-	}
-	if selected == nil {
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-	}
-	providerKey := executorKeyFromAuth(selected)
-	executor, okExecutor := m.Executor(providerKey)
-	if !okExecutor {
-		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
-	}
-	authCopy := selected.Clone()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-			current.EnsureIndex()
-			authCopy = current.Clone()
-		}
-		m.mu.Unlock()
-	}
-	return authCopy, executor, providerKey, nil
+	return m.pickNextMixedLegacyWithInflight(ctx, providers, model, opts, tried, nil, "")
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
-	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts, tried)
-	}
-
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
-		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
-	}
-
-	eligibleProviders := make([]string, 0, len(providers))
-	seenProviders := make(map[string]struct{}, len(providers))
-	for _, provider := range providers {
-		providerKey := strings.TrimSpace(strings.ToLower(provider))
-		if providerKey == "" {
-			continue
-		}
-		if _, seen := seenProviders[providerKey]; seen {
-			continue
-		}
-		if _, okExecutor := m.Executor(providerKey); !okExecutor {
-			continue
-		}
-		seenProviders[providerKey] = struct{}{}
-		eligibleProviders = append(eligibleProviders, providerKey)
-	}
-	if len(eligibleProviders) == 0 {
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	if strings.TrimSpace(model) != "" {
-		providerSet := make(map[string]struct{}, len(eligibleProviders))
-		for _, providerKey := range eligibleProviders {
-			providerSet[providerKey] = struct{}{}
-		}
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled {
-				continue
-			}
-			if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
-			}
-		}
-		m.mu.RUnlock()
-	}
-
-	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
-	for {
-		selected, providerKey, errPick := m.pickMixedWithShardFilter(ctx, eligibleProviders, model, opts, tried)
-		if errPick != nil {
-			return nil, nil, "", errPick
-		}
-		if selected == nil {
-			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-		}
-		if disallowFreeAuth && isFreeCodexAuth(selected) {
-			if tried == nil {
-				tried = make(map[string]struct{})
-			}
-			tried[selected.ID] = struct{}{}
-			continue
-		}
-		executor, okExecutor := m.Executor(providerKey)
-		if !okExecutor {
-			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
-		}
-		authCopy := selected.Clone()
-		if !selected.indexAssigned {
-			m.mu.Lock()
-			if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-				current.EnsureIndex()
-				authCopy = current.Clone()
-			}
-			m.mu.Unlock()
-		}
-		return authCopy, executor, providerKey, nil
-	}
+	return m.pickNextMixedWithInflight(ctx, providers, model, opts, tried, nil, "")
 }

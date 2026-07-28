@@ -7,7 +7,35 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestUsageRecordPhaseTimingsJSONRoundTrip(t *testing.T) {
+	want := UsageRecord{Phases: &UsagePhaseTimings{
+		Attempt:                       2,
+		RequestElapsedToUpstreamStart: 11 * time.Millisecond,
+		AuthSelection:                 3 * time.Millisecond,
+		ResponseHeaders:               17 * time.Millisecond,
+		FirstEvent:                    19 * time.Millisecond,
+		FirstSemanticToken:            23 * time.Millisecond,
+		Terminal:                      29 * time.Millisecond,
+		ResponseHeadersObserved:       true,
+		TransportReused:               true,
+		AffinityOutcome:               "hit",
+		TerminalKind:                  "completed",
+	}}
+	payload, errMarshal := json.Marshal(want)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	var got UsageRecord
+	if errUnmarshal := json.Unmarshal(payload, &got); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if got.Phases == nil || *got.Phases != *want.Phases {
+		t.Fatalf("phases = %+v, want %+v", got.Phases, want.Phases)
+	}
+}
 
 type compileTimePlugin struct{}
 

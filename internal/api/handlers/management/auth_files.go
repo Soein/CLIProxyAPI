@@ -14,7 +14,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -248,20 +247,6 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
-				if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
-					// Read compatibility: prefer codex_automation_excluded, fall back to codex_weekly_automation_excluded.
-					excludedResult := gjson.GetBytes(data, codexweekly.AutomationExcludedMetadataKey)
-					excluded := excludedResult.Exists() && excludedResult.Bool()
-					if !excludedResult.Exists() {
-						legacy := gjson.GetBytes(data, codexweekly.LegacyWeeklyAutomationExcludedKey)
-						excluded = legacy.Exists() && legacy.Bool()
-					}
-					fileData["codex_automation_excluded"] = excluded
-					fileData["codexAutomationExcluded"] = excluded
-					// Backward-compatible deprecated fields. Remove after the frontend migrates to the new fields.
-					fileData["codex_weekly_automation_excluded"] = excluded
-					fileData["codexWeeklyAutomationExcluded"] = excluded
-				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -417,15 +402,6 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 				entry["note"] = trimmed
 			}
 		}
-	}
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		excluded := codexweekly.IsAutomationExcluded(auth)
-		// Primary field.
-		entry["codex_automation_excluded"] = excluded
-		entry["codexAutomationExcluded"] = excluded
-		// Deprecated backward-compatible fields mirror the primary value.
-		entry["codex_weekly_automation_excluded"] = excluded
-		entry["codexWeeklyAutomationExcluded"] = excluded
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets

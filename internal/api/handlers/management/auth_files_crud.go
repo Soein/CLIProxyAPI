@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -54,6 +55,12 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return
+	}
 
 	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
 	if errMultipart != nil {
@@ -136,34 +143,18 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
-		entries, err := os.ReadDir(h.cfg.AuthDir)
-		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
+		names, errList := h.authFileNamesForDeleteAll(ctx)
+		if errList != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errList.Error()})
 			return
 		}
 		deleted := 0
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
+		for _, name := range names {
+			if _, _, errDelete := h.deleteAuthFileByName(ctx, name); errDelete != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errDelete.Error()})
+				return
 			}
-			name := e.Name()
-			if !strings.HasSuffix(strings.ToLower(name), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
-				}
-			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.removeAuth(ctx, full)
-			}
+			deleted++
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -207,6 +198,46 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
+}
+
+func (h *Handler) authFileNamesForDeleteAll(ctx context.Context) ([]string, error) {
+	names := make(map[string]struct{})
+	entries, errReadDir := os.ReadDir(h.cfg.AuthDir)
+	if errReadDir != nil {
+		return nil, fmt.Errorf("failed to read auth dir: %w", errReadDir)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		names[entry.Name()] = struct{}{}
+	}
+	store := h.tokenStoreWithBaseDir()
+	if authoritative, ok := store.(coreauth.AuthAuthoritativeListStore); ok {
+		auths, errList := authoritative.ListAuthoritative(ctx)
+		if errList != nil {
+			return nil, fmt.Errorf("list authoritative auth records: %w", errList)
+		}
+		for _, auth := range auths {
+			if auth == nil {
+				continue
+			}
+			name := strings.TrimSpace(auth.FileName)
+			if name == "" {
+				name = strings.TrimSpace(auth.ID)
+			}
+			name = filepath.Base(name)
+			if strings.HasSuffix(strings.ToLower(name), ".json") {
+				names[name] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
@@ -269,7 +300,10 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+	releaseFile := authfilelock.Lock(dst)
+	errWrite := os.WriteFile(dst, data, 0o600)
+	releaseFile()
+	if errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
@@ -379,7 +413,7 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	// store.Delete on a non-existent row returns nil, so this is safe even
 	// when fileExisted == true and the prior os.Remove already triggered
 	// the watcher's own cleanup.
-	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+	if errDeleteRecord := h.deleteTokenRecordAndAuths(ctx, targetPath, targetID); errDeleteRecord != nil {
 		// Genuine 404 only when none of the layers (file / authManager /
 		// token store) had the record.
 		if !fileExisted && targetAuth == nil {
@@ -387,7 +421,6 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		}
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
-	h.removeAuthsForPath(ctx, targetPath, targetID)
 	return filepath.Base(name), http.StatusOK, nil
 }
 
@@ -556,6 +589,22 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {
 	if h == nil || h.authManager == nil || auth == nil {
 		return nil
+	}
+	if _, hasFence := coreauth.ExplicitAuthOperationFence(ctx); hasFence {
+		store := h.authManager.GetStore()
+		if _, versioned := store.(coreauth.VersionedAuthStore); versioned {
+			if _, errPersist := coreauth.PersistExplicitAuth(ctx, store, auth); errPersist != nil {
+				return errPersist
+			}
+			publishCtx := coreauth.WithSkipPersist(ctx)
+			if existing, ok := h.authManager.GetByID(auth.ID); ok {
+				auth.CreatedAt = existing.CreatedAt
+				_, errUpdate := h.authManager.Update(publishCtx, auth)
+				return errUpdate
+			}
+			_, errRegister := h.authManager.Register(publishCtx, auth)
+			return errRegister
+		}
 	}
 	if existing, ok := h.authManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt

@@ -466,23 +466,26 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		auth.Status = StatusActive
 	}
 	auth.UpdatedAt = now
-	if errPersist := m.persist(ctx, auth); errPersist != nil {
-		m.mu.Unlock()
-		return nil, nil, errPersist
-	}
+	auth.revision = m.nextAuthRevisionLocked()
+	auth.durableRevision = m.nextAuthDurableRevisionLocked()
 	snapshot = auth.Clone()
+	m.markPersistenceInFlightLocked(ctx, snapshot)
 	if trackCooldownState {
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
 	m.mu.Unlock()
+	if errPersist := m.persistPublishedIfCurrent(ctx, snapshot); errPersist != nil {
+		m.reloadAfterAuthStoreConflict(ctx, authID, errPersist)
+		return nil, nil, errPersist
+	}
 
 	for _, modelKey := range models {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(authID, modelKey)
 		registry.GetGlobalRegistry().ResumeClientModel(authID, modelKey)
 	}
 	if m.scheduler != nil && snapshot != nil {
-		m.scheduler.upsertAuth(snapshot)
+		m.schedulerUpsert(snapshot)
 	}
 	if snapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(ctx)
@@ -698,6 +701,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		operatorDisabled := auth.Disabled || auth.Status == StatusDisabled
+		disabledMessage := auth.StatusMessage
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
@@ -789,7 +794,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 404:
-							if disableCooling {
+							if isRequestScopedCodexStoreMiss(result.Error.Message) || disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(12 * time.Hour)
@@ -840,7 +845,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
+		if operatorDisabled {
+			auth.Disabled = true
+			auth.Status = StatusDisabled
+			auth.StatusMessage = disabledMessage
+			clearCooldownStateForAuth(auth, now)
+			shouldResumeModel = false
+			shouldSuspendModel = false
+			clearModelQuota = false
+			setModelQuota = false
+		}
+		auth.revision = m.nextAuthRevisionLocked()
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
@@ -849,7 +864,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+		m.schedulerUpsert(authSnapshot)
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -869,6 +884,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+func isRequestScopedCodexStoreMiss(message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "Item with id") &&
+		strings.Contains(message, "not found") &&
+		strings.Contains(message, "store")
 }
 
 func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
@@ -907,7 +932,7 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 		} else {
 			auth.Failed++
 		}
-		_ = m.persist(ctx, auth)
+		auth.revision = m.nextAuthRevisionLocked()
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()

@@ -36,6 +36,12 @@ type codexOAuthService interface {
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Claude authentication...")
 
@@ -183,6 +189,12 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 func (h *Handler) RequestCodexToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Codex authentication...")
 
@@ -331,6 +343,12 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Antigravity authentication...")
 
@@ -498,6 +516,12 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 func (h *Handler) RequestXAIToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return
+	}
 
 	fmt.Println("Initializing xAI authentication...")
 
@@ -611,6 +635,12 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 func (h *Handler) RequestKimiToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	var errFence error
+	ctx, errFence = h.beginExplicitAuthOperation(ctx)
+	if errFence != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errFence.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Kimi authentication...")
 
@@ -770,6 +800,9 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 	h.mu.Unlock()
 	if isPlugin && host != nil && host.HasAuthProvider(provider) {
 		ctx := PopulateAuthContext(context.Background(), c)
+		if fence, okFence := GetOAuthSessionAuthFence(state); okFence {
+			ctx = coreauth.WithExplicitAuthOperationFence(ctx, fence)
+		}
 		resp, handled, errPoll := host.PollLogin(ctx, provider, state, metadata)
 		if handled {
 			if errPoll != nil {
@@ -838,31 +871,202 @@ func pluginLoginPollAuths(host *pluginhost.Host, resp pluginapi.AuthLoginPollRes
 }
 
 func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreauth.Auth) error {
-	savedPaths := make([]string, 0, len(records))
-	for _, record := range records {
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return fmt.Errorf("token store unavailable")
+	}
+	snapshots, errSnapshots := snapshotPluginLoginRecords(ctx, store, records)
+	if errSnapshots != nil {
+		return errSnapshots
+	}
+
+	committed := make([]pluginLoginCommittedRecord, 0, len(records))
+	for index, record := range records {
+		generationBefore := record.StoreGeneration()
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if strings.TrimSpace(savedPath) != "" {
-			savedPaths = append(savedPaths, savedPath)
+		committedGeneration := record.StoreGeneration()
+		persisted := errSave == nil || strings.TrimSpace(savedPath) != "" || record.StoreGeneration() != generationBefore
+		if errors.Is(errSave, coreauth.ErrAuthStoreCommitUnknown) {
+			persisted = true
+			if candidate, okCandidate := coreauth.AuthStoreCommitCandidateGeneration(errSave, record.ID); okCandidate {
+				committedGeneration = candidate
+			}
+		}
+		if persisted {
+			committed = append(committed, pluginLoginCommittedRecord{
+				record:              record.Clone(),
+				previous:            snapshots[index],
+				savedPath:           savedPath,
+				committedGeneration: committedGeneration,
+			})
 		}
 		if errSave != nil {
-			h.rollbackSavedTokenRecords(ctx, savedPaths)
+			errRollback := h.rollbackPluginLoginRecords(ctx, store, committed)
+			if errRollback != nil {
+				return errors.Join(errSave, fmt.Errorf("roll back plugin auth tokens: %w", errRollback))
+			}
 			return errSave
 		}
 	}
 	return nil
 }
 
-func (h *Handler) rollbackSavedTokenRecords(ctx context.Context, savedPaths []string) {
-	for i := len(savedPaths) - 1; i >= 0; i-- {
-		path := strings.TrimSpace(savedPaths[i])
-		if path == "" {
+type pluginLoginCommittedRecord struct {
+	record              *coreauth.Auth
+	previous            *coreauth.Auth
+	savedPath           string
+	committedGeneration uint64
+}
+
+func snapshotPluginLoginRecords(ctx context.Context, store coreauth.Store, records []*coreauth.Auth) ([]*coreauth.Auth, error) {
+	snapshots := make([]*coreauth.Auth, len(records))
+	seen := make(map[string]struct{}, len(records))
+	if reader, ok := store.(coreauth.AuthByIDStore); ok {
+		for index, record := range records {
+			if record == nil || strings.TrimSpace(record.ID) == "" {
+				return nil, fmt.Errorf("plugin auth record %d has no ID", index+1)
+			}
+			id := strings.TrimSpace(record.ID)
+			if _, duplicate := seen[id]; duplicate {
+				return nil, fmt.Errorf("plugin auth response contains duplicate ID %q", id)
+			}
+			seen[id] = struct{}{}
+			previous, errRead := reader.GetByID(ctx, id)
+			if errRead != nil {
+				return nil, fmt.Errorf("read existing plugin auth %s: %w", id, errRead)
+			}
+			if previous != nil {
+				snapshots[index] = previous.Clone()
+			}
+		}
+		return snapshots, nil
+	}
+
+	existing, errList := store.List(ctx)
+	if errList != nil {
+		return nil, fmt.Errorf("list existing plugin auths: %w", errList)
+	}
+	byID := make(map[string]*coreauth.Auth, len(existing))
+	for _, auth := range existing {
+		if auth != nil && strings.TrimSpace(auth.ID) != "" {
+			byID[strings.TrimSpace(auth.ID)] = auth
+		}
+	}
+	for index, record := range records {
+		if record == nil || strings.TrimSpace(record.ID) == "" {
+			return nil, fmt.Errorf("plugin auth record %d has no ID", index+1)
+		}
+		id := strings.TrimSpace(record.ID)
+		if _, duplicate := seen[id]; duplicate {
+			return nil, fmt.Errorf("plugin auth response contains duplicate ID %q", id)
+		}
+		seen[id] = struct{}{}
+		if previous := byID[id]; previous != nil {
+			snapshots[index] = previous.Clone()
+		}
+	}
+	return snapshots, nil
+}
+
+func (h *Handler) rollbackPluginLoginRecords(ctx context.Context, store coreauth.Store, committed []pluginLoginCommittedRecord) error {
+	rollbackBase := context.Background()
+	if ctx != nil {
+		rollbackBase = context.WithoutCancel(ctx)
+	}
+	rollbackCtx, cancelRollback := context.WithTimeout(rollbackBase, pluginLoginRollbackTimeout)
+	defer cancelRollback()
+
+	rollbackErrors := make([]error, 0)
+	versioned, hasVersioned := store.(coreauth.VersionedAuthStore)
+	tombstones, hasTombstones := store.(coreauth.AuthTombstoneStore)
+	for index := len(committed) - 1; index >= 0; index-- {
+		entry := committed[index]
+		if entry.record == nil {
 			continue
 		}
-		if errDelete := h.deleteTokenRecord(ctx, path); errDelete != nil {
-			log.WithError(errDelete).WithField("path", path).Warn("failed to roll back plugin auth token")
+		id := strings.TrimSpace(entry.record.ID)
+		path := strings.TrimSpace(entry.savedPath)
+		if path == "" {
+			path = id
 		}
-		h.removeAuthsForPath(ctx, path, path)
+		if hasVersioned {
+			if entry.committedGeneration == 0 {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("auth %s has no committed generation", id))
+				h.failClosePluginLoginRuntime(rollbackCtx, id)
+				continue
+			}
+			if entry.previous != nil {
+				previous := entry.previous.Clone()
+				_, generation, errRestore := versioned.SaveVersioned(rollbackCtx, previous, entry.committedGeneration)
+				if errRestore != nil {
+					rollbackErrors = append(rollbackErrors, fmt.Errorf("restore previous auth %s: %w", id, errRestore))
+					h.failClosePluginLoginRuntime(rollbackCtx, id)
+					continue
+				}
+				previous.SetStoreGeneration(generation)
+				if errRuntime := h.publishPluginLoginRollback(rollbackCtx, previous, id); errRuntime != nil {
+					rollbackErrors = append(rollbackErrors, errRuntime)
+				}
+				continue
+			}
+			if !hasTombstones {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("auth %s store cannot tombstone a newly-created row", id))
+				h.failClosePluginLoginRuntime(rollbackCtx, id)
+				continue
+			}
+			if _, errTombstone := tombstones.Tombstone(rollbackCtx, path, entry.committedGeneration); errTombstone != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("tombstone newly-created auth %s: %w", id, errTombstone))
+				h.failClosePluginLoginRuntime(rollbackCtx, id)
+				continue
+			}
+			h.failClosePluginLoginRuntime(rollbackCtx, id)
+			continue
+		}
+
+		if entry.previous != nil {
+			if _, errRestore := store.Save(rollbackCtx, entry.previous.Clone()); errRestore != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore previous auth %s: %w", id, errRestore))
+				h.failClosePluginLoginRuntime(rollbackCtx, id)
+				continue
+			}
+			if errRuntime := h.publishPluginLoginRollback(rollbackCtx, entry.previous.Clone(), id); errRuntime != nil {
+				rollbackErrors = append(rollbackErrors, errRuntime)
+			}
+			continue
+		}
+		if errDelete := store.Delete(rollbackCtx, path); errDelete != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("delete newly-created auth %s: %w", id, errDelete))
+			h.failClosePluginLoginRuntime(rollbackCtx, id)
+			continue
+		}
+		h.failClosePluginLoginRuntime(rollbackCtx, id)
 	}
+	return errors.Join(rollbackErrors...)
+}
+
+func (h *Handler) publishPluginLoginRollback(ctx context.Context, previous *coreauth.Auth, id string) error {
+	if h == nil || h.authManager == nil || previous == nil {
+		return nil
+	}
+	ctx = coreauth.WithSkipPersist(ctx)
+	if _, exists := h.authManager.GetByID(id); exists {
+		_, errUpdate := h.authManager.Update(ctx, previous)
+		if errUpdate != nil {
+			return fmt.Errorf("restore previous runtime auth %s: %w", id, errUpdate)
+		}
+		return nil
+	}
+	if _, errRegister := h.authManager.Register(ctx, previous); errRegister != nil {
+		return fmt.Errorf("register previous runtime auth %s: %w", id, errRegister)
+	}
+	return nil
+}
+
+func (h *Handler) failClosePluginLoginRuntime(ctx context.Context, id string) {
+	if h == nil || h.authManager == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	h.authManager.Remove(coreauth.WithSkipPersist(ctx), id)
 }
 
 // PopulateAuthContext extracts request info and adds it to the context

@@ -1,10 +1,17 @@
 package management
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -222,3 +229,263 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
 	}
 }
+
+func TestAPICallDispatchAdmissionRejectsAntigravityRefreshWithoutSideEffects(t *testing.T) {
+	var refreshRequests atomic.Int64
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		refreshRequests.Add(1)
+	}))
+	defer refreshServer.Close()
+	originalTokenURL := antigravityOAuthTokenURL
+	antigravityOAuthTokenURL = refreshServer.URL
+	t.Cleanup(func() { antigravityOAuthTokenURL = originalTokenURL })
+
+	var targetRequests atomic.Int64
+	targetServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests.Add(1)
+	}))
+	defer targetServer.Close()
+
+	store := &apiCallDispatchStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	registered := registerAPICallAuth(t, manager, &coreauth.Auth{
+		ID:       "management-antigravity-rejected",
+		Provider: "antigravity",
+		Metadata: map[string]any{
+			"access_token":  "expired-access-token",
+			"refresh_token": "unchanged-refresh-token",
+			"expired":       time.Now().Add(-time.Minute).Format(time.RFC3339),
+		},
+	})
+	authority := &apiCallDispatchAuthority{}
+	manager.SetDispatchAuthority(authority)
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+
+	recorder := performAPICall(t, h, apiCallRequest{
+		AuthIndexSnake: stringPointer(registered.Index),
+		Method:         http.MethodGet,
+		URL:            targetServer.URL,
+		Header:         map[string]string{"Authorization": "Bearer $TOKEN$"},
+	})
+
+	assertAPICallAuthUnavailable(t, recorder)
+	if got := refreshRequests.Load(); got != 0 {
+		t.Fatalf("refresh HTTP requests = %d, want 0", got)
+	}
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("target HTTP requests = %d, want 0", got)
+	}
+	if got := store.saves.Load(); got != 0 {
+		t.Fatalf("credential persistence calls = %d, want 0", got)
+	}
+	current, ok := manager.GetByID(registered.ID)
+	if !ok {
+		t.Fatal("registered auth disappeared")
+	}
+	if got := stringValue(current.Metadata, "access_token"); got != "expired-access-token" {
+		t.Fatalf("access_token = %q, want unchanged expired-access-token", got)
+	}
+	if got := stringValue(current.Metadata, "refresh_token"); got != "unchanged-refresh-token" {
+		t.Fatalf("refresh_token = %q, want unchanged unchanged-refresh-token", got)
+	}
+	if !current.LastRefreshedAt.IsZero() || !current.UpdatedAt.IsZero() {
+		t.Fatalf("credential timestamps mutated after rejection: refreshed=%v updated=%v", current.LastRefreshedAt, current.UpdatedAt)
+	}
+	if admits, releases, active := authority.counts(); admits != 1 || releases != 0 || active != 0 {
+		t.Fatalf("dispatch admits/releases/active = %d/%d/%d, want 1/0/0", admits, releases, active)
+	}
+}
+
+func TestAPICallDispatchAdmissionRejectsSelectedAuthRequestBeforeNetwork(t *testing.T) {
+	var targetRequests atomic.Int64
+	targetServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests.Add(1)
+	}))
+	defer targetServer.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	registered := registerAPICallAuth(t, manager, &coreauth.Auth{
+		ID:         "management-auth-request-rejected",
+		Provider:   "gemini",
+		Attributes: map[string]string{"api_key": "secret"},
+	})
+	authority := &apiCallDispatchAuthority{}
+	manager.SetDispatchAuthority(authority)
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+
+	recorder := performAPICall(t, h, apiCallRequest{
+		AuthIndexSnake: stringPointer(registered.Index),
+		Method:         http.MethodGet,
+		URL:            targetServer.URL,
+		Header:         map[string]string{"Authorization": "Bearer $TOKEN$"},
+	})
+
+	assertAPICallAuthUnavailable(t, recorder)
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("target HTTP requests = %d, want 0", got)
+	}
+	if admits, releases, active := authority.counts(); admits != 1 || releases != 0 || active != 0 {
+		t.Fatalf("dispatch admits/releases/active = %d/%d/%d, want 1/0/0", admits, releases, active)
+	}
+}
+
+func TestAPICallDispatchAdmissionReleasesRefreshAndRequest(t *testing.T) {
+	var refreshRequests atomic.Int64
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"fresh-access-token","refresh_token":"fresh-refresh-token","expires_in":3600}`))
+	}))
+	defer refreshServer.Close()
+	originalTokenURL := antigravityOAuthTokenURL
+	antigravityOAuthTokenURL = refreshServer.URL
+	t.Cleanup(func() { antigravityOAuthTokenURL = originalTokenURL })
+
+	var targetRequests atomic.Int64
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		targetRequests.Add(1)
+		if got := req.Header.Get("Authorization"); got != "Bearer fresh-access-token" {
+			t.Errorf("Authorization = %q, want refreshed token", got)
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer targetServer.Close()
+
+	store := &apiCallDispatchStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	registered := registerAPICallAuth(t, manager, &coreauth.Auth{
+		ID:       "management-antigravity-admitted",
+		Provider: "antigravity",
+		Metadata: map[string]any{
+			"refresh_token": "old-refresh-token",
+		},
+	})
+	authority := &apiCallDispatchAuthority{allow: true}
+	manager.SetDispatchAuthority(authority)
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+
+	recorder := performAPICall(t, h, apiCallRequest{
+		AuthIndexSnake: stringPointer(registered.Index),
+		Method:         http.MethodGet,
+		URL:            targetServer.URL,
+		Header:         map[string]string{"Authorization": "Bearer $TOKEN$"},
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := refreshRequests.Load(); got != 1 {
+		t.Fatalf("refresh HTTP requests = %d, want 1", got)
+	}
+	if got := targetRequests.Load(); got != 1 {
+		t.Fatalf("target HTTP requests = %d, want 1", got)
+	}
+	if got := store.saves.Load(); got != 1 {
+		t.Fatalf("credential persistence calls = %d, want 1", got)
+	}
+	if admits, releases, active := authority.counts(); admits != 2 || releases != 2 || active != 0 {
+		t.Fatalf("dispatch admits/releases/active = %d/%d/%d, want 2/2/0", admits, releases, active)
+	}
+}
+
+func TestAPICallWithoutAuthIndexBypassesDispatchAdmission(t *testing.T) {
+	var targetRequests atomic.Int64
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetRequests.Add(1)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer targetServer.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	authority := &apiCallDispatchAuthority{}
+	manager.SetDispatchAuthority(authority)
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+
+	recorder := performAPICall(t, h, apiCallRequest{Method: http.MethodGet, URL: targetServer.URL})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := targetRequests.Load(); got != 1 {
+		t.Fatalf("target HTTP requests = %d, want 1", got)
+	}
+	if admits, releases, active := authority.counts(); admits != 0 || releases != 0 || active != 0 {
+		t.Fatalf("dispatch admits/releases/active = %d/%d/%d, want 0/0/0", admits, releases, active)
+	}
+}
+
+type apiCallDispatchStore struct {
+	saves atomic.Int64
+}
+
+func (*apiCallDispatchStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
+func (s *apiCallDispatchStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	s.saves.Add(1)
+	return "", nil
+}
+func (*apiCallDispatchStore) Delete(context.Context, string) error { return nil }
+
+type apiCallDispatchAuthority struct {
+	allow    bool
+	admits   atomic.Int64
+	releases atomic.Int64
+	active   atomic.Int64
+}
+
+func (a *apiCallDispatchAuthority) Admit(string) (func(), bool) {
+	a.admits.Add(1)
+	if !a.allow {
+		return nil, false
+	}
+	a.active.Add(1)
+	return func() {
+		a.active.Add(-1)
+		a.releases.Add(1)
+	}, true
+}
+
+func (*apiCallDispatchAuthority) Wake()                           {}
+func (*apiCallDispatchAuthority) Ready() bool                     { return true }
+func (*apiCallDispatchAuthority) WaitReady(context.Context) error { return nil }
+func (*apiCallDispatchAuthority) CloseAdmissions()                {}
+func (a *apiCallDispatchAuthority) counts() (int64, int64, int64) {
+	return a.admits.Load(), a.releases.Load(), a.active.Load()
+}
+
+func registerAPICallAuth(t *testing.T, manager *coreauth.Manager, auth *coreauth.Auth) *coreauth.Auth {
+	t.Helper()
+	registered, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth)
+	if errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	if registered == nil {
+		t.Fatal("register auth returned nil")
+	}
+	return registered
+}
+
+func performAPICall(t *testing.T, h *Handler, body apiCallRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		t.Fatalf("marshal APICall request: %v", errMarshal)
+	}
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", bytes.NewReader(payload))
+	ginContext.Request.Header.Set("Content-Type", "application/json")
+	h.APICall(ginContext)
+	return recorder
+}
+
+func assertAPICallAuthUnavailable(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"error":"auth_unavailable"`) {
+		t.Fatalf("body = %s, want auth_unavailable", recorder.Body.String())
+	}
+}
+
+func stringPointer(value string) *string { return &value }

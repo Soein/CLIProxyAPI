@@ -22,8 +22,6 @@ import (
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexhourly"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
@@ -37,6 +35,75 @@ import (
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
+
+const forceCloseWaitTimeout = 5 * time.Second
+
+type activeRequestTracker struct {
+	mu       sync.Mutex
+	stopping bool
+	active   int
+	drained  chan struct{}
+}
+
+func newActiveRequestTracker() *activeRequestTracker {
+	drained := make(chan struct{})
+	close(drained)
+	return &activeRequestTracker{drained: drained}
+}
+
+func (t *activeRequestTracker) handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.mu.Lock()
+		if t.stopping {
+			t.mu.Unlock()
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		if t.active == 0 {
+			t.drained = make(chan struct{})
+		}
+		t.active++
+		t.mu.Unlock()
+
+		defer func() {
+			t.mu.Lock()
+			t.active--
+			if t.active == 0 {
+				close(t.drained)
+			}
+			t.mu.Unlock()
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (t *activeRequestTracker) stopAccepting() <-chan struct{} {
+	if t == nil {
+		drained := make(chan struct{})
+		close(drained)
+		return drained
+	}
+	t.mu.Lock()
+	t.stopping = true
+	drained := t.drained
+	t.mu.Unlock()
+	return drained
+}
+
+func (t *activeRequestTracker) isDrained() bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	drained := t.drained
+	t.mu.Unlock()
+	select {
+	case <-drained:
+		return true
+	default:
+		return false
+	}
+}
 
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
@@ -52,6 +119,21 @@ type Server struct {
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
 	muxHTTPListener *muxListener
+
+	// startResult is completed once Start has either finished listener
+	// initialization or failed before serving. It provides Service with a
+	// real happens-before barrier instead of relying on a startup sleep.
+	startResult  chan error
+	startOnce    sync.Once
+	serveDone    chan struct{}
+	serveOnce    sync.Once
+	serveCalled  atomic.Bool
+	forceStopped atomic.Bool
+
+	// activeRequests prevents Shutdown from reporting a full stop while
+	// handlers that survived graceful shutdown are still running.
+	activeRequests *activeRequestTracker
+	forceCloseWait time.Duration
 
 	// handlers contains the API handlers for processing requests.
 	handlers         *handlers.BaseAPIHandler
@@ -136,6 +218,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
+	activeRequests := newActiveRequestTracker()
 
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
@@ -184,6 +267,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
+		startResult:         make(chan error, 1),
+		serveDone:           make(chan struct{}),
+		activeRequests:      activeRequests,
+		forceCloseWait:      forceCloseWaitForConfig(cfg),
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
@@ -206,16 +293,15 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
-	// PG-backed usage stats: when usage.backend is dual or pg and the auth
-	// store exposes a PostgreSQL pool, share it with management handlers for
-	// cluster-aggregated usage and automation status reads.
+	// PG-backed usage stats: when usage.backend != "memory" and the auth
+	// store is Postgres-backed, expose its connection pool to the
+	// management handler so /usage can issue cluster-aggregated queries.
 	if backend := strings.ToLower(strings.TrimSpace(cfg.Usage.Backend)); backend == "dual" || backend == "pg" {
 		if authManager != nil {
 			if store := authManager.GetStore(); store != nil {
 				if pg, ok := store.(interface{ DB() *sql.DB }); ok && pg.DB() != nil {
 					pgStore := usage.NewPGStore(pg.DB())
 					s.mgmt.SetPGUsage(pgStore)
-					s.mgmt.SetCodexAutomationStatusReader(pgStore)
 				}
 			}
 		}
@@ -266,10 +352,91 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Create HTTP server
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler: engine,
+		Handler: activeRequests.handler(engine),
 	}
 
 	return s
+}
+
+func forceCloseWaitForConfig(cfg *config.Config) time.Duration {
+	wait := forceCloseWaitTimeout
+	if cfg == nil || !cfg.Cluster.Enabled {
+		return wait
+	}
+	staleness, errParse := time.ParseDuration(strings.TrimSpace(cfg.Cluster.RingStalenessThreshold))
+	if errParse != nil || staleness <= 0 || wait < staleness {
+		return wait
+	}
+	// A fatal cluster stop must finish its bounded force-close observation
+	// before peers may evict this node by staleness and reuse its identity.
+	return staleness / 2
+}
+
+// Started reports the one-time result of listener initialization. A nil
+// result means Start has published its listeners and launched both serving
+// goroutines, so Stop can safely run concurrently with the steady-state
+// server. A non-nil result means Start failed before reaching that point.
+func (s *Server) Started() <-chan error {
+	if s == nil {
+		result := make(chan error, 1)
+		result <- errors.New("API server is nil")
+		close(result)
+		return result
+	}
+	return s.startResult
+}
+
+func (s *Server) signalStarted(err error) {
+	if s == nil || s.startResult == nil {
+		return
+	}
+	s.startOnce.Do(func() {
+		s.startResult <- err
+		close(s.startResult)
+	})
+}
+
+func (s *Server) signalServingStopped() {
+	if s == nil || s.serveDone == nil {
+		return
+	}
+	s.serveOnce.Do(func() {
+		close(s.serveDone)
+	})
+}
+
+// IsStopped reports whether the serving loop has exited and all tracked HTTP
+// handlers have returned. A server that was never started is already stopped.
+func (s *Server) IsStopped() bool {
+	if s == nil {
+		return true
+	}
+	if s.serveCalled.Load() {
+		if s.serveDone == nil {
+			return false
+		}
+		select {
+		case <-s.serveDone:
+		default:
+			return false
+		}
+	}
+	return s.activeRequests.isDrained()
+}
+
+// WaitUntilStopped waits until the serving loop and every tracked HTTP
+// handler have returned. Force-closing the HTTP server cancels request
+// contexts, but a handler that ignores cancellation can outlive that close;
+// callers that guard ownership leases must therefore wait for this stronger
+// stopped signal before releasing them.
+func (s *Server) WaitUntilStopped(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.waitUntilStopped(ctx, s.activeRequests.stopAccepting())
 }
 
 // Start begins listening for and serving HTTP or HTTPS requests.
@@ -278,14 +445,24 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // Returns:
 //   - error: An error if the server fails to start
 func (s *Server) Start() error {
+	if s != nil {
+		s.serveCalled.Store(true)
+		defer s.signalServingStopped()
+	}
 	if s == nil || s.server == nil {
-		return fmt.Errorf("failed to start HTTP server: server not initialized")
+		errStart := fmt.Errorf("failed to start HTTP server: server not initialized")
+		if s != nil {
+			s.signalStarted(errStart)
+		}
+		return errStart
 	}
 
 	addr := s.server.Addr
 	listener, errListen := net.Listen("tcp", addr)
 	if errListen != nil {
-		return fmt.Errorf("failed to start HTTP server: %v", errListen)
+		errStart := fmt.Errorf("failed to start HTTP server: %v", errListen)
+		s.signalStarted(errStart)
+		return errStart
 	}
 
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
@@ -296,14 +473,18 @@ func (s *Server) Start() error {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
 			}
-			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
+			errStart := fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
+			s.signalStarted(errStart)
+			return errStart
 		}
 		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
 		if errLoad != nil {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)
 			}
-			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
+			errStart := fmt.Errorf("failed to start HTTPS server: %v", errLoad)
+			s.signalStarted(errStart)
+			return errStart
 		}
 
 		tlsConfig := &tls.Config{
@@ -333,6 +514,7 @@ func (s *Server) Start() error {
 	go func() {
 		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
 	}()
+	s.signalStarted(nil)
 
 	select {
 	case errServe := <-httpErrCh:
@@ -376,8 +558,9 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop gracefully shuts down the API server without interrupting any
-// active connections.
+// Stop first attempts a graceful shutdown. If the context expires, it
+// force-closes active connections and waits for the serving loop and tracked
+// handlers to exit before returning.
 //
 // Parameters:
 //   - ctx: The context for graceful shutdown
@@ -386,6 +569,10 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	if s == nil || s.server == nil {
+		return errors.New("failed to shutdown HTTP server: server not initialized")
+	}
+	requestsDrained := s.activeRequests.stopAccepting()
 
 	if s.keepAliveEnabled {
 		select {
@@ -393,7 +580,69 @@ func (s *Server) Stop(ctx context.Context) error {
 		default:
 		}
 	}
+	s.closeListeners()
+	if s.forceStopped.Load() {
+		forceCtx, cancel := context.WithTimeout(context.Background(), s.forceCloseWait)
+		errWait := s.waitUntilStopped(forceCtx, requestsDrained)
+		cancel()
+		if errWait != nil {
+			return fmt.Errorf("failed to confirm HTTP server stopped after force-close: %w", errWait)
+		}
+		return nil
+	}
 
+	// Shutdown the HTTP server. If graceful shutdown times out, Close is
+	// required to cancel active request contexts; closing listeners alone only
+	// stops new accepts and can leave handlers running after Stop returns.
+	errShutdown := normalizeHTTPServeError(s.server.Shutdown(ctx))
+	if s.codexLiveHandler != nil {
+		s.codexLiveHandler.Close()
+	}
+	if errShutdown != nil {
+		errClose := s.ForceStop()
+		forceCtx, cancel := context.WithTimeout(context.Background(), s.forceCloseWait)
+		errWait := s.waitUntilStopped(forceCtx, requestsDrained)
+		cancel()
+
+		shutdownErr := fmt.Errorf("failed to shutdown HTTP server gracefully: %w", errShutdown)
+		if errClose != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("failed to force-close HTTP server: %w", errClose))
+		}
+		if errWait != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("failed to confirm HTTP server stopped after force-close: %w", errWait))
+		}
+		return shutdownErr
+	}
+
+	if errWait := s.waitUntilStopped(ctx, requestsDrained); errWait != nil {
+		return fmt.Errorf("failed to confirm HTTP server stopped: %w", errWait)
+	}
+
+	log.Debug("API server stopped")
+	return nil
+}
+
+// ForceStop immediately stops accepting requests and closes active HTTP
+// connections. http.Server.Close cancels request contexts for those
+// connections, but Go cannot forcibly terminate a handler that ignores its
+// context; WaitUntilStopped is the authoritative completion boundary.
+func (s *Server) ForceStop() error {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	s.forceStopped.Store(true)
+	s.activeRequests.stopAccepting()
+	s.closeListeners()
+	if s.codexLiveHandler != nil {
+		s.codexLiveHandler.Close()
+	}
+	return normalizeHTTPServeError(s.server.Close())
+}
+
+func (s *Server) closeListeners() {
+	if s == nil {
+		return
+	}
 	if s.muxHTTPListener != nil {
 		_ = s.muxHTTPListener.Close()
 	}
@@ -402,30 +651,23 @@ func (s *Server) Stop(ctx context.Context) error {
 			log.Debugf("failed to close shared listener: %v", errClose)
 		}
 	}
-
-	// Shutdown the HTTP server.
-	errShutdown := s.server.Shutdown(ctx)
-	if s.codexLiveHandler != nil {
-		s.codexLiveHandler.Close()
-	}
-	if errShutdown != nil {
-		return fmt.Errorf("failed to shutdown HTTP server: %v", errShutdown)
-	}
-
-	log.Debug("API server stopped")
-	return nil
 }
 
-func (s *Server) SetCodexWeeklyAutomationStatusProvider(provider func() codexweekly.Status) {
-	if s == nil || s.mgmt == nil {
-		return
+func (s *Server) waitUntilStopped(ctx context.Context, requestsDrained <-chan struct{}) error {
+	if s.serveCalled.Load() {
+		if s.serveDone == nil {
+			return errors.New("serving completion signal is unavailable")
+		}
+		select {
+		case <-s.serveDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	s.mgmt.SetCodexWeeklyAutomationStatusProvider(provider)
-}
-
-func (s *Server) SetCodexHourlyAutomationStatusProvider(provider func() codexhourly.Status) {
-	if s == nil || s.mgmt == nil {
-		return
+	select {
+	case <-requestsDrained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	s.mgmt.SetCodexHourlyAutomationStatusProvider(provider)
 }

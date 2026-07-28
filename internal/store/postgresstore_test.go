@@ -8,15 +8,41 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
+func TestPostgresConnConfigSearchPath(t *testing.T) {
+	const dsn = "postgres://cliproxy:secret@localhost/cliproxy?search_path=public"
+	tests := []struct {
+		name       string
+		schema     string
+		searchPath string
+	}{
+		{name: "empty schema preserves DSN", searchPath: "public"},
+		{name: "simple schema", schema: "tenant_a", searchPath: `"tenant_a"`},
+		{name: "mixed case and spaces", schema: "Tenant A", searchPath: `"Tenant A"`},
+		{name: "quotes cannot add fallback schema", schema: `tenant", public`, searchPath: `"tenant"", public"`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, errConfig := postgresConnConfig(dsn, test.schema)
+			if errConfig != nil {
+				t.Fatalf("postgresConnConfig() error: %v", errConfig)
+			}
+			if got := config.RuntimeParams["search_path"]; got != test.searchPath {
+				t.Fatalf("search_path = %q, want %q", got, test.searchPath)
+			}
+		})
+	}
+}
+
 // TestBuildAuthFromRow_RestoresDisabledTrue verifies the read path turns
 // metadata.disabled=true back into auth.Disabled=true and Status=StatusDisabled.
-// Regression: prior to the fix, Disabled was never persisted/read, so codex
-// auto-disabled auths reactivated themselves on every restart.
+// Regression: prior to the fix, Disabled was never persisted/read, so auths
+// disabled through management APIs or an external controller reactivated on restart.
 func TestBuildAuthFromRow_RestoresDisabledTrue(t *testing.T) {
 	authDir := t.TempDir()
 	store := &PostgresStore{authDir: authDir}
 
-	payload := `{"type":"codex","email":"u@x.com","disabled":true,"codex_weekly_auto_disabled_at":"2026-04-27T05:20:57Z"}`
+	payload := `{"type":"codex","email":"u@x.com","disabled":true,"controller_disabled_at":"2026-04-27T05:20:57Z"}`
 	now := time.Date(2026, 4, 27, 5, 21, 0, 0, time.UTC)
 
 	auth, ok := store.buildAuthFromRow("acct-1.json", payload, now, now)
@@ -29,8 +55,8 @@ func TestBuildAuthFromRow_RestoresDisabledTrue(t *testing.T) {
 	if auth.Status != cliproxyauth.StatusDisabled {
 		t.Fatalf("auth.Status = %s, want %s", auth.Status, cliproxyauth.StatusDisabled)
 	}
-	if got := auth.Metadata["codex_weekly_auto_disabled_at"]; got != "2026-04-27T05:20:57Z" {
-		t.Fatalf("metadata.codex_weekly_auto_disabled_at = %v, want timestamp", got)
+	if got := auth.Metadata["controller_disabled_at"]; got != "2026-04-27T05:20:57Z" {
+		t.Fatalf("metadata.controller_disabled_at = %v, want timestamp", got)
 	}
 }
 

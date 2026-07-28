@@ -1336,6 +1336,8 @@ type UsageRecord struct {
 	Latency time.Duration
 	// TTFT is the time to first token for streaming requests.
 	TTFT time.Duration
+	// Phases contains optional per-attempt timing details when the host enables tracking.
+	Phases *UsagePhaseTimings
 	// Failed reports whether the request failed.
 	Failed bool
 	// Failure contains failure details when Failed is true.
@@ -1344,6 +1346,32 @@ type UsageRecord struct {
 	Detail UsageDetail
 	// ResponseHeaders contains selected upstream response headers.
 	ResponseHeaders http.Header
+}
+
+// UsagePhaseTimings contains timing and routing metadata for one upstream attempt.
+type UsagePhaseTimings struct {
+	// Attempt is the one-based attempt ordinal within the request.
+	Attempt int
+	// RequestElapsedToUpstreamStart is measured from request tracking start.
+	RequestElapsedToUpstreamStart time.Duration
+	// AuthSelection is the duration of auth selection for this attempt.
+	AuthSelection time.Duration
+	// ResponseHeaders is measured from upstream dispatch until headers arrive.
+	ResponseHeaders time.Duration
+	// FirstEvent is measured from upstream dispatch until the first protocol event.
+	FirstEvent time.Duration
+	// FirstSemanticToken is measured from upstream dispatch until user-visible content.
+	FirstSemanticToken time.Duration
+	// Terminal is measured from upstream dispatch until the terminal event.
+	Terminal time.Duration
+	// ResponseHeadersObserved distinguishes an immediate header response from no response.
+	ResponseHeadersObserved bool
+	// TransportReused reports whether the HTTP connection was reused.
+	TransportReused bool
+	// AffinityOutcome records the normalized session-affinity outcome.
+	AffinityOutcome string
+	// TerminalKind identifies the terminal event.
+	TerminalKind string
 }
 
 // UsageFailure describes an upstream or executor failure.

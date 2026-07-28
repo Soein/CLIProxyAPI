@@ -63,6 +63,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		requireStringField(t, payload, "response_service_tier", "default")
 		requireIntField(t, payload, "accounting_version", coreusage.TokenAccountingSchemaVersion)
 		requireTokenBreakdown(t, payload, coreusage.TokenAccountingQualityComplete, 30)
+		requireMissingField(t, payload, "phases")
 		requireTokensBoolField(t, payload, "cache_read_tokens_present", true)
 		requireHeaderField(t, payload, "response_headers", "X-Upstream-Request-Id", []string{"upstream-req-1"})
 		requireHeaderField(t, payload, "response_headers", "Retry-After", []string{"30"})
@@ -102,6 +103,47 @@ func TestUsageQueuePluginNormalizesDirectSDKUsageByProvider(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestUsageQueuePluginSerializesPhaseTimingsInMilliseconds(t *testing.T) {
+	withEnabledQueue(t, func() {
+		ctx := internallogging.WithResponseStatusHolder(context.Background())
+		internallogging.SetResponseStatus(ctx, http.StatusOK)
+		(&usageQueuePlugin{}).HandleUsage(ctx, coreusage.Record{
+			Provider: "xai",
+			Model:    "grok-4",
+			Phases: &coreusage.PhaseTimings{
+				Attempt:                       2,
+				RequestElapsedToUpstreamStart: 11*time.Millisecond + 900*time.Microsecond,
+				AuthSelection:                 3 * time.Millisecond,
+				ResponseHeaders:               17 * time.Millisecond,
+				FirstEvent:                    19 * time.Millisecond,
+				FirstSemanticToken:            23 * time.Millisecond,
+				Terminal:                      29 * time.Millisecond,
+				ResponseHeadersObserved:       true,
+				TransportReused:               true,
+				AffinityOutcome:               coreusage.AffinityOutcomeHit,
+				TerminalKind:                  "completed",
+			},
+		})
+
+		payload := popSinglePayload(t)
+		var phases map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(payload["phases"], &phases); errUnmarshal != nil {
+			t.Fatalf("unmarshal phases: %v", errUnmarshal)
+		}
+		requireInt64Field(t, phases, "attempt", 2)
+		requireInt64Field(t, phases, "request_elapsed_to_upstream_start_ms", 11)
+		requireInt64Field(t, phases, "auth_selection_ms", 3)
+		requireInt64Field(t, phases, "response_headers_ms", 17)
+		requireInt64Field(t, phases, "first_event_ms", 19)
+		requireInt64Field(t, phases, "first_semantic_token_ms", 23)
+		requireInt64Field(t, phases, "terminal_ms", 29)
+		requireStringField(t, phases, "affinity_outcome", "hit")
+		requireStringField(t, phases, "terminal_kind", "completed")
+		requireBoolField(t, phases, "response_headers_observed", true)
+		requireBoolField(t, phases, "transport_reused", true)
+	})
 }
 
 func TestUsageQueuePluginPayloadIncludesGenerateFalse(t *testing.T) {
@@ -485,6 +527,22 @@ func requireBoolField(t *testing.T, payload map[string]json.RawMessage, key stri
 	}
 	if got != want {
 		t.Fatalf("%s = %t, want %t", key, got, want)
+	}
+}
+
+func requireInt64Field(t *testing.T, payload map[string]json.RawMessage, key string, want int64) {
+	t.Helper()
+
+	raw, ok := payload[key]
+	if !ok {
+		t.Fatalf("payload missing %q", key)
+	}
+	var got int64
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", key, err)
+	}
+	if got != want {
+		t.Fatalf("%s = %d, want %d", key, got, want)
 	}
 }
 

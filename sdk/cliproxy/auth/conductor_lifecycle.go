@@ -2,11 +2,11 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 // SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
@@ -71,29 +71,57 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	auth.discardStoreGenerationMetadata()
 	now := time.Now()
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
-	authClone := auth.Clone()
 	m.mu.Lock()
+	existing := m.auths[auth.ID]
+	registeringNew := existing == nil
+	if existing != nil && auth.StoreGeneration() == 0 {
+		auth.SetStoreGeneration(existing.StoreGeneration())
+	}
+	if existing != nil && m.shouldCarryDisabledRuntimeLocked(auth.ID, existing) {
+		auth = mergePersistedAuthRuntime(auth, existing)
+	}
+	m.carryDisabledAdmissionLocked(auth.ID, auth, existing)
+	if existing == nil {
+		delete(m.pendingDisabledPersistence, auth.ID)
+	}
+	auth.revision = m.nextAuthRevisionLocked()
+	auth.durableRevision = m.nextAuthDurableRevisionLocked()
+	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	m.markPersistenceInFlightLocked(ctx, authClone)
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.schedulerUpsert(authClone)
+	}
+	if registeringNew {
+		m.wakeDispatchAuthority()
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthRegistered(ctx, auth.Clone())
+	errPersist := m.persistRegisteredIfCurrent(ctx, authClone, registeringNew)
+	if errPersist != nil {
+		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
+		current, _ := m.GetByID(auth.ID)
+		return current, fmt.Errorf("persist registered auth %q: %w", auth.ID, errPersist)
+	}
+	committed, okCommitted := m.GetByID(auth.ID)
+	if !okCommitted || committed == nil {
+		committed = auth.Clone()
+	}
+	m.hook.OnAuthRegistered(ctx, committed.Clone())
 	if clearedCooldown {
 		m.persistCooldownStates(ctx)
 	}
-	return auth.Clone(), nil
+	return committed, nil
 }
 
 // Update replaces an existing auth entry and notifies hooks.
@@ -101,12 +129,37 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	auth.discardStoreGenerationMetadata()
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
 		return nil, nil
 	}
+	if auth.durableRevision != 0 && auth.durableRevision < existing.durableRevision {
+		current := existing.Clone()
+		m.mu.Unlock()
+		return current, nil
+	}
+	incomingGeneration := auth.StoreGeneration()
+	existingGeneration := existing.StoreGeneration()
+	if incomingGeneration > 0 && existingGeneration > 0 && incomingGeneration < existingGeneration {
+		current := existing.Clone()
+		m.mu.Unlock()
+		return current, nil
+	}
+	unversionedWatcherSnapshot := incomingGeneration == 0 && existingGeneration > 0
+	if unversionedWatcherSnapshot {
+		auth.SetStoreGeneration(existing.StoreGeneration())
+	}
+	if unversionedWatcherSnapshot && authIsDisabled(existing) && !authIsDisabled(auth) {
+		// File watcher snapshots without the private Postgres generation cannot
+		// prove they are newer than a durable disable. Preserve credential fields
+		// while keeping admission closed; only SetDisabled(false) is an explicit
+		// local enable operation.
+		applyDisabledRuntimeState(auth, existing)
+	}
+	m.carryDisabledAdmissionLocked(auth.ID, auth, existing)
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
@@ -125,22 +178,33 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
+	auth.revision = m.nextAuthRevisionLocked()
+	auth.durableRevision = m.nextAuthDurableRevisionLocked()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	m.markPersistenceInFlightLocked(ctx, authClone)
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.schedulerUpsert(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	if errPersist := m.persistPublishedIfCurrent(ctx, authClone); errPersist != nil {
+		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
+		current, _ := m.GetByID(auth.ID)
+		return current, fmt.Errorf("persist updated auth %q: %w", auth.ID, errPersist)
+	}
+	committed, okCommitted := m.GetByID(auth.ID)
+	if !okCommitted || committed == nil {
+		committed = auth.Clone()
+	}
+	m.hook.OnAuthUpdated(ctx, committed.Clone())
 	if clearedCooldown {
 		m.persistCooldownStates(ctx)
 	}
-	return auth.Clone(), nil
+	return committed, nil
 }
 
 // Remove deletes an auth from runtime state without persisting.
@@ -205,58 +269,30 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	}
 }
 
-// Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
-	m.mu.Lock()
-	if m.store == nil {
-		m.mu.Unlock()
-		return nil
-	}
-	items, err := m.store.List(ctx)
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	m.auths = make(map[string]*Auth, len(items))
-	for _, auth := range items {
-		if auth == nil || auth.ID == "" {
-			continue
-		}
-		auth.EnsureIndex()
-		m.auths[auth.ID] = auth.Clone()
-	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil {
-		cfg = &internalconfig.Config{}
-	}
-	m.rebuildAPIKeyModelAliasLocked(cfg)
-	m.mu.Unlock()
-	m.syncScheduler()
-	return nil
+	return m.load(ctx, false)
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
-	if m.store == nil || auth == nil {
+	if m == nil || auth == nil {
 		return nil
 	}
-	if shouldSkipPersist(ctx) {
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if store == nil || shouldSkipPersist(ctx) || isExplicitlyNonPersistentAuth(auth) || auth.Metadata == nil {
 		return nil
 	}
-	if IsConfigAPIKeyAuth(auth) {
-		return nil
-	}
-	if auth.Attributes != nil {
-		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
-			return nil
+	if versioned, ok := store.(VersionedAuthStore); ok {
+		expectedGeneration := auth.StoreGeneration()
+		_, generation, errSave := versioned.SaveVersioned(ctx, auth, expectedGeneration)
+		if errSave != nil {
+			return errSave
 		}
-	}
-	if IsPluginVirtualAuth(auth) {
+		auth.SetStoreGeneration(generation)
+		m.mergeCommittedStoreGeneration(auth, expectedGeneration, generation)
 		return nil
 	}
-	// Skip persistence when metadata is absent (e.g., runtime-only auths).
-	if auth.Metadata == nil {
-		return nil
-	}
-	_, err := m.store.Save(ctx, auth)
+	_, err := store.Save(ctx, auth)
 	return err
 }

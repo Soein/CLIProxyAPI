@@ -87,6 +87,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Timestamp:       timestamp,
 		LatencyMs:       record.Latency.Milliseconds(),
 		TTFTMs:          record.TTFT.Milliseconds(),
+		Phases:          queuePhaseTimings(record.Phases),
 		Source:          record.Source,
 		AuthIndex:       record.AuthIndex,
 		Tokens:          tokens,
@@ -136,16 +137,50 @@ type queuedUsageDetail struct {
 }
 
 type requestDetail struct {
-	Timestamp       time.Time   `json:"timestamp"`
-	LatencyMs       int64       `json:"latency_ms"`
-	TTFTMs          int64       `json:"ttft_ms"`
-	Source          string      `json:"source"`
-	AuthIndex       string      `json:"auth_index"`
-	Tokens          tokenStats  `json:"tokens"`
-	Failed          bool        `json:"failed"`
-	Generate        bool        `json:"generate"`
-	Fail            failDetail  `json:"fail"`
-	ResponseHeaders http.Header `json:"response_headers,omitempty"`
+	Timestamp       time.Time     `json:"timestamp"`
+	LatencyMs       int64         `json:"latency_ms"`
+	TTFTMs          int64         `json:"ttft_ms"`
+	Phases          *phaseTimings `json:"phases,omitempty"`
+	Source          string        `json:"source"`
+	AuthIndex       string        `json:"auth_index"`
+	Tokens          tokenStats    `json:"tokens"`
+	Failed          bool          `json:"failed"`
+	Generate        bool          `json:"generate"`
+	Fail            failDetail    `json:"fail"`
+	ResponseHeaders http.Header   `json:"response_headers,omitempty"`
+}
+
+type phaseTimings struct {
+	Attempt                         int    `json:"attempt"`
+	RequestElapsedToUpstreamStartMs int64  `json:"request_elapsed_to_upstream_start_ms"`
+	AuthSelectionMs                 int64  `json:"auth_selection_ms"`
+	ResponseHeadersMs               int64  `json:"response_headers_ms"`
+	FirstEventMs                    int64  `json:"first_event_ms"`
+	FirstSemanticTokenMs            int64  `json:"first_semantic_token_ms"`
+	TerminalMs                      int64  `json:"terminal_ms"`
+	ResponseHeadersObserved         bool   `json:"response_headers_observed"`
+	TransportReused                 bool   `json:"transport_reused"`
+	AffinityOutcome                 string `json:"affinity_outcome"`
+	TerminalKind                    string `json:"terminal_kind"`
+}
+
+func queuePhaseTimings(phases *coreusage.PhaseTimings) *phaseTimings {
+	if phases == nil {
+		return nil
+	}
+	return &phaseTimings{
+		Attempt:                         phases.Attempt,
+		RequestElapsedToUpstreamStartMs: phases.RequestElapsedToUpstreamStart.Milliseconds(),
+		AuthSelectionMs:                 phases.AuthSelection.Milliseconds(),
+		ResponseHeadersMs:               phases.ResponseHeaders.Milliseconds(),
+		FirstEventMs:                    phases.FirstEvent.Milliseconds(),
+		FirstSemanticTokenMs:            phases.FirstSemanticToken.Milliseconds(),
+		TerminalMs:                      phases.Terminal.Milliseconds(),
+		ResponseHeadersObserved:         phases.ResponseHeadersObserved,
+		TransportReused:                 phases.TransportReused,
+		AffinityOutcome:                 string(phases.AffinityOutcome),
+		TerminalKind:                    phases.TerminalKind,
+	}
 }
 
 type tokenStats struct {

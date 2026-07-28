@@ -96,8 +96,30 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
-	recentRequests recentRequestRing `json:"-"`
-	indexAssigned  bool              `json:"-"`
+	recentRequests  recentRequestRing `json:"-"`
+	indexAssigned   bool              `json:"-"`
+	revision        uint64            `json:"-"`
+	durableRevision uint64            `json:"-"`
+	storeGeneration uint64            `json:"-"`
+}
+
+// StoreGeneration returns the generation last observed from a versioned
+// durable auth store. It is intentionally excluded from JSON, Metadata, and
+// Attributes so provider payloads cannot forge persistence ordering.
+func (a *Auth) StoreGeneration() uint64 {
+	if a == nil {
+		return 0
+	}
+	return a.storeGeneration
+}
+
+// SetStoreGeneration records a generation returned by a trusted Store
+// implementation. Callers should not derive this value from provider data.
+func (a *Auth) SetStoreGeneration(generation uint64) {
+	if a == nil {
+		return
+	}
+	a.storeGeneration = generation
 }
 
 const (
@@ -106,6 +128,15 @@ const (
 	AttributeVirtualSource   = "virtual_source"
 	pluginVirtualAttrEnabled = "true"
 )
+
+const postgresStoreGenerationMetadataKey = "__cliproxy_internal_postgres_version"
+
+func (a *Auth) discardStoreGenerationMetadata() {
+	if a == nil || a.Metadata == nil {
+		return
+	}
+	delete(a.Metadata, postgresStoreGenerationMetadataKey)
+}
 
 // MarkPluginVirtualAuth marks an auth that was expanded from a plugin-owned source file.
 func MarkPluginVirtualAuth(auth *Auth, sourcePath string, ordinal int) {

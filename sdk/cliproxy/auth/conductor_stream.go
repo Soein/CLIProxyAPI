@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -103,10 +104,14 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, lease *authLease, dispatchRelease func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		defer lease.Release()
+		if dispatchRelease != nil {
+			defer dispatchRelease()
+		}
 		var failed bool
 		forward := true
 		var rewriter *StreamRewriter
@@ -161,8 +166,25 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				return
 			}
 		}
-		for chunk := range remaining {
-			if ok := emit(chunk); !ok {
+		for {
+			var (
+				chunk cliproxyexecutor.StreamChunk
+				ok    bool
+			)
+			if ctx == nil {
+				chunk, ok = <-remaining
+			} else {
+				select {
+				case <-ctx.Done():
+					discardStreamChunks(remaining)
+					return
+				case chunk, ok = <-remaining:
+				}
+			}
+			if !ok {
+				break
+			}
+			if emitted := emit(chunk); !emitted {
 				discardStreamChunks(remaining)
 				return
 			}
@@ -180,7 +202,11 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, allowRetry bool, ephemeralResult bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, allowRetry bool, ephemeralResult bool, lease *authLease) (*cliproxyexecutor.StreamResult, error) {
+	ownedLease := lease
+	defer func() {
+		ownedLease.Release()
+	}()
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -188,6 +214,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	var lastErr error
 	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
+		var dispatchRelease func()
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
@@ -203,16 +230,26 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if errCtx := ctx.Err(); errCtx != nil {
 			return nil, errCtx
 		}
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+		streamResult, dispatchRelease, errStream := m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
+		if errors.Is(errStream, ErrDispatchAdmissionRejected) {
+			return nil, errStream
+		}
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
 			if allowRetry {
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
+				refreshed, okRefresh, errRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized)
+				if errRefresh != nil {
+					return nil, errRefresh
+				}
+				if okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
+					streamResult, dispatchRelease, errStream = m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
+					if errors.Is(errStream, ErrDispatchAdmissionRejected) {
+						return nil, errStream
+					}
 					if errStream != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
 							return nil, errCtx
@@ -222,6 +259,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if errStream == nil && (streamResult == nil || streamResult.Chunks == nil) {
+			if dispatchRelease != nil {
+				dispatchRelease()
+				dispatchRelease = nil
+			}
 			errStream = &Error{Code: "empty_stream", Message: "upstream stream has no source", Retryable: true}
 		}
 		if errStream != nil {
@@ -240,14 +281,33 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
+				if dispatchRelease != nil {
+					dispatchRelease()
+				}
 				return nil, errCtx
 			}
 			if allowRetry {
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, bootstrapErr, didRefreshOnUnauthorized); okRefresh {
+				refreshed, okRefresh, errRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, bootstrapErr, didRefreshOnUnauthorized)
+				if errRefresh != nil {
 					discardStreamChunks(streamResult.Chunks)
+					if dispatchRelease != nil {
+						dispatchRelease()
+						dispatchRelease = nil
+					}
+					return nil, errRefresh
+				}
+				if okRefresh {
+					discardStreamChunks(streamResult.Chunks)
+					if dispatchRelease != nil {
+						dispatchRelease()
+						dispatchRelease = nil
+					}
 					auth = refreshed
 					didRefreshOnUnauthorized = true
-					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+					retryStream, retryRelease, retryErr := m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
+					if errors.Is(retryErr, ErrDispatchAdmissionRejected) {
+						return nil, retryErr
+					}
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
 							return nil, errCtx
@@ -256,12 +316,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						streamResult = &cliproxyexecutor.StreamResult{}
 					} else {
 						streamResult = retryStream
+						dispatchRelease = retryRelease
 						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
 					}
 				}
 			}
 		}
 		if bootstrapErr != nil {
+			if dispatchRelease != nil {
+				dispatchRelease()
+				dispatchRelease = nil
+			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := resultErrorFromError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
@@ -288,6 +353,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 
 		if closed && len(buffered) == 0 {
+			if dispatchRelease != nil {
+				dispatchRelease()
+				dispatchRelease = nil
+			}
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
@@ -304,7 +373,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult), nil
+		wrapped := m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, ephemeralResult, ownedLease, dispatchRelease)
+		ownedLease = nil
+		return wrapped, nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

@@ -2204,6 +2204,45 @@ func TestUsageAdapterPreservesExplicitGenerateFalse(t *testing.T) {
 	}
 }
 
+func TestUsageAdapterMapsPhaseTimings(t *testing.T) {
+	var got *pluginapi.UsagePhaseTimings
+	plugin := usagePluginFunc(func(_ context.Context, record pluginapi.UsageRecord) {
+		got = record.Phases
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-phases",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{host: host, pluginID: "usage-phases"}
+	phases := &coreusage.PhaseTimings{
+		Attempt:                       2,
+		RequestElapsedToUpstreamStart: 10 * time.Millisecond,
+		AuthSelection:                 2 * time.Millisecond,
+		ResponseHeaders:               20 * time.Millisecond,
+		FirstEvent:                    25 * time.Millisecond,
+		FirstSemanticToken:            30 * time.Millisecond,
+		Terminal:                      80 * time.Millisecond,
+		ResponseHeadersObserved:       true,
+		TransportReused:               true,
+		AffinityOutcome:               coreusage.AffinityOutcomeFailover,
+		TerminalKind:                  "completed",
+	}
+	adapter.HandleUsage(context.Background(), coreusage.Record{Provider: "xai", Phases: phases})
+	phases.Attempt = 99
+
+	if got == nil {
+		t.Fatal("plugin phases = nil")
+	}
+	if got.Attempt != 2 || got.AffinityOutcome != "failover" || got.TerminalKind != "completed" {
+		t.Fatalf("plugin phases = %+v", got)
+	}
+	if got.RequestElapsedToUpstreamStart != 10*time.Millisecond || got.FirstSemanticToken != 30*time.Millisecond {
+		t.Fatalf("plugin phase durations = %+v", got)
+	}
+}
+
 func TestUsageManagerRegisterNamedReplacesWithoutDuplicateDispatch(t *testing.T) {
 	manager := coreusage.NewManager(0)
 	defer manager.Stop()

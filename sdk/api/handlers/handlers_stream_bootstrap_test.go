@@ -20,6 +20,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -199,6 +200,63 @@ type authAwareStreamExecutor struct {
 type invalidJSONStreamExecutor struct{}
 
 type splitResponsesEventStreamExecutor struct{}
+
+type phaseTrackingStreamExecutor struct {
+	mu        sync.Mutex
+	provider  string
+	failFirst bool
+	trackers  []*coreusage.PhaseTracker
+	attempts  []int
+}
+
+func (e *phaseTrackingStreamExecutor) Identifier() string { return e.provider }
+
+func (e *phaseTrackingStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *phaseTrackingStreamExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	tracker := coreusage.PhaseTrackerFromContext(ctx)
+	attempt := 0
+	if tracker != nil {
+		attempt = tracker.BeginAttempt().Attempt
+	}
+
+	e.mu.Lock()
+	e.trackers = append(e.trackers, tracker)
+	e.attempts = append(e.attempts, attempt)
+	call := len(e.trackers)
+	e.mu.Unlock()
+
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	if e.failFirst && call == 1 {
+		ch <- coreexecutor.StreamChunk{Err: errors.New("bootstrap failed")}
+	} else {
+		ch <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")}
+	}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *phaseTrackingStreamExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *phaseTrackingStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *phaseTrackingStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented", HTTPStatus: http.StatusNotImplemented}
+}
+
+func (e *phaseTrackingStreamExecutor) Snapshots() ([]*coreusage.PhaseTracker, []int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	trackers := append([]*coreusage.PhaseTracker(nil), e.trackers...)
+	attempts := append([]int(nil), e.attempts...)
+	return trackers, attempts
+}
 
 func (e *invalidJSONStreamExecutor) Identifier() string { return "codex" }
 
@@ -714,6 +772,96 @@ func TestExecuteStreamWithAuthManager_HomeBootstrapFailureDoesNotRedispatch(t *t
 	}
 	if got := releaseSink.Notifications(); len(got) != 1 || got[0] != wantRelease {
 		t.Fatalf("release notifications after drain = %#v, want [%#v]", got, wantRelease)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_XAIBootstrapRetryPreservesPhaseTracker(t *testing.T) {
+	executor := &phaseTrackingStreamExecutor{provider: "xai", failFirst: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	manager.SetRetryConfig(0, 0, 1)
+
+	auth := &coreauth.Auth{ID: "phase-xai-auth", Provider: "xai", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(%s): %v", auth.ID, err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "phase-xai-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"phase-xai-model",
+		[]byte(`{"model":"phase-xai-model"}`),
+		"",
+	)
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	trackers, attempts := executor.Snapshots()
+	if len(trackers) != 2 {
+		t.Fatalf("tracker observations = %d, want 2", len(trackers))
+	}
+	if trackers[0] == nil || trackers[1] == nil {
+		t.Fatalf("trackers = %v, want two non-nil observations", trackers)
+	}
+	if trackers[0] != trackers[1] {
+		t.Fatal("bootstrap retry replaced the request phase tracker")
+	}
+	if len(attempts) != 2 || attempts[0] != 1 || attempts[1] != 2 {
+		t.Fatalf("attempts = %v, want [1 2]", attempts)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_NonXAIDoesNotEnablePhaseTracker(t *testing.T) {
+	executor := &phaseTrackingStreamExecutor{provider: "codex"}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "phase-codex-auth", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(%s): %v", auth.ID, err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "phase-codex-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai-response",
+		"phase-codex-model",
+		[]byte(`{"model":"phase-codex-model"}`),
+		"",
+	)
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	trackers, attempts := executor.Snapshots()
+	if len(trackers) != 1 {
+		t.Fatalf("tracker observations = %d, want 1", len(trackers))
+	}
+	if trackers[0] != nil {
+		t.Fatal("non-xAI request unexpectedly enabled phase tracking")
+	}
+	if len(attempts) != 1 || attempts[0] != 0 {
+		t.Fatalf("attempts = %v, want [0] without phase tracking", attempts)
 	}
 }
 

@@ -87,12 +87,6 @@ type Config struct {
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
 
-	// CodexWeeklyAutomation controls periodic Codex weekly-limit detection.
-	CodexWeeklyAutomation CodexWeeklyAutomation `yaml:"codex-weekly-automation" json:"codex-weekly-automation"`
-
-	// CodexHourlyAutomation controls periodic Codex 5h (primary_window) limit detection.
-	CodexHourlyAutomation CodexHourlyAutomation `yaml:"codex-hourly-automation" json:"codex-hourly-automation"`
-
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
@@ -185,21 +179,47 @@ type ClusterConfig struct {
 	NodeID string `yaml:"node-id,omitempty" json:"node-id,omitempty"`
 	// Region is a free-form operator-visible label.
 	Region string `yaml:"region,omitempty" json:"region,omitempty"`
-	// ProbeInterval controls advisory-lock probes. Empty/invalid uses 5s.
+	// ProbeInterval is how often the leader elector re-checks its advisory
+	// lock. Auth sharding also uses it as the node-lease and serving-path
+	// watchdog cadence, capped to one fifth of RingStalenessThreshold.
+	// Parsed as a Go duration string (e.g. "5s"). Empty/invalid means 5s.
 	ProbeInterval string `yaml:"probe-interval,omitempty" json:"probe-interval,omitempty"`
 	// Endpoint advertises this replica to an external front-door router.
 	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
 	// Weight is the relative share assigned by the front-door router.
 	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
-	// RegistrarInterval controls cluster_nodes heartbeat refreshes.
+	// RegistrarInterval is how often InstanceRegistrar refreshes the row in
+	// cluster_nodes. Parsed as a Go duration; empty/invalid means 10s.
+	// Auth-sharding startup rejects combinations that cannot detect a failed
+	// heartbeat strictly before RingStalenessThreshold.
 	RegistrarInterval string `yaml:"registrar-interval,omitempty" json:"registrar-interval,omitempty"`
-	// AuthSharding assigns each auth to exactly one replica.
+	// AuthSharding, when true, routes each auth (OAuth account) to exactly
+	// one replica using weighted rendezvous hashing on cluster_nodes
+	// membership. Each replica only dispatches / refreshes auths that hash
+	// to its NodeID, ensuring cross-instance rate-limit, usage and
+	// cooldown tracking stay consistent.
+	//
+	// Default false preserves Phase 1-3 behavior (all replicas use all
+	// auths). This flag is read during cluster bootstrap; changing it requires
+	// every replica to restart so the cluster cannot mix ownership modes. It
+	// cannot be combined with Home mode or Spillover.
 	AuthSharding bool `yaml:"auth-sharding,omitempty" json:"auth-sharding,omitempty"`
-	// Spillover allows fallback to the full auth pool when a local shard is blocked.
+	// Spillover preserves legacy non-strict routing behavior outside auth
+	// sharding. Strict auth sharding rejects this option at startup because a
+	// non-owner may never dispatch an account.
 	Spillover bool `yaml:"spillover,omitempty" json:"spillover,omitempty"`
-	// RingStalenessThreshold excludes stale cluster_nodes rows from the ring.
+	// RingStalenessThreshold is how old a cluster_nodes row may be before
+	// the RingWatcher treats it as dead and excludes it from the ring.
+	// Parsed as a Go duration; empty/invalid means 30s. Auth-sharding validates
+	// this against both RegistrarInterval and the effective watchdog cadence;
+	// unsafe custom timing fails startup. Dispatch ownership leases use half
+	// this duration, capped at 15s, and must retain more than a 500ms guard.
+	// The defaults are safe.
 	RingStalenessThreshold string `yaml:"ring-staleness,omitempty" json:"ring-staleness,omitempty"`
-	// RingPollInterval controls safety-net ring membership refreshes.
+	// RingPollInterval is how often the RingWatcher re-queries
+	// cluster_nodes as a safety net in case LISTEN/NOTIFY drops a message.
+	// Parsed as a Go duration; empty/invalid means 30s. Auth sharding caps the
+	// effective poll interval to its node-lease watchdog cadence.
 	RingPollInterval string `yaml:"ring-poll-interval,omitempty" json:"ring-poll-interval,omitempty"`
 }
 
@@ -234,14 +254,4 @@ func (u UsageConfig) WithDefaults() UsageConfig {
 		u.QueryCacheTTL = "5s"
 	}
 	return u
-}
-
-type CodexWeeklyAutomation struct {
-	Enabled         bool `yaml:"enabled" json:"enabled"`
-	IntervalSeconds int  `yaml:"interval-seconds" json:"interval-seconds"`
-}
-
-type CodexHourlyAutomation struct {
-	Enabled         bool `yaml:"enabled" json:"enabled"`
-	IntervalSeconds int  `yaml:"interval-seconds" json:"interval-seconds"`
 }

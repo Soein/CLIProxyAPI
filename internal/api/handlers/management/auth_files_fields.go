@@ -10,15 +10,19 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexweekly"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfilelock"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
+
+var errAuthFileChanged = errors.New("auth file changed concurrently")
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
 func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
@@ -28,9 +32,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		Name      string `json:"name"`
-		AuthIndex string `json:"auth_index"`
-		Disabled  *bool  `json:"disabled"`
+		Name      string   `json:"name"`
+		Names     []string `json:"names"`
+		AuthIndex string   `json:"auth_index"`
+		Disabled  *bool    `json:"disabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -39,8 +44,32 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	name := strings.TrimSpace(req.Name)
 	authIndex := strings.TrimSpace(req.AuthIndex)
-	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+	names := make([]string, 0, len(req.Names)+1)
+	seenNames := make(map[string]struct{}, len(req.Names)+1)
+	for _, candidate := range req.Names {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, exists := seenNames[candidate]; exists {
+			continue
+		}
+		seenNames[candidate] = struct{}{}
+		names = append(names, candidate)
+	}
+	if name != "" && len(names) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and names are mutually exclusive"})
+		return
+	}
+	if name != "" {
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name or names is required"})
+		return
+	}
+	if authIndex != "" && name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index requires name"})
 		return
 	}
 	if req.Disabled == nil {
@@ -49,34 +78,58 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-
-	targetAuth, _ := h.lookupAuthFile(name, authIndex)
-	if targetAuth == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
-		return
+	auths := h.authManager.List()
+	authByID := make(map[string]*coreauth.Auth, len(auths))
+	authByFileName := make(map[string]*coreauth.Auth, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			authByID[id] = auth
+		}
+		if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+			if _, exists := authByFileName[fileName]; !exists {
+				authByFileName[fileName] = auth
+			}
+		}
 	}
-	if coreauth.IsPluginVirtualAuth(targetAuth) {
-		// Allow status changes only when targeting the source auth file name, matching delete semantics.
-		// Expanded virtual project auths still cannot be modified independently.
-		if !isPluginVirtualSourceDelete(name, targetAuth) {
+	resolved := make([]*coreauth.Auth, 0, len(names))
+	for _, targetName := range names {
+		var targetAuth *coreauth.Auth
+		if authIndex != "" {
+			targetAuth, _ = h.lookupAuthFile(targetName, authIndex)
+		} else {
+			targetAuth = authByID[targetName]
+			if targetAuth == nil {
+				targetAuth = authByFileName[targetName]
+			}
+		}
+		if targetAuth == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("auth file not found: %s", targetName)})
+			return
+		}
+		if coreauth.IsPluginVirtualAuth(targetAuth) && !isPluginVirtualSourceDelete(targetName, targetAuth) {
 			c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 			return
 		}
-		if errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, *req.Disabled); errPatch != nil {
-			status := http.StatusInternalServerError
-			if errors.Is(errPatch, errAuthFileNotFound) || os.IsNotExist(errPatch) {
-				status = http.StatusNotFound
-			}
-			c.JSON(status, gin.H{"error": errPatch.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
-		return
+		resolved = append(resolved, targetAuth)
 	}
 
-	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
+	var configTarget *coreauth.Auth
+	for _, targetAuth := range resolved {
+		if coreauth.IsConfigAPIKeyAuth(targetAuth) {
+			configTarget = targetAuth
+			break
+		}
+	}
+	if configTarget != nil && len(resolved) > 1 {
+		c.JSON(http.StatusConflict, gin.H{"error": "config api key cannot be updated in a multi-auth request"})
+		return
+	}
+	if configTarget != nil {
 		h.mu.Lock()
-		handled, errToggle := toggleConfigAPIKeyExcludedAll(h.cfg, targetAuth, *req.Disabled)
+		handled, errToggle := toggleConfigAPIKeyExcludedAll(h.cfg, configTarget, *req.Disabled)
 		if errToggle != nil {
 			h.mu.Unlock()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update config api key: %v", errToggle)})
@@ -94,7 +147,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		}
 		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
 		if h.tokenStore != nil {
-			_ = h.tokenStore.Delete(ctx, targetAuth.ID)
+			_ = h.tokenStore.Delete(ctx, configTarget.ID)
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"status":           "ok",
@@ -105,65 +158,213 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	applyAuthDisabledState(targetAuth, *req.Disabled)
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+	sourcePaths := make(map[string]string)
+	runtimeIDs := make([]string, 0, len(resolved))
+	seenRuntimeIDs := make(map[string]struct{}, len(resolved))
+	addRuntimeID := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, exists := seenRuntimeIDs[id]; exists {
+			return
+		}
+		seenRuntimeIDs[id] = struct{}{}
+		runtimeIDs = append(runtimeIDs, id)
+	}
+	for _, targetAuth := range resolved {
+		if !coreauth.IsPluginVirtualAuth(targetAuth) {
+			addRuntimeID(targetAuth.ID)
+			continue
+		}
+		sourcePath := strings.TrimSpace(authAttribute(targetAuth, coreauth.AttributeVirtualSource))
+		if sourcePath == "" {
+			sourcePath = strings.TrimSpace(authAttribute(targetAuth, "path"))
+		}
+		if sourcePath == "" {
+			c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
+			return
+		}
+		sourceKey := authFilePathKey(sourcePath)
+		if sourceKey == "" {
+			c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
+			return
+		}
+		sourcePaths[sourceKey] = sourcePath
+	}
+	if len(sourcePaths) > 0 {
+		for _, auth := range auths {
+			if auth == nil {
+				continue
+			}
+			_, pathMatch := sourcePaths[authFilePathKey(authAttribute(auth, "path"))]
+			_, virtualSourceMatch := sourcePaths[authFilePathKey(authAttribute(auth, coreauth.AttributeVirtualSource))]
+			if pathMatch || virtualSourceMatch {
+				addRuntimeID(auth.ID)
+			}
+		}
+	}
+	sourceKeys := make([]string, 0, len(sourcePaths))
+	for sourceKey := range sourcePaths {
+		sourceKeys = append(sourceKeys, sourceKey)
+	}
+	sort.Strings(sourceKeys)
+	sourceLockPaths := make([]string, 0, len(sourceKeys))
+	for _, sourceKey := range sourceKeys {
+		sourceLockPaths = append(sourceLockPaths, sourcePaths[sourceKey])
+	}
+	unlockSources := authfilelock.Lock(sourceLockPaths...)
+	sourceLocksHeld := true
+	releaseSourceLocks := func() {
+		if !sourceLocksHeld {
+			return
+		}
+		unlockSources()
+		sourceLocksHeld = false
+	}
+	defer releaseSourceLocks()
+
+	preparedSources := make(map[string]preparedSourceAuthFile, len(sourceKeys))
+	for _, sourceKey := range sourceKeys {
+		sourcePath := sourcePaths[sourceKey]
+		original, updatedRaw, errPrepare := prepareSourceAuthFileDisabled(sourcePath, *req.Disabled)
+		if errPrepare != nil {
+			status := http.StatusInternalServerError
+			if os.IsNotExist(errPrepare) {
+				status = http.StatusNotFound
+			}
+			c.JSON(status, gin.H{"error": fmt.Sprintf("failed to update source auth file: %v", errPrepare)})
+			return
+		}
+		preparedSources[sourceKey] = preparedSourceAuthFile{path: sourcePath, original: original, updated: updatedRaw}
+	}
+	writtenSourceKeys := make([]string, 0, len(sourceKeys))
+	rollbackSources := func(failClosed bool) error {
+		rollbackErrors := make([]error, 0)
+		for index := len(writtenSourceKeys) - 1; index >= 0; index-- {
+			sourceKey := writtenSourceKeys[index]
+			prepared := preparedSources[sourceKey]
+			errRollback := writeSourceAuthFileAtomicallyIfUnchanged(prepared.path, prepared.updated, prepared.original)
+			if failClosed && errors.Is(errRollback, errAuthFileChanged) {
+				errRollback = writeLatestSourceAuthFileDisabled(prepared.path)
+			}
+			if errRollback != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore source auth file %q: %w", prepared.path, errRollback))
+			}
+		}
+		return errors.Join(rollbackErrors...)
+	}
+	for _, sourceKey := range sourceKeys {
+		prepared := preparedSources[sourceKey]
+		if errWrite := writeSourceAuthFileAtomicallyIfUnchanged(prepared.path, prepared.original, prepared.updated); errWrite != nil {
+			errWrite = errors.Join(errWrite, rollbackSources(false))
+			status := http.StatusInternalServerError
+			if errors.Is(errWrite, errAuthFileChanged) {
+				status = http.StatusConflict
+			} else if os.IsNotExist(errWrite) {
+				status = http.StatusNotFound
+			}
+			c.JSON(status, gin.H{"error": fmt.Sprintf("failed to update source auth file: %v", errWrite)})
+			return
+		}
+		writtenSourceKeys = append(writtenSourceKeys, sourceKey)
+	}
+	releaseSourceLocks()
+
+	updated, errSetDisabled := h.authManager.SetDisabled(ctx, runtimeIDs, *req.Disabled)
+	if errSetDisabled != nil {
+		if !*req.Disabled {
+			unlockRollback := authfilelock.Lock(sourceLockPaths...)
+			errSourceRollback := rollbackSources(true)
+			unlockRollback()
+
+			if errors.Is(errSetDisabled, coreauth.ErrAuthStoreCommitUnknown) {
+				compensationBase := context.Background()
+				if ctx != nil {
+					compensationBase = context.WithoutCancel(ctx)
+				}
+				compensationCtx, cancelCompensation := context.WithTimeout(compensationBase, authStatusCompensationTimeout)
+				_, errCompensate := h.authManager.SetDisabled(compensationCtx, runtimeIDs, true)
+				if errCompensate == nil {
+					if _, okDisabled := authsAtDisabledState(h.authManager, runtimeIDs, true); !okDisabled {
+						errCompensate = errors.New("fail-closed compensation did not converge to disabled state")
+					}
+				}
+				cancelCompensation()
+				if errCompensate != nil {
+					errCompensate = fmt.Errorf("fail-closed compensation: %w", errCompensate)
+				}
+				errSetDisabled = errors.Join(errSetDisabled, errSourceRollback, errCompensate)
+				if errSourceRollback != nil || errCompensate != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{
+						"error": "failed to persist auth status; credential state could not be confirmed: " + errSetDisabled.Error(),
+					})
+					return
+				}
+			} else {
+				errSetDisabled = errors.Join(errSetDisabled, errSourceRollback)
+			}
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "failed to persist auth status; affected credentials remain disabled: " + errSetDisabled.Error(),
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+	response := gin.H{"status": "ok", "disabled": *req.Disabled}
+	if len(names) > 1 {
+		response["updated"] = len(updated)
+	}
+	c.JSON(http.StatusOK, response)
 }
 
-// patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all
-// runtime auths expanded from it. Virtual project children cannot be toggled independently.
-func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool) error {
-	if h == nil || h.authManager == nil || targetAuth == nil {
-		return fmt.Errorf("core auth manager unavailable")
+func authsAtDisabledState(manager *coreauth.Manager, ids []string, disabled bool) ([]*coreauth.Auth, bool) {
+	if manager == nil || len(ids) == 0 {
+		return nil, false
 	}
-	sourcePath := strings.TrimSpace(authAttribute(targetAuth, coreauth.AttributeVirtualSource))
-	if sourcePath == "" {
-		sourcePath = strings.TrimSpace(authAttribute(targetAuth, "path"))
-	}
-	if sourcePath == "" {
-		return errPluginVirtualAuth
-	}
-	if errWrite := setSourceAuthFileDisabled(sourcePath, disabled); errWrite != nil {
-		if os.IsNotExist(errWrite) {
-			return errAuthFileNotFound
-		}
-		return fmt.Errorf("failed to update source auth file: %w", errWrite)
-	}
-	now := time.Now()
-	for _, auth := range h.authManager.List() {
-		if auth == nil {
-			continue
-		}
-		if !sameAuthFilePath(authAttribute(auth, "path"), sourcePath) &&
-			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), sourcePath) {
-			continue
-		}
-		applyAuthDisabledState(auth, disabled)
-		auth.UpdatedAt = now
-		if _, errUpdate := h.authManager.Update(ctx, auth); errUpdate != nil {
-			return fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
+	authByID := make(map[string]*coreauth.Auth)
+	for _, auth := range manager.List() {
+		if auth != nil {
+			authByID[auth.ID] = auth
 		}
 	}
-	return nil
+	resolved := make([]*coreauth.Auth, 0, len(ids))
+	for _, id := range ids {
+		auth := authByID[id]
+		if auth == nil || auth.Disabled != disabled {
+			return nil, false
+		}
+		if disabled {
+			if auth.Status != coreauth.StatusDisabled {
+				return nil, false
+			}
+		} else if auth.Status != coreauth.StatusActive {
+			return nil, false
+		}
+		resolved = append(resolved, auth)
+	}
+	return resolved, true
 }
 
-func setSourceAuthFileDisabled(path string, disabled bool) error {
+type preparedSourceAuthFile struct {
+	path     string
+	original []byte
+	updated  []byte
+}
+
+func prepareSourceAuthFileDisabled(path string, disabled bool) ([]byte, []byte, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return fmt.Errorf("source auth path is empty")
+		return nil, nil, fmt.Errorf("source auth path is empty")
 	}
 	data, errRead := os.ReadFile(path)
 	if errRead != nil {
-		return errRead
+		return nil, nil, errRead
 	}
 	metadata := make(map[string]any)
 	if len(bytes.TrimSpace(data)) > 0 {
 		if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
-			return fmt.Errorf("invalid auth file: %w", errUnmarshal)
+			return nil, nil, fmt.Errorf("invalid auth file: %w", errUnmarshal)
 		}
 	}
 	if metadata == nil {
@@ -172,10 +373,61 @@ func setSourceAuthFileDisabled(path string, disabled bool) error {
 	metadata["disabled"] = disabled
 	raw, errMarshal := json.Marshal(metadata)
 	if errMarshal != nil {
-		return fmt.Errorf("marshal auth file: %w", errMarshal)
+		return nil, nil, fmt.Errorf("marshal auth file: %w", errMarshal)
 	}
-	if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
-		return errWrite
+	return data, raw, nil
+}
+
+func writeLatestSourceAuthFileDisabled(path string) error {
+	current, disabledRaw, errPrepare := prepareSourceAuthFileDisabled(path, true)
+	if errPrepare != nil {
+		return errPrepare
+	}
+	return writeSourceAuthFileAtomicallyIfUnchanged(path, current, disabledRaw)
+}
+
+func writeSourceAuthFileAtomicallyIfUnchanged(path string, expected, raw []byte) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("source auth path is empty")
+	}
+	tmp, errCreate := os.CreateTemp(filepath.Dir(path), ".auth-status-*.tmp")
+	if errCreate != nil {
+		return errCreate
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !os.IsNotExist(errRemove) {
+			log.WithError(errRemove).Warn("failed to remove temporary auth status file")
+		}
+	}()
+	closeWithError := func(cause error) error {
+		if errClose := tmp.Close(); errClose != nil {
+			return errors.Join(cause, fmt.Errorf("close temporary auth status file: %w", errClose))
+		}
+		return cause
+	}
+	if errChmod := tmp.Chmod(0o600); errChmod != nil {
+		return closeWithError(errChmod)
+	}
+	if _, errWrite := tmp.Write(raw); errWrite != nil {
+		return closeWithError(errWrite)
+	}
+	if errSync := tmp.Sync(); errSync != nil {
+		return closeWithError(errSync)
+	}
+	if errClose := tmp.Close(); errClose != nil {
+		return errClose
+	}
+	current, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return errRead
+	}
+	if !bytes.Equal(current, expected) {
+		return fmt.Errorf("%w: %s", errAuthFileChanged, path)
+	}
+	if errRename := os.Rename(tmpPath, path); errRename != nil {
+		return errRename
 	}
 	return nil
 }
@@ -275,17 +527,6 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 		if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
-		} else if fieldPath == "codex_automation_excluded" || fieldPath == "codex_weekly_automation_excluded" {
-			// Codex automation exclusion uses dedicated migration logic: it
-			// unifies the new/legacy fields, records a timestamp, and clears
-			// the legacy key to avoid value drift. Falls outside the generic
-			// metadata path on purpose.
-			excluded, okBool := value.(bool)
-			if !okBool {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid field %s", fieldPath)})
-				return
-			}
-			codexweekly.SetAutomationExcluded(targetAuth, excluded, time.Now())
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
 			return
@@ -576,47 +817,45 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 	auth.StatusMessage = ""
 }
 
-func (h *Handler) removeAuth(ctx context.Context, id string) {
+func (h *Handler) authIDsForPath(path string, fallbackID string) []string {
 	if h == nil || h.authManager == nil {
-		return
+		return nil
 	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return
+	ids := make([]string, 0, 1)
+	seen := make(map[string]struct{})
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
 	}
-	if _, ok := h.authManager.GetByID(id); ok {
-		h.authManager.Remove(ctx, id)
-		return
-	}
-	authID := h.authIDForPath(id)
-	if authID == "" {
-		return
-	}
-	h.authManager.Remove(ctx, authID)
-}
-
-func (h *Handler) removeAuthsForPath(ctx context.Context, path string, fallbackID string) {
-	if h == nil || h.authManager == nil {
-		return
-	}
-	removed := false
 	for _, auth := range h.authManager.List() {
 		if auth == nil {
 			continue
 		}
 		if sameAuthFilePath(authAttribute(auth, "path"), path) || sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), path) {
-			h.removeAuth(ctx, auth.ID)
-			removed = true
+			add(auth.ID)
 		}
 	}
-	if removed {
-		return
+	if len(ids) > 0 {
+		return ids
 	}
 	if strings.TrimSpace(fallbackID) != "" {
-		h.removeAuth(ctx, fallbackID)
-		return
+		if _, ok := h.authManager.GetByID(fallbackID); ok {
+			add(fallbackID)
+			return ids
+		}
 	}
-	h.removeAuth(ctx, path)
+	authID := h.authIDForPath(path)
+	if _, ok := h.authManager.GetByID(authID); ok {
+		add(authID)
+	}
+	return ids
 }
 
 func sameAuthFilePath(left, right string) bool {
@@ -631,6 +870,14 @@ func sameAuthFilePath(left, right string) bool {
 	return left == right
 }
 
+func authFilePathKey(path string) string {
+	path = cleanAuthFilePath(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
 func cleanAuthFilePath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -642,7 +889,7 @@ func cleanAuthFilePath(path string) string {
 	return filepath.Clean(path)
 }
 
-func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
+func (h *Handler) deleteTokenRecord(ctx context.Context, path string, expectedGeneration uint64) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("auth path is empty")
 	}
@@ -650,7 +897,77 @@ func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	if store == nil {
 		return fmt.Errorf("token store unavailable")
 	}
+	if tombstoneStore, ok := store.(coreauth.AuthTombstoneStore); ok {
+		_, errTombstone := tombstoneStore.Tombstone(ctx, path, expectedGeneration)
+		return errTombstone
+	}
 	return store.Delete(ctx, path)
+}
+
+func (h *Handler) deleteTokenRecordAndAuths(ctx context.Context, path string, fallbackID string) error {
+	if h == nil || h.authManager == nil {
+		expectedGeneration, errGeneration := h.authStoreGenerationForDelete(ctx, path, fallbackID, nil)
+		if errGeneration != nil {
+			return errGeneration
+		}
+		return h.deleteTokenRecord(ctx, path, expectedGeneration)
+	}
+	ids := h.authIDsForPath(path, fallbackID)
+	expectedGeneration, errGeneration := h.authStoreGenerationForDelete(ctx, path, fallbackID, ids)
+	if errGeneration != nil {
+		return errGeneration
+	}
+	return h.authManager.DeleteAuths(ctx, ids, func(deleteCtx context.Context) error {
+		return h.deleteTokenRecord(deleteCtx, path, expectedGeneration)
+	})
+}
+
+func (h *Handler) authStoreGenerationForDelete(ctx context.Context, path, fallbackID string, ids []string) (uint64, error) {
+	var expected uint64
+	merge := func(generation uint64) error {
+		if generation == 0 {
+			return nil
+		}
+		if expected != 0 && expected != generation {
+			return fmt.Errorf("auth generation changed while preparing delete: %d != %d", expected, generation)
+		}
+		expected = generation
+		return nil
+	}
+	if h != nil && h.authManager != nil {
+		for _, id := range ids {
+			if auth, ok := h.authManager.GetByID(id); ok && auth != nil {
+				if errMerge := merge(auth.StoreGeneration()); errMerge != nil {
+					return 0, errMerge
+				}
+			}
+		}
+	}
+	if expected != 0 {
+		return expected, nil
+	}
+	store := h.tokenStoreWithBaseDir()
+	reader, ok := store.(coreauth.AuthByIDStore)
+	if !ok {
+		return 0, nil
+	}
+	candidates := uniqueAuthFileNames(append([]string{path, filepath.Base(path), fallbackID}, ids...))
+	for _, id := range candidates {
+		auth, errRead := reader.GetByID(ctx, id)
+		if errRead != nil {
+			return 0, fmt.Errorf("read auth generation before delete: %w", errRead)
+		}
+		if auth == nil {
+			continue
+		}
+		if errMerge := merge(auth.StoreGeneration()); errMerge != nil {
+			return 0, errMerge
+		}
+		if expected != 0 {
+			return expected, nil
+		}
+	}
+	return expected, nil
 }
 
 func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
@@ -683,7 +1000,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	savedPath, errSave := store.Save(ctx, record)
+	savedPath, errSave := coreauth.PersistExplicitAuth(ctx, store, record)
 	if errSave != nil {
 		return savedPath, errSave
 	}
@@ -693,4 +1010,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		}
 	}
 	return savedPath, nil
+}
+
+func (h *Handler) beginExplicitAuthOperation(ctx context.Context) (context.Context, error) {
+	store := h.tokenStoreWithBaseDir()
+	return coreauth.BeginExplicitAuthOperation(ctx, store)
 }

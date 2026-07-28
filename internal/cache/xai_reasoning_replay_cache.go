@@ -232,8 +232,8 @@ func xaiReasoningReplayCacheKey(modelName, sessionKey string) string {
 	if modelName == "" || sessionKey == "" {
 		return ""
 	}
-	// The session key is the continuity boundary. Keep this independent from
-	// the selected upstream xAI credential so auth failover can preserve replay.
+	// The executor includes the selected xAI auth provenance in sessionKey.
+	// Encrypted reasoning is credential-bound and must never survive auth failover.
 	return strings.Join([]string{"xai-reasoning-replay", modelName, sessionKey}, "\x00")
 }
 

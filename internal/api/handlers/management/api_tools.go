@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -138,6 +139,10 @@ func (h *Handler) APICall(c *gin.Context) {
 		}
 		if auth != nil && token == "" {
 			if tokenErr != nil {
+				if errors.Is(tokenErr, coreauth.ErrDispatchAdmissionRejected) {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth_unavailable"})
+					return
+				}
 				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
 				return
 			}
@@ -176,6 +181,19 @@ func (h *Handler) APICall(c *gin.Context) {
 		Timeout: defaultAPICallTimeout,
 	}
 	httpClient.Transport = h.apiCallTransport(auth)
+
+	release, errAdmit := h.admitAPICallAuth(auth)
+	if errAdmit != nil {
+		if errors.Is(errAdmit, coreauth.ErrDispatchAdmissionRejected) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth_unavailable"})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
+		return
+	}
+	if release != nil {
+		defer release()
+	}
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
@@ -285,6 +303,13 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 		Timeout:   defaultAPICallTimeout,
 		Transport: h.apiCallTransport(auth),
 	}
+	release, errAdmit := h.admitAPICallAuth(auth)
+	if errAdmit != nil {
+		return "", errAdmit
+	}
+	if release != nil {
+		defer release()
+	}
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
 		return "", errDo
@@ -339,6 +364,13 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	}
 
 	return strings.TrimSpace(tokenResp.AccessToken), nil
+}
+
+func (h *Handler) admitAPICallAuth(auth *coreauth.Auth) (func(), error) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return nil, nil
+	}
+	return h.authManager.AdmitDispatch(auth.ID)
 }
 
 func antigravityTokenNeedsRefresh(metadata map[string]any) bool {
