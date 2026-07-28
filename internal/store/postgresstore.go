@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	defaultConfigTable = "config_store"
-	defaultAuthTable   = "auth_store"
-	defaultConfigKey   = "config"
+	defaultConfigTable   = "config_store"
+	defaultAuthTable     = "auth_store"
+	defaultCooldownTable = "cooldown_store"
+	defaultConfigKey     = "config"
 )
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
@@ -36,11 +37,12 @@ type PostgresStoreConfig struct {
 	// (EnsureSchema, persistAuth, persistConfig, *Delete*) always use DSN.
 	// When empty or the pool fails its initial ping, reads transparently
 	// fall back to DSN.
-	ReadDSN     string
-	Schema      string
-	ConfigTable string
-	AuthTable   string
-	SpoolDir    string
+	ReadDSN       string
+	Schema        string
+	ConfigTable   string
+	AuthTable     string
+	CooldownTable string
+	SpoolDir      string
 }
 
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
@@ -50,13 +52,14 @@ type PostgresStore struct {
 	// readDB, when non-nil, points at a dedicated read-only pool (e.g. an HAProxy
 	// read backend pointing to local replicas). Reads opt in via readPool();
 	// writes always go through db.
-	readDB     *sql.DB
-	cfg        PostgresStoreConfig
-	spoolRoot  string
-	configPath string
-	authDir    string
-	nodeID     string
-	mu         sync.Mutex
+	readDB        *sql.DB
+	cfg           PostgresStoreConfig
+	spoolRoot     string
+	configPath    string
+	authDir       string
+	nodeID        string
+	cooldownStore *postgresCooldownStateStore
+	mu            sync.Mutex
 }
 
 // NodeID sets an identifier recorded in last_writer on UPSERT. Used in cluster
@@ -100,6 +103,9 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	}
 	if cfg.AuthTable == "" {
 		cfg.AuthTable = defaultAuthTable
+	}
+	if cfg.CooldownTable == "" {
+		cfg.CooldownTable = defaultCooldownTable
 	}
 
 	spoolRoot := strings.TrimSpace(cfg.SpoolDir)
@@ -163,6 +169,7 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 		configPath: filepath.Join(configDir, "config.yaml"),
 		authDir:    authDir,
 	}
+	store.cooldownStore = &postgresCooldownStateStore{store: store}
 	return store, nil
 }
 
@@ -466,7 +473,20 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`); err != nil {
 		return fmt.Errorf("postgres store: create codex_automation_state: %w", err)
 	}
-
+	cooldownTable := s.fullTableName(s.cfg.CooldownTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			auth_id TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
+			content JSONB NOT NULL,
+			deleted BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (auth_id, model)
+		)
+	`, cooldownTable)); err != nil {
+		return fmt.Errorf("postgres store: create cooldown table: %w", err)
+	}
 	return nil
 }
 
