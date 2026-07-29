@@ -871,6 +871,9 @@ func (s *PostgresStore) SetBaseDir(string) {}
 
 // Save persists authentication metadata to disk and PostgreSQL.
 func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	if auth == nil {
+		return "", fmt.Errorf("postgres store: auth is nil")
+	}
 	path, _, err := s.SaveVersioned(ctx, auth, auth.StoreGeneration())
 	return path, err
 }
@@ -881,6 +884,9 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 func (s *PostgresStore) SaveVersioned(ctx context.Context, auth *cliproxyauth.Auth, expectedGeneration uint64) (string, uint64, error) {
 	if auth == nil {
 		return "", 0, fmt.Errorf("postgres store: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", 0, fmt.Errorf("postgres store: %w", errWeight)
 	}
 
 	path, relID, errIdentity := s.resolveCanonicalAuthIdentity(auth)
@@ -934,6 +940,9 @@ func (s *PostgresStore) SaveVersioned(ctx context.Context, auth *cliproxyauth.Au
 func (s *PostgresStore) Restore(ctx context.Context, auth *cliproxyauth.Auth, expectedGeneration uint64) (string, uint64, error) {
 	if auth == nil {
 		return "", 0, fmt.Errorf("postgres store: auth is nil")
+	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", 0, fmt.Errorf("postgres store: %w", errWeight)
 	}
 	path, relID, errIdentity := s.resolveCanonicalAuthIdentity(auth)
 	if errIdentity != nil {
@@ -1140,6 +1149,9 @@ func (s *PostgresStore) SaveBatch(ctx context.Context, auths []*cliproxyauth.Aut
 	for _, auth := range auths {
 		if auth == nil {
 			return errors.New("postgres store: batch auth is nil")
+		}
+		if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+			return fmt.Errorf("postgres store: %w", errWeight)
 		}
 		path, relID, errIdentity := s.resolveCanonicalAuthIdentity(auth)
 		if errIdentity != nil {
@@ -1677,6 +1689,10 @@ func (s *PostgresStore) buildAuthFromRow(id, payload string, createdAt, updatedA
 		return nil, false
 	}
 	delete(metadata, postgresAuthGenerationPayloadKey)
+	if errWeight := cliproxyauth.ValidateAuthWeight(&cliproxyauth.Auth{Metadata: metadata}); errWeight != nil {
+		log.WithError(errWeight).Warnf("postgres store: skipping auth %s with invalid weight", id)
+		return nil, false
+	}
 	provider := strings.TrimSpace(valueAsString(metadata["type"]))
 	if provider == "" {
 		provider = "unknown"

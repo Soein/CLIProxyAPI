@@ -64,6 +64,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		serviceTier = coreusage.ServiceTierFromContext(ctx)
 	}
 	responseServiceTier := strings.TrimSpace(record.ResponseServiceTier)
+	clientRequestMetadata := internallogging.GetClientRequestMetadata(ctx)
 
 	usageDetail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
 	tokens := tokenStats{
@@ -90,6 +91,9 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Phases:          queuePhaseTimings(record.Phases),
 		Source:          record.Source,
 		AuthIndex:       record.AuthIndex,
+		ClientIP:        clientRequestMetadata.ClientIP,
+		XForwardedFor:   clientRequestMetadata.XForwardedFor,
+		UserAgent:       clientRequestMetadata.UserAgent,
 		Tokens:          tokens,
 		Failed:          failed,
 		Generate:        coreusage.GenerateEnabled(record.Generate),
@@ -143,6 +147,9 @@ type requestDetail struct {
 	Phases          *phaseTimings `json:"phases,omitempty"`
 	Source          string        `json:"source"`
 	AuthIndex       string        `json:"auth_index"`
+	ClientIP        string        `json:"client_ip"`
+	XForwardedFor   string        `json:"x_forwarded_for"`
+	UserAgent       string        `json:"user_agent"`
 	Tokens          tokenStats    `json:"tokens"`
 	Failed          bool          `json:"failed"`
 	Generate        bool          `json:"generate"`

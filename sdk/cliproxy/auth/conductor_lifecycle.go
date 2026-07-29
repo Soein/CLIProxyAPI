@@ -68,6 +68,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, fmt.Errorf("register auth: %w", errWeight)
+	}
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -128,6 +131,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
+	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, fmt.Errorf("update auth: %w", errWeight)
 	}
 	auth.discardStoreGenerationMetadata()
 	m.mu.Lock()
@@ -276,6 +282,9 @@ func (m *Manager) Load(ctx context.Context) error {
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if m == nil || auth == nil {
 		return nil
+	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return fmt.Errorf("persist auth: %w", errWeight)
 	}
 	m.mu.RLock()
 	store := m.store

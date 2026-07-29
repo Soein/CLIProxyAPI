@@ -826,6 +826,9 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+			continue
+		}
 		current := previous[auth.ID]
 		baselineDurableRevision, existedAtStart := baselineDurableRevisions[auth.ID]
 		if existedAtStart && current == nil {
@@ -1168,7 +1171,8 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 						available = leastInflightAuths(available, inflight)
 					}
 				}
-				selected, errPick = selector.Pick(ctx, selectorProvider, selectionArgForSelector(selector, model), opts, available)
+				selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+				selected, errPick = selector.Pick(selectorCtx, selectorProvider, selectionArgForSelector(selector, model), opts, available)
 			}
 			if errPick != nil {
 				return nil, nil, "", errPick

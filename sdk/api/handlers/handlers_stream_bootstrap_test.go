@@ -781,13 +781,18 @@ func TestExecuteStreamWithAuthManager_XAIBootstrapRetryPreservesPhaseTracker(t *
 	manager.RegisterExecutor(executor)
 	manager.SetRetryConfig(0, 0, 1)
 
-	auth := &coreauth.Auth{ID: "phase-xai-auth", Provider: "xai", Status: coreauth.StatusActive}
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatalf("manager.Register(%s): %v", auth.ID, err)
+	authIDs := []string{"phase-xai-auth-primary", "phase-xai-auth-retry"}
+	for _, authID := range authIDs {
+		auth := &coreauth.Auth{ID: authID, Provider: "xai", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("manager.Register(%s): %v", auth.ID, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "phase-xai-model"}})
 	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "phase-xai-model"}})
 	t.Cleanup(func() {
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		for _, authID := range authIDs {
+			registry.GetGlobalRegistry().UnregisterClient(authID)
+		}
 	})
 
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
