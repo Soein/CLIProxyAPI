@@ -537,6 +537,7 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 type SessionAffinitySelector struct {
 	fallback Selector
 	cache    *SessionCache
+	pickMu   [64]sync.Mutex
 	hits     atomic.Uint64
 	failover atomic.Uint64
 }
@@ -613,6 +614,9 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + model
 	}
+	unlock := s.lockSessionKeys(cacheKey, fallbackKey)
+	defer unlock()
+
 	bind := func(authID string) {
 		if fallbackKey != "" {
 			s.cache.SetAliases(authID, cacheKey, fallbackKey)
@@ -665,6 +669,33 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	usage.MarkAffinityOutcome(ctx, string(usage.AffinityOutcomeMiss))
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) lockSessionKeys(primaryKey, fallbackKey string) func() {
+	primaryIndex := sessionAffinityLockIndex(primaryKey, len(s.pickMu))
+	fallbackIndex := primaryIndex
+	if fallbackKey != "" {
+		fallbackIndex = sessionAffinityLockIndex(fallbackKey, len(s.pickMu))
+	}
+	if primaryIndex == fallbackIndex {
+		s.pickMu[primaryIndex].Lock()
+		return s.pickMu[primaryIndex].Unlock
+	}
+	if primaryIndex > fallbackIndex {
+		primaryIndex, fallbackIndex = fallbackIndex, primaryIndex
+	}
+	s.pickMu[primaryIndex].Lock()
+	s.pickMu[fallbackIndex].Lock()
+	return func() {
+		s.pickMu[fallbackIndex].Unlock()
+		s.pickMu[primaryIndex].Unlock()
+	}
+}
+
+func sessionAffinityLockIndex(key string, stripes int) int {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(key))
+	return int(hash.Sum64() % uint64(stripes))
 }
 
 func (s *SessionAffinitySelector) pickFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, inflight func(string) int, preferredAuthID string) (*Auth, error) {

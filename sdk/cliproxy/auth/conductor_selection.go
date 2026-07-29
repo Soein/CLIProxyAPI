@@ -481,24 +481,34 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 	}
 }
 
-func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, bool, error) {
+func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
 	if m == nil || m.scheduler == nil {
 		return nil, false, nil
+	}
+	candidateIDs := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate != nil {
+			candidateIDs[candidate.ID] = struct{}{}
+		}
+	}
+	eligible := func(authID string) bool {
+		_, ok := candidateIDs[authID]
+		return ok
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	var selected *Auth
 	var errPick error
 	if providerKey == "mixed" {
-		selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
+		selected, _, errPick = m.scheduler.pickMixedWithStrategyAndFilter(ctx, providers, model, opts, tried, strategy, eligible)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
-			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
+			selected, _, errPick = m.scheduler.pickMixedWithStrategyAndFilter(ctx, providers, model, opts, tried, strategy, eligible)
 		}
 	} else {
-		selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
+		selected, errPick = m.scheduler.pickSingleWithStrategyAndInflight(ctx, providerKey, model, opts, tried, strategy, nil, "", eligible)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
-			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
+			selected, errPick = m.scheduler.pickSingleWithStrategyAndInflight(ctx, providerKey, model, opts, tried, strategy, nil, "", eligible)
 		}
 	}
 	if errPick != nil {
@@ -542,7 +552,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
-	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
+	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried, candidates)
 }
 
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {

@@ -11,6 +11,9 @@ const (
 	maxRetentionSeconds     int64 = 3600
 	usageSubscriberBuffer         = 256
 	errorSubscriberBuffer         = 256
+	maxQueuePayloadBytes          = 256 << 10
+	maxQueueItems                 = 4096
+	maxQueueBytes                 = 16 << 20
 
 	usageSupportRefreshPayload = `{"support_refresh":true}`
 	usageRefreshPayload        = `{"refresh":true}`
@@ -25,6 +28,7 @@ type queue struct {
 	mu               sync.Mutex
 	items            []queueItem
 	head             int
+	retainedBytes    int
 	subscribers      map[uint64]chan []byte
 	nextSubscriberID uint64
 }
@@ -66,7 +70,7 @@ func Enqueue(payload []byte) {
 	if !Enabled() {
 		return
 	}
-	if len(payload) == 0 {
+	if !queuePayloadAllowed(payload) {
 		return
 	}
 	if global.publishToSubscribers(payload) {
@@ -75,11 +79,15 @@ func Enqueue(payload []byte) {
 	global.enqueue(payload)
 }
 
+func queuePayloadAllowed(payload []byte) bool {
+	return len(payload) > 0 && len(payload) <= maxQueuePayloadBytes
+}
+
 func EnqueueError(payload []byte) {
 	if !Enabled() {
 		return
 	}
-	if len(payload) == 0 {
+	if !queuePayloadAllowed(payload) {
 		return
 	}
 	errorGlobal.publishToSubscribers(payload)
@@ -116,6 +124,7 @@ func (q *queue) clear() {
 	}
 	q.items = nil
 	q.head = 0
+	q.retainedBytes = 0
 	q.subscribers = nil
 	q.mu.Unlock()
 
@@ -135,7 +144,20 @@ func (q *queue) enqueue(payload []byte) {
 		enqueuedAt: now,
 		payload:    append([]byte(nil), payload...),
 	})
+	q.retainedBytes += len(payload)
+	for len(q.items)-q.head > maxQueueItems || q.retainedBytes > maxQueueBytes {
+		q.discardOldestLocked()
+	}
 	q.maybeCompactLocked()
+}
+
+func (q *queue) discardOldestLocked() {
+	if q.head >= len(q.items) {
+		return
+	}
+	q.retainedBytes -= len(q.items[q.head].payload)
+	q.items[q.head].payload = nil
+	q.head++
 }
 
 func (q *queue) publishToSubscribers(payload []byte) bool {
@@ -207,6 +229,7 @@ func (q *queue) popOldest(count int) [][]byte {
 	if available <= 0 {
 		q.items = nil
 		q.head = 0
+		q.retainedBytes = 0
 		return nil
 	}
 	if count > available {
@@ -215,10 +238,10 @@ func (q *queue) popOldest(count int) [][]byte {
 
 	out := make([][]byte, 0, count)
 	for i := 0; i < count; i++ {
-		item := q.items[q.head+i]
+		item := q.items[q.head]
 		out = append(out, item.payload)
+		q.discardOldestLocked()
 	}
-	q.head += count
 	q.maybeCompactLocked()
 	return out
 }
@@ -227,6 +250,7 @@ func (q *queue) pruneLocked(now time.Time) {
 	if q.head >= len(q.items) {
 		q.items = nil
 		q.head = 0
+		q.retainedBytes = 0
 		return
 	}
 
@@ -236,7 +260,7 @@ func (q *queue) pruneLocked(now time.Time) {
 	}
 	cutoff := now.Add(-time.Duration(windowSeconds) * time.Second)
 	for q.head < len(q.items) && q.items[q.head].enqueuedAt.Before(cutoff) {
-		q.head++
+		q.discardOldestLocked()
 	}
 }
 
@@ -247,6 +271,7 @@ func (q *queue) maybeCompactLocked() {
 	if q.head >= len(q.items) {
 		q.items = nil
 		q.head = 0
+		q.retainedBytes = 0
 		return
 	}
 	if q.head < 1024 && q.head*2 < len(q.items) {

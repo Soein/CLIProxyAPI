@@ -3,9 +3,13 @@ package logging
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 )
+
+const maxClientRequestMetadataValueBytes = 4 << 10
 
 type endpointKey struct{}
 type responseStatusKey struct{}
@@ -50,7 +54,39 @@ func WithClientRequestMetadata(ctx context.Context, metadata ClientRequestMetada
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	metadata.ClientIP = boundedUTF8(metadata.ClientIP, maxClientRequestMetadataValueBytes)
+	metadata.XForwardedFor = boundedUTF8(metadata.XForwardedFor, maxClientRequestMetadataValueBytes)
+	metadata.UserAgent = boundedUTF8(metadata.UserAgent, maxClientRequestMetadataValueBytes)
 	return context.WithValue(ctx, clientRequestMetadataKey{}, metadata)
+}
+
+func boundedUTF8(value string, maxBytes int) string {
+	if maxBytes <= 0 || value == "" {
+		return ""
+	}
+	if len(value) <= maxBytes && utf8.ValidString(value) {
+		return value
+	}
+
+	var limited strings.Builder
+	limited.Grow(min(len(value), maxBytes))
+	for len(value) > 0 {
+		r, size := utf8.DecodeRuneInString(value)
+		if r == utf8.RuneError && size == 1 {
+			if limited.Len()+utf8.RuneLen(utf8.RuneError) > maxBytes {
+				break
+			}
+			limited.WriteRune(utf8.RuneError)
+			value = value[1:]
+			continue
+		}
+		if limited.Len()+size > maxBytes {
+			break
+		}
+		limited.WriteString(value[:size])
+		value = value[size:]
+	}
+	return limited.String()
 }
 
 // GetClientRequestMetadata returns downstream request metadata stored in ctx.

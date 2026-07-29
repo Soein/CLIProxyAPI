@@ -3,7 +3,9 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -12,6 +14,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"golang.org/x/net/context"
 )
+
+const testMaxClientRequestMetadataValueBytes = 4 << 10
 
 func TestGetContextWithCancelCapturesClientRequestMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -35,6 +39,32 @@ func TestGetContextWithCancelCapturesClientRequestMetadata(t *testing.T) {
 	}
 	if metadata.UserAgent != "test-client/1.0" {
 		t.Fatalf("UserAgent = %q", metadata.UserAgent)
+	}
+}
+
+func TestGetContextWithCancelBoundsClientRequestMetadataByBytes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	longValue := "\xff" + strings.Repeat("界", testMaxClientRequestMetadataValueBytes)
+	ginCtx.Request.Header.Set("X-Forwarded-For", longValue)
+	ginCtx.Request.Header.Set("User-Agent", longValue)
+
+	handler := &BaseAPIHandler{Cfg: &config.SDKConfig{}}
+	ctx, cancel := handler.GetContextWithCancel(nil, ginCtx, context.Background())
+	defer cancel()
+
+	metadata := logging.GetClientRequestMetadata(ctx)
+	for name, value := range map[string]string{
+		"XForwardedFor": metadata.XForwardedFor,
+		"UserAgent":     metadata.UserAgent,
+	} {
+		if len(value) > testMaxClientRequestMetadataValueBytes {
+			t.Fatalf("%s length = %d bytes, want at most %d", name, len(value), testMaxClientRequestMetadataValueBytes)
+		}
+		if !utf8.ValidString(value) {
+			t.Fatalf("%s is not valid UTF-8", name)
+		}
 	}
 }
 

@@ -1,6 +1,10 @@
 package redisqueue
 
 import (
+	"bytes"
+	"encoding/json"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,6 +35,71 @@ func TestEnqueueBroadcastsToUsageSubscribersAndSkipsQueue(t *testing.T) {
 		items := PopOldest(1)
 		if len(items) != 1 || string(items[0]) != "queued-record" {
 			t.Fatalf("PopOldest() items = %q, want queued record after unsubscribe", items)
+		}
+	})
+}
+
+func TestEnqueueRejectsOversizedPayloadBeforeSubscriberBroadcast(t *testing.T) {
+	withEnabledQueue(t, func() {
+		subscriber, unsubscribe := SubscribeUsage()
+		defer unsubscribe()
+		requireUsageSubscriberPayload(t, subscriber, usageSupportRefreshPayload)
+
+		atLimitJSON := []byte(`{"value":"` + strings.Repeat("a", maxQueuePayloadBytes-len(`{"value":""}`)) + `"}`)
+		oversizedJSON := append(append([]byte(nil), atLimitJSON...), ' ')
+		if len(atLimitJSON) != maxQueuePayloadBytes || !json.Valid(atLimitJSON) || !json.Valid(oversizedJSON) {
+			t.Fatal("invalid queue limit test fixture")
+		}
+
+		Enqueue(atLimitJSON)
+		requireUsageSubscriberPayload(t, subscriber, string(atLimitJSON))
+
+		Enqueue(oversizedJSON)
+
+		select {
+		case got := <-subscriber:
+			t.Fatalf("subscriber received oversized payload of %d bytes", len(got))
+		default:
+		}
+	})
+}
+
+func TestQueueEvictsOldestItemsAtCountLimit(t *testing.T) {
+	withEnabledQueue(t, func() {
+		for i := 0; i <= maxQueueItems; i++ {
+			Enqueue([]byte(strconv.Itoa(i)))
+		}
+
+		items := PopOldest(maxQueueItems + 1)
+		if len(items) != maxQueueItems {
+			t.Fatalf("PopOldest() returned %d items, want %d", len(items), maxQueueItems)
+		}
+		if got := string(items[0]); got != "1" {
+			t.Fatalf("oldest retained payload = %q, want %q", got, "1")
+		}
+		if got := string(items[len(items)-1]); got != strconv.Itoa(maxQueueItems) {
+			t.Fatalf("newest retained payload = %q, want %q", got, strconv.Itoa(maxQueueItems))
+		}
+	})
+}
+
+func TestQueueEvictsOldestItemsAtTotalByteLimit(t *testing.T) {
+	withEnabledQueue(t, func() {
+		const payloadBytes = 64 << 10
+		payload := bytes.Repeat([]byte{'x'}, payloadBytes)
+		itemCount := maxQueueBytes/payloadBytes + 1
+		for i := 0; i < itemCount; i++ {
+			payload[0] = byte(i)
+			Enqueue(payload)
+		}
+
+		items := PopOldest(itemCount)
+		wantItems := maxQueueBytes / payloadBytes
+		if len(items) != wantItems {
+			t.Fatalf("PopOldest() returned %d items, want %d", len(items), wantItems)
+		}
+		if got := items[0][0]; got != 1 {
+			t.Fatalf("oldest retained payload marker = %d, want 1", got)
 		}
 	})
 }
@@ -78,6 +147,45 @@ func TestEnqueueErrorBroadcastsToErrorSubscribersAndDiscardsWithoutSubscribers(t
 
 		EnqueueError([]byte("discarded-error"))
 		requireErrorQueueEmpty(t)
+	})
+}
+
+func TestEnqueueErrorRejectsOversizedPayloadBeforeSubscriberBroadcast(t *testing.T) {
+	withEnabledQueue(t, func() {
+		subscriber, unsubscribe := SubscribeErrors()
+		defer unsubscribe()
+
+		oversizedPayload := bytes.Repeat([]byte{'x'}, maxQueuePayloadBytes+1)
+		EnqueueError(oversizedPayload)
+
+		select {
+		case got := <-subscriber:
+			t.Fatalf("error subscriber received oversized payload of %d bytes", len(got))
+		default:
+		}
+
+		EnqueueError([]byte(`{"accepted":true}`))
+		requireUsageSubscriberPayload(t, subscriber, `{"accepted":true}`)
+	})
+}
+
+func TestQueueLimitsPreserveRetentionPruning(t *testing.T) {
+	previousRetention := retentionSeconds.Load()
+	defer retentionSeconds.Store(previousRetention)
+	SetRetentionSeconds(int(defaultRetentionSeconds))
+
+	withEnabledQueue(t, func() {
+		Enqueue([]byte("expired"))
+		global.mu.Lock()
+		global.items[global.head].enqueuedAt = time.Now().Add(-time.Duration(defaultRetentionSeconds+1) * time.Second)
+		global.mu.Unlock()
+
+		Enqueue([]byte("retained"))
+
+		items := PopOldest(2)
+		if len(items) != 1 || string(items[0]) != "retained" {
+			t.Fatalf("PopOldest() items = %q, want only retained payload", items)
+		}
 	})
 }
 

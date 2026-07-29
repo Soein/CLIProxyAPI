@@ -278,6 +278,59 @@ func TestHASharding_PluginSchedulerOnlyReceivesOwnedCandidates(t *testing.T) {
 	})
 }
 
+func TestHASharding_PluginSchedulerDelegateBuiltinOnlyUsesOwnedCandidates(t *testing.T) {
+	newManager := func(t *testing.T, providers ...string) (*Manager, *fakePluginScheduler) {
+		t.Helper()
+		manager := NewManager(nil, &FillFirstSelector{}, nil)
+		for _, provider := range providers {
+			manager.RegisterExecutor(haTestExecutor{id: provider})
+		}
+		manager.SetAuthRing(&stubRing{ready: true, mine: map[string]bool{"a-remote": false, "z-local": true}})
+		manager.SetAuthShardingEnabled(true)
+		manager.SetSpilloverEnabled(true)
+		plugin := &fakePluginScheduler{
+			resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin},
+			handled: true,
+		}
+		manager.SetPluginScheduler(plugin)
+		return manager, plugin
+	}
+
+	t.Run("single", func(t *testing.T) {
+		manager, plugin := newManager(t, "test")
+		registerHAAuth(t, manager, "a-remote", "test")
+		registerHAAuth(t, manager, "z-local", "test")
+
+		selected, _, err := manager.pickNext(context.Background(), "test", "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("pickNext() error = %v", err)
+		}
+		if selected == nil || selected.ID != "z-local" {
+			t.Fatalf("pickNext() auth = %#v, want z-local", selected)
+		}
+		if len(plugin.requests) != 1 || len(plugin.requests[0].Candidates) != 1 || plugin.requests[0].Candidates[0].ID != "z-local" {
+			t.Fatalf("plugin candidates = %#v, want only z-local", plugin.requests)
+		}
+	})
+
+	t.Run("mixed", func(t *testing.T) {
+		manager, plugin := newManager(t, "test-a", "test-b")
+		registerHAAuth(t, manager, "a-remote", "test-a")
+		registerHAAuth(t, manager, "z-local", "test-b")
+
+		selected, _, provider, err := manager.pickNextMixed(context.Background(), []string{"test-a", "test-b"}, "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("pickNextMixed() error = %v", err)
+		}
+		if selected == nil || selected.ID != "z-local" || provider != "test-b" {
+			t.Fatalf("pickNextMixed() = (%#v, %q), want (z-local, test-b)", selected, provider)
+		}
+		if len(plugin.requests) != 1 || len(plugin.requests[0].Candidates) != 1 || plugin.requests[0].Candidates[0].ID != "z-local" {
+			t.Fatalf("plugin candidates = %#v, want only z-local", plugin.requests)
+		}
+	})
+}
+
 func TestHASharding_RouteAwareLegacySelectionEnforcesOwnership(t *testing.T) {
 	const (
 		provider = "codex"
