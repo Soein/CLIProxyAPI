@@ -955,6 +955,146 @@ func TestEnsureRepositoryReconcilesRemoteConfigChangesAroundLocalAuth(t *testing
 	assertLocalFileContents(t, localAuthPath, localAuthContents)
 }
 
+func TestEnsureRepositoryReconcilesRemoteFileDirectoryTransitions(t *testing.T) {
+	tests := []struct {
+		name            string
+		initialPath     string
+		initialContents string
+		targetPath      string
+		targetContents  string
+	}{
+		{
+			name:            "directory to file",
+			initialPath:     "auths/swap/child.json",
+			initialContents: `{"type":"codex","access_token":"old"}`,
+			targetPath:      "auths/swap",
+			targetContents:  "replacement file\n",
+		},
+		{
+			name:            "file to directory",
+			initialPath:     "auths/swap",
+			initialContents: "original file\n",
+			targetPath:      "auths/swap/child.json",
+			targetContents:  `{"type":"codex","access_token":"new"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			remoteDir := setupGitRemoteRepository(t, root, "master",
+				testBranchSpec{name: "master", contents: "remote master branch\n"},
+			)
+			seedDir := filepath.Join(root, "seed")
+			seedRepo, errOpen := git.PlainOpen(seedDir)
+			if errOpen != nil {
+				t.Fatalf("open seed repository: %v", errOpen)
+			}
+			seedWorktree, errWorktree := seedRepo.Worktree()
+			if errWorktree != nil {
+				t.Fatalf("open seed worktree: %v", errWorktree)
+			}
+			writeGitStoreTestFile(t, seedDir, tt.initialPath, tt.initialContents)
+			commitAndPushGitStoreTestPath(t, seedRepo, seedWorktree, tt.initialPath, "Add initial transition path")
+			initialTree := gitStoreTestHeadTree(t, seedRepo)
+
+			store := NewGitTokenStore(remoteDir, "", "", "")
+			store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+			if errEnsure := store.EnsureRepository(); errEnsure != nil {
+				t.Fatalf("EnsureRepository initial: %v", errEnsure)
+			}
+			if errWrite := os.WriteFile(store.ConfigPath(), []byte("source: local-dirty\n"), 0o600); errWrite != nil {
+				t.Fatalf("write local dirty config: %v", errWrite)
+			}
+
+			if _, errRemove := seedWorktree.Remove(tt.initialPath); errRemove != nil {
+				t.Fatalf("remove initial transition path: %v", errRemove)
+			}
+			if errRemove := os.RemoveAll(filepath.Join(seedDir, "auths", "swap")); errRemove != nil {
+				t.Fatalf("remove initial transition shape: %v", errRemove)
+			}
+			writeGitStoreTestFile(t, seedDir, tt.targetPath, tt.targetContents)
+			commitAndPushGitStoreTestPath(t, seedRepo, seedWorktree, tt.targetPath, "Replace transition path")
+			targetTree := gitStoreTestHeadTree(t, seedRepo)
+
+			applyDir := filepath.Join(root, "apply")
+			writeGitStoreTestFile(t, applyDir, tt.initialPath, tt.initialContents)
+			changedPaths, errChangedPaths := changedTreePaths(initialTree, targetTree)
+			if errChangedPaths != nil {
+				t.Fatalf("changedTreePaths: %v", errChangedPaths)
+			}
+			if errApply := applyTreePaths(targetTree, applyDir, changedPaths); errApply != nil {
+				t.Fatalf("applyTreePaths remote transition: %v", errApply)
+			}
+			assertLocalFileContents(t, filepath.Join(applyDir, filepath.FromSlash(tt.targetPath)), tt.targetContents)
+			if errRollback := applyTreePaths(initialTree, applyDir, changedPaths); errRollback != nil {
+				t.Fatalf("applyTreePaths rollback transition: %v", errRollback)
+			}
+			assertLocalFileContents(t, filepath.Join(applyDir, filepath.FromSlash(tt.initialPath)), tt.initialContents)
+			if tt.name == "directory to file" {
+				ignoredPath := filepath.Join(applyDir, "auths", "swap", "ignored.local")
+				writeGitStoreTestFile(t, applyDir, "auths/swap/ignored.local", "preserve me\n")
+				if errApply := applyTreePaths(targetTree, applyDir, changedPaths); errApply == nil {
+					t.Fatal("applyTreePaths with untracked directory content error = nil")
+				}
+				if errRollback := applyTreePaths(initialTree, applyDir, changedPaths); errRollback != nil {
+					t.Fatalf("applyTreePaths rollback after partial transition: %v", errRollback)
+				}
+				assertLocalFileContents(t, ignoredPath, "preserve me\n")
+				assertLocalFileContents(t, filepath.Join(applyDir, filepath.FromSlash(tt.initialPath)), tt.initialContents)
+			}
+
+			if errEnsure := store.EnsureRepository(); errEnsure != nil {
+				t.Fatalf("EnsureRepository after remote transition: %v", errEnsure)
+			}
+			assertLocalFileContents(t, filepath.Join(root, "workspace", filepath.FromSlash(tt.targetPath)), tt.targetContents)
+			assertLocalFileContents(t, store.ConfigPath(), "source: local-dirty\n")
+		})
+	}
+}
+
+func TestApplyTreePathsRejectsUnsafePaths(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "worktree")
+	outsidePath := filepath.Join(root, "outside")
+	gitConfigPath := filepath.Join(repoDir, ".git", "config")
+	writeGitStoreTestFile(t, root, "outside", "outside sentinel\n")
+	writeGitStoreTestFile(t, repoDir, ".git/config", "git sentinel\n")
+
+	unsafePaths := []string{
+		"../outside",
+		"auths/../outside",
+		".git/config",
+		".git /config",
+		".git./config",
+		".git:stream/config",
+		"git~1/config",
+		"git~1.../config",
+		".g\u200cit/config",
+		`auths\..\outside`,
+		"auths/\x1foutside",
+		filepath.ToSlash(outsidePath),
+	}
+	for _, unsafePath := range unsafePaths {
+		t.Run(unsafePath, func(t *testing.T) {
+			if errApply := applyTreePaths(&object.Tree{}, repoDir, []string{unsafePath}); errApply == nil {
+				t.Fatalf("applyTreePaths(%q) error = nil", unsafePath)
+			}
+			assertLocalFileContents(t, outsidePath, "outside sentinel\n")
+			assertLocalFileContents(t, gitConfigPath, "git sentinel\n")
+		})
+	}
+}
+
+func TestResolveTreePathAllowsGitPrefixedNames(t *testing.T) {
+	repoDir := t.TempDir()
+	for _, path := range []string{".github/workflows/test.yml", ".gitignore", ".gitmodules", "auths/git~10.json"} {
+		if _, errResolve := resolveTreePath(repoDir, path); errResolve != nil {
+			t.Errorf("resolveTreePath(%q): %v", path, errResolve)
+		}
+	}
+}
+
 func TestEnsureRepositoryFailsClosedOnSamePathConflict(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "master",
@@ -1631,6 +1771,49 @@ func findBranchSpec(branches []testBranchSpec, name string) (testBranchSpec, boo
 		}
 	}
 	return testBranchSpec{}, false
+}
+
+func writeGitStoreTestFile(t *testing.T, root, path, contents string) {
+	t.Helper()
+	fullPath := filepath.Join(root, filepath.FromSlash(path))
+	if errMkdir := os.MkdirAll(filepath.Dir(fullPath), 0o700); errMkdir != nil {
+		t.Fatalf("create parent for %s: %v", path, errMkdir)
+	}
+	if errWrite := os.WriteFile(fullPath, []byte(contents), 0o600); errWrite != nil {
+		t.Fatalf("write %s: %v", path, errWrite)
+	}
+}
+
+func commitAndPushGitStoreTestPath(t *testing.T, repo *git.Repository, worktree *git.Worktree, path, message string) {
+	t.Helper()
+	if _, errAdd := worktree.Add(path); errAdd != nil {
+		t.Fatalf("add %s: %v", path, errAdd)
+	}
+	if _, errCommit := worktree.Commit(message, &git.CommitOptions{Author: &object.Signature{
+		Name: "CLIProxyAPI", Email: "cliproxy@local", When: time.Unix(1711929600, 0),
+	}}); errCommit != nil {
+		t.Fatalf("commit %s: %v", path, errCommit)
+	}
+	if errPush := repo.Push(&git.PushOptions{RemoteName: "origin"}); errPush != nil {
+		t.Fatalf("push %s: %v", path, errPush)
+	}
+}
+
+func gitStoreTestHeadTree(t *testing.T, repo *git.Repository) *object.Tree {
+	t.Helper()
+	head, errHead := repo.Head()
+	if errHead != nil {
+		t.Fatalf("resolve test repository HEAD: %v", errHead)
+	}
+	commit, errCommit := repo.CommitObject(head.Hash())
+	if errCommit != nil {
+		t.Fatalf("resolve test repository commit: %v", errCommit)
+	}
+	tree, errTree := commit.Tree()
+	if errTree != nil {
+		t.Fatalf("resolve test repository tree: %v", errTree)
+	}
+	return tree
 }
 
 func assertLocalFileContents(t *testing.T, path, wantContents string) {

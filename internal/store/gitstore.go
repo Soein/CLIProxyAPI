@@ -1078,12 +1078,28 @@ func overlappingDirtyPath(path string, dirtyPaths map[string]struct{}) (string, 
 }
 
 func applyTreePaths(tree *object.Tree, repoDir string, paths []string) error {
+	type treePathUpdate struct {
+		path        string
+		destination string
+		contents    string
+	}
+
+	removals := make([]treePathUpdate, 0, len(paths))
+	directories := make([]treePathUpdate, 0, len(paths))
+	writes := make([]treePathUpdate, 0, len(paths))
 	for _, path := range paths {
-		destination := filepath.Join(repoDir, filepath.FromSlash(path))
+		destination, errDestination := resolveTreePath(repoDir, path)
+		if errDestination != nil {
+			return errDestination
+		}
 		file, errFile := tree.File(path)
 		if errors.Is(errFile, object.ErrFileNotFound) {
-			if errRemove := os.Remove(destination); errRemove != nil && !errors.Is(errRemove, fs.ErrNotExist) {
-				return fmt.Errorf("remove %s: %w", path, errRemove)
+			if _, errDirectory := tree.Tree(path); errDirectory == nil {
+				directories = append(directories, treePathUpdate{path: path, destination: destination})
+			} else if errors.Is(errDirectory, object.ErrDirectoryNotFound) {
+				removals = append(removals, treePathUpdate{path: path, destination: destination})
+			} else {
+				return fmt.Errorf("inspect directory %s: %w", path, errDirectory)
 			}
 			continue
 		}
@@ -1094,11 +1110,158 @@ func applyTreePaths(tree *object.Tree, repoDir string, paths []string) error {
 		if errContents != nil {
 			return fmt.Errorf("read %s: %w", path, errContents)
 		}
-		if errMkdir := os.MkdirAll(filepath.Dir(destination), 0o700); errMkdir != nil {
-			return fmt.Errorf("create parent for %s: %w", path, errMkdir)
+		writes = append(writes, treePathUpdate{path: path, destination: destination, contents: contents})
+	}
+
+	pathDepth := func(path string) int { return strings.Count(filepath.ToSlash(path), "/") }
+	sort.Slice(removals, func(i, j int) bool {
+		depthI, depthJ := pathDepth(removals[i].path), pathDepth(removals[j].path)
+		if depthI != depthJ {
+			return depthI > depthJ
 		}
-		if errWrite := os.WriteFile(destination, []byte(contents), 0o600); errWrite != nil {
-			return fmt.Errorf("write %s: %w", path, errWrite)
+		return removals[i].path > removals[j].path
+	})
+	for _, removal := range removals {
+		if errRemove := os.Remove(removal.destination); errRemove != nil && !errors.Is(errRemove, fs.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", removal.path, errRemove)
+		}
+	}
+
+	sort.Slice(directories, func(i, j int) bool {
+		depthI, depthJ := pathDepth(directories[i].path), pathDepth(directories[j].path)
+		if depthI != depthJ {
+			return depthI < depthJ
+		}
+		return directories[i].path < directories[j].path
+	})
+	for _, directory := range directories {
+		info, errStat := os.Lstat(directory.destination)
+		if errors.Is(errStat, fs.ErrNotExist) {
+			continue
+		}
+		if errStat != nil {
+			return fmt.Errorf("inspect directory destination %s: %w", directory.path, errStat)
+		}
+		if info.IsDir() {
+			continue
+		}
+		if errRemove := os.Remove(directory.destination); errRemove != nil {
+			return fmt.Errorf("replace destination %s with directory: %w", directory.path, errRemove)
+		}
+	}
+
+	sort.Slice(writes, func(i, j int) bool {
+		depthI, depthJ := pathDepth(writes[i].path), pathDepth(writes[j].path)
+		if depthI != depthJ {
+			return depthI < depthJ
+		}
+		return writes[i].path < writes[j].path
+	})
+	for _, write := range writes {
+		if info, errStat := os.Lstat(write.destination); errStat == nil && (info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+			if errRemove := os.Remove(write.destination); errRemove != nil {
+				return fmt.Errorf("replace destination %s: %w", write.path, errRemove)
+			}
+		} else if errStat != nil && !errors.Is(errStat, fs.ErrNotExist) {
+			return fmt.Errorf("inspect destination %s: %w", write.path, errStat)
+		}
+		if errParents := validateTreePathParents(repoDir, write.destination); errParents != nil {
+			return fmt.Errorf("validate parent for %s: %w", write.path, errParents)
+		}
+		if errMkdir := os.MkdirAll(filepath.Dir(write.destination), 0o700); errMkdir != nil {
+			return fmt.Errorf("create parent for %s: %w", write.path, errMkdir)
+		}
+		if errWrite := os.WriteFile(write.destination, []byte(write.contents), 0o600); errWrite != nil {
+			return fmt.Errorf("write %s: %w", write.path, errWrite)
+		}
+	}
+	return nil
+}
+
+func resolveTreePath(repoDir, path string) (string, error) {
+	localPath := filepath.FromSlash(path)
+	if path == "" || strings.Contains(path, `\`) || filepath.IsAbs(localPath) || filepath.VolumeName(localPath) != "" {
+		return "", fmt.Errorf("invalid repository path %q", path)
+	}
+	for i := 0; i < len(path); i++ {
+		if path[i] < 0x20 || path[i] == 0x7f {
+			return "", fmt.Errorf("invalid repository path %q", path)
+		}
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	if clean != path || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("invalid repository path %q", path)
+	}
+	for _, component := range strings.Split(clean, "/") {
+		if component == "" || component == "." || component == ".." || isGitMetadataPathComponent(component) {
+			return "", fmt.Errorf("invalid repository path %q", path)
+		}
+	}
+
+	destination := filepath.Join(repoDir, filepath.FromSlash(clean))
+	relative, errRelative := filepath.Rel(repoDir, destination)
+	if errRelative != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", fmt.Errorf("repository path %q escapes worktree", path)
+	}
+	return destination, nil
+}
+
+func isGitMetadataPathComponent(component string) bool {
+	normalized := strings.ToLower(strings.Map(func(r rune) rune {
+		switch r {
+		case 0x200c, 0x200d, 0x200e, 0x200f,
+			0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+			0x206a, 0x206b, 0x206c, 0x206d, 0x206e, 0x206f,
+			0xfeff:
+			return -1
+		default:
+			return r
+		}
+	}, component))
+
+	baseLength := 0
+	switch {
+	case strings.HasPrefix(normalized, ".git"):
+		baseLength = len(".git")
+	case strings.HasPrefix(normalized, "git~1"):
+		baseLength = len("git~1")
+	default:
+		return false
+	}
+	for _, r := range normalized[baseLength:] {
+		if r == ':' {
+			return true
+		}
+		if r != '.' && r != ' ' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateTreePathParents(repoDir, destination string) error {
+	relative, errRelative := filepath.Rel(repoDir, filepath.Dir(destination))
+	if errRelative != nil {
+		return errRelative
+	}
+	current := repoDir
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, errStat := os.Lstat(current)
+		if errors.Is(errStat, fs.ErrNotExist) {
+			return nil
+		}
+		if errStat != nil {
+			return errStat
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("parent %s is a symbolic link", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("parent %s is not a directory", current)
 		}
 	}
 	return nil
