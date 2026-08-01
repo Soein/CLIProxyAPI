@@ -119,6 +119,25 @@ func codexReasoningReplaySessionKey(ctx context.Context, from sdktranslator.Form
 	return ""
 }
 
+// isolateReasoningReplaySessionKeyByCaller namespaces client-controlled replay
+// keys by the downstream CPA API key. Trusted execution keys retain their
+// existing form, while unauthenticated client-controlled keys are disabled.
+func isolateReasoningReplaySessionKeyByCaller(ctx context.Context, sessionKey string) string {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return ""
+	}
+	if strings.HasPrefix(sessionKey, "execution:") {
+		return sessionKey
+	}
+	apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx))
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return "caller:" + hex.EncodeToString(sum[:8]) + ":" + sessionKey
+}
+
 func metadataString(metadata map[string]any, key string) string {
 	if len(metadata) == 0 {
 		return ""

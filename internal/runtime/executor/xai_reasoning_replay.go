@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -75,7 +74,7 @@ func xaiReasoningReplayScopeFromRequest(ctx context.Context, from sdktranslator.
 // downstream CPA API key. Missing auth provenance fails closed; untrusted
 // client-controlled sessions without a caller API key are also disabled.
 func xaiReasoningReplayIsolateSessionKey(ctx context.Context, sessionKey string, opts cliproxyexecutor.Options) string {
-	sessionKey = strings.TrimSpace(sessionKey)
+	sessionKey = isolateReasoningReplaySessionKeyByCaller(ctx, sessionKey)
 	if sessionKey == "" {
 		return ""
 	}
@@ -85,15 +84,7 @@ func xaiReasoningReplayIsolateSessionKey(ctx context.Context, sessionKey string,
 	}
 	authSum := sha256.Sum256([]byte(authID))
 	authScope := "auth:" + hex.EncodeToString(authSum[:8])
-	if strings.HasPrefix(sessionKey, "execution:") {
-		return authScope + ":" + sessionKey
-	}
-	apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx))
-	if apiKey == "" {
-		return ""
-	}
-	callerSum := sha256.Sum256([]byte(apiKey))
-	return authScope + ":caller:" + hex.EncodeToString(callerSum[:8]) + ":" + sessionKey
+	return authScope + ":" + sessionKey
 }
 
 func xaiReasoningReplayEnabledForSource(from sdktranslator.Format) bool {
