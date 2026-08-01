@@ -364,7 +364,9 @@ func kimiThinkingReplayCacheKey(modelFamily, sessionKey string) string {
 	if modelFamily == "" || sessionKey == "" {
 		return ""
 	}
-	return strings.Join([]string{"kimi-thinking-replay", modelFamily, sessionKey}, "\x00")
+	// Keep client-controlled session values out of long-lived map keys. This
+	// also bounds tombstone memory independently from request key length.
+	return strings.Join([]string{"kimi-thinking-replay", homekv.HashKeyPart(modelFamily), homekv.HashKeyPart(sessionKey)}, "\x00")
 }
 
 func kimiThinkingReplayKVKey(modelFamily, sessionKey string) string {

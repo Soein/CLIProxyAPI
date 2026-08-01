@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -218,6 +219,30 @@ func TestKimiThinkingReplayTracksAggregateLocalBytes(t *testing.T) {
 	ClearKimiThinkingReplayCache()
 	if kimiThinkingReplayTotalBytes != 0 {
 		t.Fatalf("aggregate bytes after clear = %d, want 0", kimiThinkingReplayTotalBytes)
+	}
+}
+
+func TestKimiThinkingReplayBoundsPersistedMissKey(t *testing.T) {
+	ClearKimiThinkingReplayCache()
+	t.Cleanup(ClearKimiThinkingReplayCache)
+
+	const modelFamily = "k3"
+	sessionKey := "prompt-cache:" + strings.Repeat("x", 1<<20)
+	_, _, found, errGet := GetKimiThinkingReplayWithSnapshotRequired(context.Background(), modelFamily, sessionKey)
+	if errGet != nil || found {
+		t.Fatalf("oversized session miss = found %v, error %v", found, errGet)
+	}
+	if len(kimiThinkingReplayEntries) != 1 {
+		t.Fatalf("persisted entries = %d, want 1 tombstone", len(kimiThinkingReplayEntries))
+	}
+	for key := range kimiThinkingReplayEntries {
+		const wantKeyBytes = len("kimi-thinking-replay") + 1 + 64 + 1 + 64
+		if len(key) != wantKeyBytes {
+			t.Fatalf("persisted key bytes = %d, want fixed %d", len(key), wantKeyBytes)
+		}
+		if strings.Contains(key, sessionKey) {
+			t.Fatal("persisted key retained the client-controlled session value")
+		}
 	}
 }
 
