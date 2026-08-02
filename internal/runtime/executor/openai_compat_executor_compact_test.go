@@ -75,6 +75,64 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatExecutorPreservesResponsesAssistantTurnWithContentAndToolCall(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"inspect the next step"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect the logs now."}]},
+			{"type":"function_call","call_id":"call_logs","name":"exec_command","arguments":"{\"cmd\":\"tail -n 20 app.log\"}"},
+			{"type":"function_call_output","call_id":"call_logs","output":"ok"}
+		]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4-flash",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Fatalf("path = %q, want /v1/chat/completions", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "messages.#").Int(); got != 2 {
+		t.Fatalf("messages count = %d, want 2; body=%s", got, gotBody)
+	}
+	assistant := gjson.GetBytes(gotBody, "messages.0")
+	if got := assistant.Get("content.0.text").String(); got != "I will inspect the logs now." {
+		t.Fatalf("assistant content = %q; body=%s", got, gotBody)
+	}
+	if got := assistant.Get("reasoning_content").String(); got != "inspect the next step" {
+		t.Fatalf("assistant reasoning_content = %q; body=%s", got, gotBody)
+	}
+	if got := assistant.Get("tool_calls.0.id").String(); got != "call_logs" {
+		t.Fatalf("assistant tool call id = %q; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "messages.1.tool_call_id").String(); got != "call_logs" {
+		t.Fatalf("tool output call id = %q; body=%s", got, gotBody)
+	}
+}
+
 func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
