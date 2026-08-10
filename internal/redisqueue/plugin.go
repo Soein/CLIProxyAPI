@@ -91,6 +91,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Phases:          queuePhaseTimings(record.Phases),
 		Source:          record.Source,
 		AuthIndex:       record.AuthIndex,
+		AccessTokenHash: record.AccessTokenSHA256,
 		ClientIP:        clientRequestMetadata.ClientIP,
 		XForwardedFor:   clientRequestMetadata.XForwardedFor,
 		UserAgent:       clientRequestMetadata.UserAgent,
@@ -147,6 +148,7 @@ type requestDetail struct {
 	Phases          *phaseTimings `json:"phases,omitempty"`
 	Source          string        `json:"source"`
 	AuthIndex       string        `json:"auth_index"`
+	AccessTokenHash string        `json:"access_token_sha256,omitempty"`
 	ClientIP        string        `json:"client_ip"`
 	XForwardedFor   string        `json:"x_forwarded_for"`
 	UserAgent       string        `json:"user_agent"`

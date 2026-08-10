@@ -76,9 +76,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.discardStoreGenerationMetadata()
 	now := time.Now()
-	clearedCooldown := false
+	cooldownStateChanged := normalizeModelStates(auth)
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	m.mu.Lock()
@@ -121,7 +121,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		committed = auth.Clone()
 	}
 	m.hook.OnAuthRegistered(ctx, committed.Clone())
-	if clearedCooldown {
+	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
 	return committed, nil
@@ -179,9 +179,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 	}
 	now := time.Now()
-	clearedCooldown := false
+	cooldownStateChanged := normalizeModelStates(auth)
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	auth.revision = m.nextAuthRevisionLocked()
@@ -207,7 +207,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		committed = auth.Clone()
 	}
 	m.hook.OnAuthUpdated(ctx, committed.Clone())
-	if clearedCooldown {
+	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
 	return committed, nil

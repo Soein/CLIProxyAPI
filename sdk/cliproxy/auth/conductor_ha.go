@@ -1138,7 +1138,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			}
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+		available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 		if errAvailable != nil {
 			m.mu.RUnlock()
 			if spillover() {
@@ -1146,7 +1146,6 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			}
 			return nil, nil, "", errAvailable
 		}
-		available = cloneAuthSlice(available)
 		m.mu.RUnlock()
 
 		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
@@ -1161,20 +1160,24 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 				}
 			}
 			if sessionAffinity, okSession := selector.(*SessionAffinitySelector); okSession && inflight != nil && selectorProvider == "xai" {
-				selected, errPick = sessionAffinity.pickForExecution(ctx, selectorProvider, model, opts, available, inflight, preferredAuthID)
+				selected, errPick = sessionAffinity.pickForExecution(ctx, selectorProvider, model, opts, selectorAuths, inflight, preferredAuthID)
 			} else {
+				selectionAuths := selectorAuths
 				if inflight != nil && selectorProvider == "xai" && isBuiltInSelector(selector) {
-					available = preferWebsocketAuths(ctx, selectorProvider, available)
-					if preferred := authByID(available, preferredAuthID); preferred != nil {
-						available = []*Auth{preferred}
+					selectionAuths = preferWebsocketAuths(ctx, selectorProvider, selectionAuths)
+					if preferred := authByID(selectionAuths, preferredAuthID); preferred != nil {
+						selectionAuths = []*Auth{preferred}
 					} else {
-						available = leastInflightAuths(available, inflight)
+						selectionAuths = leastInflightAuths(selectionAuths, inflight)
 					}
 				}
 				selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
-				selected, errPick = selector.Pick(selectorCtx, selectorProvider, selectionArgForSelector(selector, model), opts, available)
+				selected, errPick = selector.Pick(selectorCtx, selectorProvider, selectionArgForSelector(selector, model), opts, selectionAuths)
 			}
 			if errPick != nil {
+				if isBuiltInSelector(selector) {
+					errPick = restoreModelCooldownErrorModel(errPick, model)
+				}
 				return nil, nil, "", errPick
 			}
 		}

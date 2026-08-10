@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -11,7 +12,7 @@ import (
 // ConvertCodexResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
 // to OpenAI Responses SSE events (response.*).
 
-func ConvertCodexResponseToOpenAIResponses(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) [][]byte {
+func ConvertCodexResponseToOpenAIResponses(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) [][]byte {
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
 		if errorResult := gjson.GetBytes(rawJSON, "error"); errorResult.Exists() {
@@ -22,12 +23,37 @@ func ConvertCodexResponseToOpenAIResponses(_ context.Context, _ string, _, _, ra
 			out = append(out, errorEvent...)
 			return [][]byte{out}
 		}
+		rawJSON = setResponsesModel(rawJSON, modelName, originalRequestRawJSON, requestRawJSON)
 		out := make([]byte, 0, len(rawJSON)+len("data: "))
 		out = append(out, []byte("data: ")...)
 		out = append(out, rawJSON...)
 		return [][]byte{out}
 	}
-	return [][]byte{rawJSON}
+	return [][]byte{setResponsesModel(rawJSON, modelName, originalRequestRawJSON, requestRawJSON)}
+}
+
+func setResponsesModel(rawJSON []byte, modelName string, originalRequestRawJSON, requestRawJSON []byte) []byte {
+	eventType := gjson.GetBytes(rawJSON, "type").String()
+	if eventType != "response.created" && eventType != "response.in_progress" {
+		return rawJSON
+	}
+	if gjson.GetBytes(rawJSON, "response.model").Exists() {
+		return rawJSON
+	}
+
+	requestModelName := translatorcommon.RequestModelName(originalRequestRawJSON, requestRawJSON)
+	if requestModelName == "" {
+		requestModelName = modelName
+	}
+	if requestModelName == "" {
+		return rawJSON
+	}
+
+	updated, errSet := sjson.SetBytes(rawJSON, "response.model", requestModelName)
+	if errSet != nil {
+		return rawJSON
+	}
+	return updated
 }
 
 // ConvertCodexResponseToOpenAIResponsesNonStream builds a single Responses JSON
