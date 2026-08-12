@@ -22,10 +22,15 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
+// resetAntigravityCreditsRetryState clears the package-level credits state
+// between tests. It empties each map in place instead of assigning a fresh
+// sync.Map, because credits hint refreshes run on background goroutines that
+// may still be writing these maps when a test's cleanup runs. Replacing the
+// variable is an unsynchronized write and races with them; Clear is not.
 func resetAntigravityCreditsRetryState() {
 	// Credits-hint probes are intentionally detached. Wait for any local probe
-	// to leave its per-auth critical section before replacing the global maps,
-	// otherwise test cleanup can race the final cache writes.
+	// to leave its per-auth critical section before clearing the global maps,
+	// otherwise final cache writes can repopulate state after test cleanup.
 	antigravityCreditsHintRefreshByID.Range(func(_, value any) bool {
 		if state, ok := value.(*antigravityCreditsHintRefreshState); ok && state != nil {
 			state.mu.Lock()
@@ -33,10 +38,10 @@ func resetAntigravityCreditsRetryState() {
 		}
 		return true
 	})
-	antigravityCreditsFailureByAuth = sync.Map{}
-	antigravityShortCooldownByAuth = sync.Map{}
-	antigravityCreditsBalanceByAuth = sync.Map{}
-	antigravityCreditsHintRefreshByID = sync.Map{}
+	antigravityCreditsFailureByAuth.Clear()
+	antigravityShortCooldownByAuth.Clear()
+	antigravityCreditsBalanceByAuth.Clear()
+	antigravityCreditsHintRefreshByID.Clear()
 }
 
 type closeSignalReadCloser struct {
