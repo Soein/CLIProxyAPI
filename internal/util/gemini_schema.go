@@ -229,8 +229,8 @@ func removePlaceholderFields(jsonStr string) string {
 }
 
 // inlineLocalRefs resolves JSON Pointer references against the original schema before definition
-// containers are stripped. Each expansion receives its own copy, sibling keywords override the
-// referenced definition, and cycles terminate as a typed hint instead of recursing forever.
+// containers are stripped. Each expansion receives its own copy, sibling object schemas are
+// merged, and cycles or exhausted budgets terminate as typed hints instead of recursing forever.
 func inlineLocalRefs(jsonStr string) string {
 	if !strings.Contains(jsonStr, `"$ref"`) {
 		return jsonStr
@@ -249,11 +249,14 @@ func inlineLocalRefs(jsonStr string) string {
 	}
 	resolved, ok := resolver.resolve(root, root, make(map[string]bool), 0)
 	if !ok {
-		return jsonStr
+		resolved = compactLocalRefFallback(root)
 	}
 	out, err := json.Marshal(resolved)
 	if err != nil || len(out) > maxInlineLocalRefOutputBytes {
-		return jsonStr
+		out, err = json.Marshal(compactLocalRefFallback(root))
+		if err != nil || len(out) > maxInlineLocalRefOutputBytes {
+			return `{"type":"object","description":"Local reference expansion limit exceeded"}`
+		}
 	}
 	return string(out)
 }
@@ -299,30 +302,30 @@ func (r *localRefResolver) resolve(root, value any, active map[string]bool, dept
 				resolvedTarget, okResolved := r.resolve(root, target, active, depth+1)
 				delete(active, ref)
 				if !okResolved {
-					return nil, false
+					return cyclicRefFallback(node, target, ref), true
 				}
 				if targetMap, okTarget := resolvedTarget.(map[string]any); okTarget {
-					out := make(map[string]any, len(targetMap)+len(node))
-					for key, item := range targetMap {
-						out[key] = item
-					}
+					siblings := make(map[string]any, len(node)-1)
 					for key, item := range node {
-						if key == "$ref" {
+						if key == "$ref" || isLocalDefinitionContainer(key) {
 							continue
 						}
 						resolved, okResolved := r.resolve(root, item, active, depth+1)
 						if !okResolved {
-							return nil, false
+							return cyclicRefFallback(node, target, ref), true
 						}
-						out[key] = resolved
+						siblings[key] = resolved
 					}
-					return out, true
+					return mergeRefSchemaMaps(targetMap, siblings), true
 				}
 			}
 		}
 
 		out := make(map[string]any, len(node))
 		for key, item := range node {
+			if isLocalDefinitionContainer(key) {
+				continue
+			}
 			resolved, ok := r.resolve(root, item, active, depth+1)
 			if !ok {
 				return nil, false
@@ -333,6 +336,129 @@ func (r *localRefResolver) resolve(root, value any, active map[string]bool, dept
 	default:
 		return value, true
 	}
+}
+
+func compactLocalRefFallback(root any) map[string]any {
+	ref, target, ok := findLocalRef(root, root, 0, new(int))
+	if !ok {
+		return map[string]any{
+			"type":        "object",
+			"description": "Local reference expansion limit exceeded",
+		}
+	}
+
+	fallback := cyclicRefFallback(nil, target, ref)
+	// The target description may itself be what exceeded the output budget. Keep the existing
+	// typed-reference hint, but discard all unbounded text and sibling constraints on this final
+	// safety path.
+	fallback["description"] = "See: " + refName(ref)
+	return fallback
+}
+
+func findLocalRef(root, value any, depth int, nodes *int) (string, any, bool) {
+	if depth > maxInlineLocalRefDepth || nodes == nil || *nodes >= maxInlineLocalRefNodes {
+		return "", nil, false
+	}
+	*nodes++
+
+	switch node := value.(type) {
+	case []any:
+		for _, item := range node {
+			if ref, target, ok := findLocalRef(root, item, depth+1, nodes); ok {
+				return ref, target, true
+			}
+		}
+	case map[string]any:
+		if ref, ok := node["$ref"].(string); ok && strings.HasPrefix(ref, "#/") {
+			if target, found := resolveJSONPointer(root, ref); found {
+				return ref, target, true
+			}
+		}
+		keys := make([]string, 0, len(node))
+		for key := range node {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if ref, target, ok := findLocalRef(root, node[key], depth+1, nodes); ok {
+				return ref, target, true
+			}
+		}
+	}
+	return "", nil, false
+}
+
+func isLocalDefinitionContainer(key string) bool {
+	return key == "$defs" || key == "definitions"
+}
+
+func mergeRefSchemaMaps(base, sibling map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(sibling))
+	for key, value := range base {
+		if isLocalDefinitionContainer(key) {
+			continue
+		}
+		out[key] = value
+	}
+	for key, value := range sibling {
+		switch key {
+		case "properties":
+			baseProperties, baseOK := out[key].(map[string]any)
+			siblingProperties, siblingOK := value.(map[string]any)
+			if baseOK && siblingOK {
+				out[key] = mergeRefProperties(baseProperties, siblingProperties)
+				continue
+			}
+		case "required":
+			baseRequired, _ := out[key].([]any)
+			siblingRequired, siblingOK := value.([]any)
+			if siblingOK {
+				out[key] = stableRequiredUnion(baseRequired, siblingRequired)
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func mergeRefProperties(base, sibling map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(sibling))
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range sibling {
+		baseSchema, baseOK := out[key].(map[string]any)
+		siblingSchema, siblingOK := value.(map[string]any)
+		if baseOK && siblingOK {
+			out[key] = mergeRefSchemaMaps(baseSchema, siblingSchema)
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func stableRequiredUnion(base, sibling []any) []any {
+	out := make([]any, 0, len(base)+len(sibling))
+	seen := make(map[string]struct{}, len(base)+len(sibling))
+	appendRequired := func(values []any) {
+		for _, required := range values {
+			name, ok := required.(string)
+			if !ok {
+				out = append(out, required)
+				continue
+			}
+			if _, exists := seen[name]; exists {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	appendRequired(base)
+	appendRequired(sibling)
+	return out
 }
 
 func (r *localRefResolver) reserveNode() bool {
@@ -377,7 +503,7 @@ func cyclicRefFallback(node map[string]any, target any, ref string) map[string]a
 		}
 	}
 	for key, value := range node {
-		if key != "$ref" {
+		if key != "$ref" && !isLocalDefinitionContainer(key) {
 			out[key] = value
 		}
 	}

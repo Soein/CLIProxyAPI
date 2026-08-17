@@ -1478,15 +1478,19 @@ func TestCleanJSONSchemaForAntigravityResponseInlinesLocalRef(t *testing.T) {
 	}
 }
 
-func TestCleanJSONSchemaForGemini_LocalRefBudgetStopsExplosion(t *testing.T) {
+func TestCleanJSONSchemaForAntigravityResponse_LocalRefBudgetStopsExplosion(t *testing.T) {
 	input := buildBudgetExplosionSchema(10)
 
-	result := CleanJSONSchemaForGemini(input)
+	result := CleanJSONSchemaForAntigravityResponse(input)
 	if len(result) > 12<<10 {
 		t.Fatalf("schema expansion exceeded budget: len=%d, result=%s", len(result), result)
 	}
 	if strings.Count(result, `"value"`) > 24 {
 		t.Fatalf("schema still expanded too far: %s", result)
+	}
+	resolved := gjson.Parse(result)
+	if resolved.Get("type").String() != "object" || !strings.Contains(resolved.Get("description").String(), "See: Node9") {
+		t.Fatalf("budget exhaustion did not produce a typed reference hint: %s", result)
 	}
 }
 
@@ -1510,6 +1514,110 @@ func buildBudgetExplosionSchema(levels int) string {
 	}
 	fmt.Fprintf(&b, `},"$ref":"#/definitions/Node%d"}`, levels-1)
 	return b.String()
+}
+
+func TestCleanJSONSchemaForAntigravityResponse_LocalRefDepthBudgetUsesTypedHint(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"definitions":{`)
+	for i := 0; i <= maxInlineLocalRefDepth+2; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"Deep%d":{"type":"object"`, i)
+		if i < maxInlineLocalRefDepth+2 {
+			fmt.Fprintf(&b, `,"properties":{"next":{"$ref":"#/definitions/Deep%d"}}`, i+1)
+		}
+		b.WriteByte('}')
+	}
+	fmt.Fprintf(&b, `},"$ref":"#/definitions/Deep0"}`)
+
+	result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(b.String()))
+	if result.Get("type").String() != "object" || !strings.Contains(result.Raw, "See: Deep") {
+		t.Fatalf("depth budget exhaustion did not retain a typed reference hint: %s", result.Raw)
+	}
+}
+
+func TestCleanJSONSchemaForAntigravityResponse_LocalRefNodeBudgetUsesTypedHint(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"definitions":{"Wide":{"type":"object","properties":{`)
+	for i := 0; i < maxInlineLocalRefNodes; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"field%d":{"type":"string"}`, i)
+	}
+	b.WriteString(`}}},"$ref":"#/definitions/Wide"}`)
+
+	result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(b.String()))
+	if result.Get("type").String() != "object" || !strings.Contains(result.Get("description").String(), "See: Wide") {
+		t.Fatalf("node budget exhaustion did not produce a typed reference hint: %s", result.Raw)
+	}
+}
+
+func TestInlineLocalRefs_OutputBudgetUsesTypedHint(t *testing.T) {
+	input := fmt.Sprintf(
+		`{"definitions":{"Large":{"type":"object","description":%q,"properties":{"payload":{"type":"string"}}}},"$ref":"#/definitions/Large"}`,
+		strings.Repeat("x", maxInlineLocalRefOutputBytes),
+	)
+
+	result := inlineLocalRefs(input)
+	if len(result) > maxInlineLocalRefOutputBytes {
+		t.Fatalf("fallback exceeded output budget: len=%d", len(result))
+	}
+	parsed := gjson.Parse(result)
+	if parsed.Get("type").String() != "object" || !strings.Contains(parsed.Get("description").String(), "See: Large") || parsed.Get(`\$ref`).Exists() {
+		t.Fatalf("output budget exhaustion did not produce a typed reference hint: %s", result)
+	}
+}
+
+func TestInlineLocalRefs_MergesSiblingObjectSchemas(t *testing.T) {
+	input := `{
+		"definitions":{
+			"Base":{
+				"type":"object",
+				"minProperties":1,
+				"properties":{
+					"id":{"type":"string"},
+					"profile":{
+						"type":"object",
+						"properties":{"first":{"type":"string"}},
+						"required":["first"]
+					}
+				},
+				"required":["id","profile"]
+			}
+		},
+		"$ref":"#/definitions/Base",
+		"maxProperties":3,
+		"properties":{
+			"profile":{
+				"properties":{"last":{"type":"string"}},
+				"required":["last","first"]
+			},
+			"status":{"type":"string"}
+		},
+		"required":["profile","status","profile"]
+	}`
+
+	result := gjson.Parse(inlineLocalRefs(input))
+	for _, path := range []string{
+		"properties.id.type",
+		"properties.status.type",
+		"properties.profile.properties.first.type",
+		"properties.profile.properties.last.type",
+		"minProperties",
+		"maxProperties",
+	} {
+		if !result.Get(path).Exists() {
+			t.Fatalf("merged schema lost %s: %s", path, result.Raw)
+		}
+	}
+	if got := result.Get("required").Array(); len(got) != 3 || got[0].String() != "id" || got[1].String() != "profile" || got[2].String() != "status" {
+		t.Fatalf("root required union is unstable or duplicated: %s", result.Raw)
+	}
+	if got := result.Get("properties.profile.required").Array(); len(got) != 2 || got[0].String() != "first" || got[1].String() != "last" {
+		t.Fatalf("nested required union is unstable or duplicated: %s", result.Raw)
+	}
 }
 
 func TestCleanJSONSchemaForAntigravityResponseTypeArrayUsesNativeNullable(t *testing.T) {
