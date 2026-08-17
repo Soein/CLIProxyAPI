@@ -2,6 +2,7 @@ package util
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -1475,6 +1476,40 @@ func TestCleanJSONSchemaForAntigravityResponseInlinesLocalRef(t *testing.T) {
 	if payload.Get("type").String() != "object" || payload.Get("properties.id.type").String() != "integer" || payload.Get("required.0").String() != "id" {
 		t.Fatalf("local reference definition was not inlined: %s", result.Raw)
 	}
+}
+
+func TestCleanJSONSchemaForGemini_LocalRefBudgetStopsExplosion(t *testing.T) {
+	input := buildBudgetExplosionSchema(10)
+
+	result := CleanJSONSchemaForGemini(input)
+	if len(result) > 12<<10 {
+		t.Fatalf("schema expansion exceeded budget: len=%d, result=%s", len(result), result)
+	}
+	if strings.Count(result, `"value"`) > 24 {
+		t.Fatalf("schema still expanded too far: %s", result)
+	}
+}
+
+func buildBudgetExplosionSchema(levels int) string {
+	if levels < 1 {
+		levels = 1
+	}
+	var b strings.Builder
+	b.WriteString(`{"definitions":{`)
+	for i := 0; i < levels; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"Node%d":{"type":"object","properties":{`, i)
+		if i == 0 {
+			b.WriteString(`"value":{"type":"string"}}`)
+		} else {
+			fmt.Fprintf(&b, `"left":{"$ref":"#/definitions/Node%d"},"right":{"$ref":"#/definitions/Node%d"},"value":{"type":"string"}}`, i-1, i-1)
+		}
+		b.WriteByte('}')
+	}
+	fmt.Fprintf(&b, `},"$ref":"#/definitions/Node%d"}`, levels-1)
+	return b.String()
 }
 
 func TestCleanJSONSchemaForAntigravityResponseTypeArrayUsesNativeNullable(t *testing.T) {

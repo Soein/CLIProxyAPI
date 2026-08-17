@@ -16,6 +16,12 @@ var gjsonPathKeyReplacer = strings.NewReplacer(".", "\\.", "*", "\\*", "?", "\\?
 
 const placeholderReasonDescription = "Brief explanation of why you are calling this tool"
 
+const (
+	maxInlineLocalRefDepth       = 24
+	maxInlineLocalRefNodes       = 512
+	maxInlineLocalRefOutputBytes = 64 << 10
+)
+
 // Pass a single JSON schema to the functions below — never a whole request document.
 //
 // Cleaning walks every node and rewrites keys by name, and schema keywords such as "title",
@@ -237,32 +243,64 @@ func inlineLocalRefs(jsonStr string) string {
 		return jsonStr
 	}
 
-	resolved := resolveLocalRefs(root, root, make(map[string]bool))
+	resolver := localRefResolver{
+		maxDepth: maxInlineLocalRefDepth,
+		maxNodes: maxInlineLocalRefNodes,
+	}
+	resolved, ok := resolver.resolve(root, root, make(map[string]bool), 0)
+	if !ok {
+		return jsonStr
+	}
 	out, err := json.Marshal(resolved)
-	if err != nil {
+	if err != nil || len(out) > maxInlineLocalRefOutputBytes {
 		return jsonStr
 	}
 	return string(out)
 }
 
-func resolveLocalRefs(root, value any, active map[string]bool) any {
+type localRefResolver struct {
+	maxDepth int
+	maxNodes int
+	nodes    int
+}
+
+func (r *localRefResolver) resolve(root, value any, active map[string]bool, depth int) (any, bool) {
+	if r == nil {
+		return value, true
+	}
+	if depth > r.maxDepth {
+		return nil, false
+	}
 	switch node := value.(type) {
 	case []any:
+		if !r.reserveNode() {
+			return nil, false
+		}
 		out := make([]any, len(node))
 		for i, item := range node {
-			out[i] = resolveLocalRefs(root, item, active)
+			resolved, ok := r.resolve(root, item, active, depth+1)
+			if !ok {
+				return nil, false
+			}
+			out[i] = resolved
 		}
-		return out
+		return out, true
 	case map[string]any:
+		if !r.reserveNode() {
+			return nil, false
+		}
 		ref, hasRef := node["$ref"].(string)
 		if hasRef && strings.HasPrefix(ref, "#/") {
 			if target, ok := resolveJSONPointer(root, ref); ok {
 				if active[ref] {
-					return cyclicRefFallback(node, target, ref)
+					return cyclicRefFallback(node, target, ref), true
 				}
 				active[ref] = true
-				resolvedTarget := resolveLocalRefs(root, target, active)
+				resolvedTarget, okResolved := r.resolve(root, target, active, depth+1)
 				delete(active, ref)
+				if !okResolved {
+					return nil, false
+				}
 				if targetMap, okTarget := resolvedTarget.(map[string]any); okTarget {
 					out := make(map[string]any, len(targetMap)+len(node))
 					for key, item := range targetMap {
@@ -272,21 +310,37 @@ func resolveLocalRefs(root, value any, active map[string]bool) any {
 						if key == "$ref" {
 							continue
 						}
-						out[key] = resolveLocalRefs(root, item, active)
+						resolved, okResolved := r.resolve(root, item, active, depth+1)
+						if !okResolved {
+							return nil, false
+						}
+						out[key] = resolved
 					}
-					return out
+					return out, true
 				}
 			}
 		}
 
 		out := make(map[string]any, len(node))
 		for key, item := range node {
-			out[key] = resolveLocalRefs(root, item, active)
+			resolved, ok := r.resolve(root, item, active, depth+1)
+			if !ok {
+				return nil, false
+			}
+			out[key] = resolved
 		}
-		return out
+		return out, true
 	default:
-		return value
+		return value, true
 	}
+}
+
+func (r *localRefResolver) reserveNode() bool {
+	if r == nil {
+		return true
+	}
+	r.nodes++
+	return r.nodes <= r.maxNodes
 }
 
 func resolveJSONPointer(root any, ref string) (any, bool) {
