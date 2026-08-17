@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"math"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -940,44 +941,166 @@ func cloneSessionAffinityMetadata(src map[string]any) map[string]any {
 	if src == nil {
 		return nil
 	}
-	cloned := make(map[string]any, len(src))
-	for key, value := range src {
-		cloned[key] = cloneSessionAffinityMetadataValue(value)
+	clonedValue, ok := cloneSessionAffinityMetadataGraph(reflect.ValueOf(src))
+	if !ok {
+		return sessionAffinityMetadataFallback(src)
+	}
+	cloned, ok := clonedValue.Interface().(map[string]any)
+	if !ok {
+		return sessionAffinityMetadataFallback(src)
 	}
 	return cloned
 }
 
-func cloneSessionAffinityMetadataValue(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		return cloneSessionAffinityMetadata(typed)
-	case []any:
-		cloned := make([]any, len(typed))
-		for index, item := range typed {
-			cloned[index] = cloneSessionAffinityMetadataValue(item)
+const (
+	maxSessionAffinityMetadataCloneNodes = 4096
+	maxSessionAffinityMetadataCloneDepth = 64
+)
+
+type sessionAffinityMetadataVisit struct {
+	typ      reflect.Type
+	kind     reflect.Kind
+	pointer  uintptr
+	length   int
+	capacity int
+}
+
+type sessionAffinityMetadataCloner struct {
+	visited map[sessionAffinityMetadataVisit]reflect.Value
+	nodes   int
+}
+
+func cloneSessionAffinityMetadataGraph(value reflect.Value) (cloned reflect.Value, ok bool) {
+	defer func() {
+		if recover() != nil {
+			cloned = reflect.Value{}
+			ok = false
 		}
-		return cloned
-	case []byte:
-		return bytes.Clone(typed)
-	case []string:
-		return append([]string(nil), typed...)
-	case map[string]string:
-		cloned := make(map[string]string, len(typed))
-		for key, item := range typed {
-			cloned[key] = item
-		}
-		return cloned
-	case map[string][]string:
-		cloned := make(map[string][]string, len(typed))
-		for key, items := range typed {
-			cloned[key] = append([]string(nil), items...)
-		}
-		return cloned
-	case http.Header:
-		return cloneHTTPHeader(typed)
-	default:
-		return value
+	}()
+	cloner := sessionAffinityMetadataCloner{visited: make(map[sessionAffinityMetadataVisit]reflect.Value)}
+	return cloner.clone(value, 0)
+}
+
+func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (reflect.Value, bool) {
+	if !value.IsValid() {
+		return value, true
 	}
+	if depth > maxSessionAffinityMetadataCloneDepth || c.nodes >= maxSessionAffinityMetadataCloneNodes {
+		return reflect.Value{}, false
+	}
+	c.nodes++
+
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		clonedElement, ok := c.clone(value.Elem(), depth+1)
+		if !ok {
+			return reflect.Value{}, false
+		}
+		cloned := reflect.New(value.Type()).Elem()
+		cloned.Set(clonedElement)
+		return cloned, true
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		visit := sessionAffinityMetadataVisit{typ: value.Type(), kind: value.Kind(), pointer: value.Pointer()}
+		if cloned, exists := c.visited[visit]; exists {
+			return cloned, true
+		}
+		cloned := reflect.MakeMapWithSize(value.Type(), value.Len())
+		c.visited[visit] = cloned
+		iterator := value.MapRange()
+		for iterator.Next() {
+			clonedKey, okKey := c.clone(iterator.Key(), depth+1)
+			clonedValue, okValue := c.clone(iterator.Value(), depth+1)
+			if !okKey || !okValue {
+				return reflect.Value{}, false
+			}
+			cloned.SetMapIndex(clonedKey, clonedValue)
+		}
+		return cloned, true
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		visit := sessionAffinityMetadataVisit{typ: value.Type(), kind: value.Kind(), pointer: value.Pointer(), length: value.Len(), capacity: value.Cap()}
+		if cloned, exists := c.visited[visit]; exists {
+			return cloned, true
+		}
+		cloned := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		c.visited[visit] = cloned
+		for index := 0; index < value.Len(); index++ {
+			clonedElement, ok := c.clone(value.Index(index), depth+1)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			cloned.Index(index).Set(clonedElement)
+		}
+		return cloned, true
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), true
+		}
+		visit := sessionAffinityMetadataVisit{typ: value.Type(), kind: value.Kind(), pointer: value.Pointer()}
+		if cloned, exists := c.visited[visit]; exists {
+			return cloned, true
+		}
+		cloned := reflect.New(value.Type().Elem())
+		c.visited[visit] = cloned
+		clonedElement, ok := c.clone(value.Elem(), depth+1)
+		if !ok {
+			return reflect.Value{}, false
+		}
+		cloned.Elem().Set(clonedElement)
+		return cloned, true
+	case reflect.Struct:
+		cloned := reflect.New(value.Type()).Elem()
+		for index := 0; index < value.NumField(); index++ {
+			if value.Type().Field(index).PkgPath != "" {
+				return reflect.Value{}, false
+			}
+			clonedField, ok := c.clone(value.Field(index), depth+1)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			cloned.Field(index).Set(clonedField)
+		}
+		return cloned, true
+	case reflect.Array:
+		cloned := reflect.New(value.Type()).Elem()
+		for index := 0; index < value.Len(); index++ {
+			clonedElement, ok := c.clone(value.Index(index), depth+1)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			cloned.Index(index).Set(clonedElement)
+		}
+		return cloned, true
+	default:
+		// Scalar values are immutable. Func, chan, and unsafe pointer values cannot
+		// be meaningfully cloned and are never inputs to affinity key calculation.
+		return value, true
+	}
+}
+
+func sessionAffinityMetadataFallback(src map[string]any) map[string]any {
+	keys := [...]string{
+		cliproxyexecutor.CallerScopeMetadataKey,
+		cliproxyexecutor.ExecutionSessionMetadataKey,
+		cliproxyexecutor.DerivedSessionIDMetadataKey,
+		cliproxyexecutor.SessionAffinityProviderMetadataKey,
+		cliproxyexecutor.SessionAffinityModelMetadataKey,
+	}
+	fallback := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := src[key].(string); ok {
+			fallback[key] = value
+		}
+	}
+	return fallback
 }
 
 // normalizedSessionCandidate validates an explicit client-provided session signal.

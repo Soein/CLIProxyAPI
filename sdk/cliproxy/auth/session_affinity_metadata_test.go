@@ -197,6 +197,11 @@ func (*affinitySnapshotTamperingHook) OnResult(_ context.Context, result Result)
 	copy(result.Options.OriginalRequest, []byte(`{"session_id":"hook"}`))
 	result.Options.Metadata[cliproxyexecutor.CallerScopeMetadataKey] = "hook-caller"
 	result.Options.Metadata["nested"].(map[string]any)["values"].([]any)[0] = "hook-nested"
+	result.Options.Metadata["typed-map"].(map[string]int)["value"] = 40
+	result.Options.Metadata["typed-slice"].([]int)[0] = 50
+	result.Options.Metadata["typed-pointer"].(*affinityCloneContainer).Values[0] = 60
+	result.Options.Metadata["cyclic-map"].(map[string]any)["value"] = "hook-cycle"
+	result.Options.Metadata["cyclic-slice"].([]any)[0] = "hook-cycle"
 }
 
 type affinitySnapshotInspectingWrapper struct {
@@ -228,6 +233,13 @@ func TestSessionAffinityWrapperReceivesIndependentPickSnapshot(t *testing.T) {
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
 
 	originalBody := []byte(`{"session_id":"picked-body","input":"original"}`)
+	typedMap := map[string]int{"value": 4}
+	typedSlice := []int{5}
+	typedPointer := &affinityCloneContainer{Values: []int{6}}
+	cyclicMap := map[string]any{"value": "picked-cycle"}
+	cyclicMap["self"] = cyclicMap
+	cyclicSlice := make([]any, 1)
+	cyclicSlice[0] = cyclicSlice
 	opts := cliproxyexecutor.Options{
 		Headers:         http.Header{"X-Session-Id": {"picked-session"}, "X-Original": {"header"}},
 		Query:           map[string][]string{"tenant": {"picked-tenant"}},
@@ -235,6 +247,11 @@ func TestSessionAffinityWrapperReceivesIndependentPickSnapshot(t *testing.T) {
 		Metadata: map[string]any{
 			cliproxyexecutor.CallerScopeMetadataKey: "picked-caller",
 			"nested":                                map[string]any{"values": []any{"picked-nested"}},
+			"typed-map":                             typedMap,
+			"typed-slice":                           typedSlice,
+			"typed-pointer":                         typedPointer,
+			"cyclic-map":                            cyclicMap,
+			"cyclic-slice":                          cyclicSlice,
 		},
 		RequestAfterAuthInterceptor: func(context.Context, cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
 			return cliproxyexecutor.RequestAfterAuthInterceptResponse{
@@ -264,8 +281,108 @@ func TestSessionAffinityWrapperReceivesIndependentPickSnapshot(t *testing.T) {
 	if nested := got.Metadata["nested"].(map[string]any)["values"].([]any)[0]; nested != "picked-nested" {
 		t.Fatalf("selector nested metadata = %v, want picked-nested", nested)
 	}
+	if value := got.Metadata["typed-map"].(map[string]int)["value"]; value != 4 {
+		t.Fatalf("selector typed map value = %d, want 4", value)
+	}
+	if value := got.Metadata["typed-slice"].([]int)[0]; value != 5 {
+		t.Fatalf("selector typed slice value = %d, want 5", value)
+	}
+	if value := got.Metadata["typed-pointer"].(*affinityCloneContainer).Values[0]; value != 6 {
+		t.Fatalf("selector typed pointer value = %d, want 6", value)
+	}
+	if value := got.Metadata["cyclic-map"].(map[string]any)["value"]; value != "picked-cycle" {
+		t.Fatalf("selector cyclic map value = %v, want picked-cycle", value)
+	}
+	if _, ok := got.Metadata["cyclic-slice"].([]any)[0].([]any); !ok {
+		t.Fatal("selector cyclic slice was changed by Hook")
+	}
 	if remaining := affinityCacheExpirations(affinity); len(remaining) != 0 {
 		t.Fatalf("wrapper fallback failed to remove picked binding: %v", remaining)
+	}
+}
+
+type affinityCloneContainer struct {
+	Values []int
+}
+
+func TestCloneSessionAffinityMetadataClonesTypedContainersAndPointers(t *testing.T) {
+	typedMap := map[string]int{"value": 1}
+	typedSlice := []int{2}
+	typedPointer := &affinityCloneContainer{Values: []int{3}}
+	original := map[string]any{
+		"map":     typedMap,
+		"slice":   typedSlice,
+		"pointer": typedPointer,
+	}
+	cloned := cloneSessionAffinityMetadata(original)
+
+	typedMap["value"] = 10
+	typedSlice[0] = 20
+	typedPointer.Values[0] = 30
+	if got := cloned["map"].(map[string]int)["value"]; got != 1 {
+		t.Fatalf("cloned typed map value = %d, want 1", got)
+	}
+	if got := cloned["slice"].([]int)[0]; got != 2 {
+		t.Fatalf("cloned typed slice value = %d, want 2", got)
+	}
+	clonedPointer := cloned["pointer"].(*affinityCloneContainer)
+	if clonedPointer == typedPointer || clonedPointer.Values[0] != 3 {
+		t.Fatalf("cloned pointer = %#v, want independent value 3", clonedPointer)
+	}
+}
+
+func TestCloneSessionAffinityMetadataPreservesCycles(t *testing.T) {
+	cyclicMap := map[string]any{"value": "original"}
+	cyclicMap["self"] = cyclicMap
+	cyclicSlice := make([]any, 1)
+	cyclicSlice[0] = cyclicSlice
+
+	cloned := cloneSessionAffinityMetadata(map[string]any{"map": cyclicMap, "slice": cyclicSlice})
+	clonedMap := cloned["map"].(map[string]any)
+	cyclicMap["value"] = "mutated"
+	if clonedMap["value"] != "original" {
+		t.Fatalf("cloned cyclic map value = %v, want original", clonedMap["value"])
+	}
+	clonedSelf := clonedMap["self"].(map[string]any)
+	clonedSelf["cycle-marker"] = true
+	if clonedMap["cycle-marker"] != true {
+		t.Fatal("cloned map cycle was not preserved")
+	}
+
+	clonedSlice := cloned["slice"].([]any)
+	cyclicSlice[0] = "mutated"
+	clonedSelfSlice := clonedSlice[0].([]any)
+	clonedSelfSlice[0] = "cycle-marker"
+	if clonedSlice[0] != "cycle-marker" {
+		t.Fatal("cloned slice cycle was not preserved")
+	}
+}
+
+func TestCloneSessionAffinityMetadataBudgetFallsBackToAffinityStrings(t *testing.T) {
+	deep := map[string]any{"leaf": "value"}
+	for range 256 {
+		deep = map[string]any{"next": deep}
+	}
+	original := map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey:             "caller",
+		cliproxyexecutor.ExecutionSessionMetadataKey:        "execution",
+		cliproxyexecutor.DerivedSessionIDMetadataKey:        "derived",
+		cliproxyexecutor.SessionAffinityProviderMetadataKey: "provider",
+		cliproxyexecutor.SessionAffinityModelMetadataKey:    "model",
+		"deep": deep,
+	}
+	cloned := cloneSessionAffinityMetadata(original)
+	if len(cloned) != 5 {
+		t.Fatalf("budget fallback metadata = %#v, want five affinity strings", cloned)
+	}
+	if cloned[cliproxyexecutor.CallerScopeMetadataKey] != "caller" || cloned[cliproxyexecutor.ExecutionSessionMetadataKey] != "execution" {
+		t.Fatalf("budget fallback lost affinity metadata: %#v", cloned)
+	}
+
+	original["deep"] = make([]int, maxSessionAffinityMetadataCloneNodes+1)
+	cloned = cloneSessionAffinityMetadata(original)
+	if len(cloned) != 5 {
+		t.Fatalf("large metadata fallback = %#v, want five affinity strings", cloned)
 	}
 }
 
