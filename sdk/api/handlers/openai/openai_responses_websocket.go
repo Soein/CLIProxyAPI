@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -18,25 +19,27 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coresession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
-	wsRequestTypeCreate                   = "response.create"
-	wsRequestTypeAppend                   = "response.append"
-	wsEventTypeError                      = "error"
-	wsEventTypeCompleted                  = "response.completed"
-	wsEventTypeDone                       = "response.done"
-	wsDoneMarker                          = "[DONE]"
-	wsTurnStateHeader                     = "x-codex-turn-state"
-	wsTimelineBodyKey                     = "WEBSOCKET_TIMELINE_OVERRIDE"
-	wsCloseReasonMaxBytes                 = 123
-	wsHTTPReplayRequiredCloseReason       = "upstream requires HTTP replay"
-	responsesWebsocketUpstreamModeUnknown = ""
-	responsesWebsocketUpstreamModeWS      = "websocket"
-	responsesWebsocketUpstreamModeHTTP    = "http"
+	wsRequestTypeCreate                      = "response.create"
+	wsRequestTypeAppend                      = "response.append"
+	wsEventTypeError                         = "error"
+	wsEventTypeCompleted                     = "response.completed"
+	wsEventTypeDone                          = "response.done"
+	wsDoneMarker                             = "[DONE]"
+	wsTurnStateHeader                        = "x-codex-turn-state"
+	wsTimelineBodyKey                        = "WEBSOCKET_TIMELINE_OVERRIDE"
+	wsCloseReasonMaxBytes                    = 123
+	responsesWebsocketMaxInboundMessageBytes = 16 << 20
+	wsHTTPReplayRequiredCloseReason          = "upstream requires HTTP replay"
+	responsesWebsocketUpstreamModeUnknown    = ""
+	responsesWebsocketUpstreamModeWS         = "websocket"
+	responsesWebsocketUpstreamModeHTTP       = "http"
 
 	codexLocalCompactionSummaryPrefix = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:"
 )
@@ -248,6 +251,21 @@ func truncateWebsocketCloseReason(reason string, maxBytes int) string {
 	return truncated.String()
 }
 
+func responsesWebsocketToolCacheSessionKey(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+
+	request := c.Request
+	if value, exists := c.Get("userApiKey"); exists && value != nil {
+		callerScope := coresession.CallerScope(fmt.Sprint(value))
+		if callerScope != "" {
+			request = request.WithContext(context.WithValue(request.Context(), responsesWebsocketCallerScopeContextKey{}, callerScope))
+		}
+	}
+	return websocketDownstreamSessionKey(request)
+}
+
 // ResponsesWebsocket handles websocket requests for /v1/responses.
 // It accepts `response.create` and `response.append` requests and streams
 // response events back as JSON websocket text messages.
@@ -256,9 +274,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(responsesWebsocketMaxInboundMessageBytes)
 	writer := newResponsesWebsocketWriter(conn)
 	passthroughSessionID := uuid.NewString()
-	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
+	downstreamSessionKey := responsesWebsocketToolCacheSessionKey(c)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)

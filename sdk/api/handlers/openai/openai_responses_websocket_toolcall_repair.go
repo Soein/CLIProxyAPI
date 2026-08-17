@@ -2,6 +2,8 @@ package openai
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -13,27 +15,41 @@ import (
 )
 
 const (
-	websocketToolOutputCacheMaxPerSession = 256
-	websocketToolOutputCacheTTL           = 30 * time.Minute
+	websocketToolOutputCacheMaxPerSession   = 256
+	websocketToolOutputCacheTTL             = 30 * time.Minute
+	websocketToolOutputCacheMaxItemBytes    = 1 << 20
+	websocketToolOutputCacheMaxSessionBytes = 8 << 20
+	websocketToolOutputCacheMaxTotalBytes   = 64 << 20
+	websocketToolOutputCacheMaxSessions     = 1024
 )
 
-var defaultWebsocketToolOutputCache = newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
-var defaultWebsocketToolCallCache = newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
+var defaultWebsocketToolOutputCache = newWebsocketToolOutputCache(websocketToolOutputCacheTTL, websocketToolOutputCacheMaxPerSession)
+var defaultWebsocketToolCallCache = newWebsocketToolOutputCache(websocketToolOutputCacheTTL, websocketToolOutputCacheMaxPerSession)
 var defaultWebsocketToolSessionRefs = newWebsocketToolSessionRefCounter()
 var defaultWebsocketToolCacheTransactionMu sync.RWMutex
 
 type websocketToolOutputCache struct {
-	mu            sync.Mutex
-	ttl           time.Duration
-	maxPerSession int
-	sessions      map[string]*websocketToolOutputSession
+	mu                 sync.Mutex
+	ttl                time.Duration
+	maxPerSession      int
+	maxItemBytes       int
+	maxBytesPerSession int
+	maxTotalBytes      int
+	maxSessions        int
+	totalBytes         int
+	accessSequence     uint64
+	sessions           map[string]*websocketToolOutputSession
 }
 
 type websocketToolOutputSession struct {
-	lastSeen time.Time
-	outputs  map[string]json.RawMessage
-	order    []string
+	lastSeen   time.Time
+	lastAccess uint64
+	bytes      int
+	outputs    map[string]json.RawMessage
+	order      []string
 }
+
+type responsesWebsocketCallerScopeContextKey struct{}
 
 type responsesWebsocketToolCacheTurn struct {
 	sessionKey  string
@@ -44,24 +60,59 @@ type responsesWebsocketToolCacheTurn struct {
 }
 
 func newWebsocketToolOutputCache(ttl time.Duration, maxPerSession int) *websocketToolOutputCache {
+	return newWebsocketToolOutputCacheWithLimits(
+		ttl,
+		maxPerSession,
+		websocketToolOutputCacheMaxItemBytes,
+		websocketToolOutputCacheMaxSessionBytes,
+		websocketToolOutputCacheMaxTotalBytes,
+		websocketToolOutputCacheMaxSessions,
+	)
+}
+
+func newWebsocketToolOutputCacheWithLimits(
+	ttl time.Duration,
+	maxPerSession int,
+	maxItemBytes int,
+	maxBytesPerSession int,
+	maxTotalBytes int,
+	maxSessions int,
+) *websocketToolOutputCache {
 	if ttl < 0 {
 		ttl = websocketToolOutputCacheTTL
 	}
 	if maxPerSession <= 0 {
 		maxPerSession = websocketToolOutputCacheMaxPerSession
 	}
+	if maxItemBytes <= 0 {
+		maxItemBytes = websocketToolOutputCacheMaxItemBytes
+	}
+	if maxBytesPerSession <= 0 {
+		maxBytesPerSession = websocketToolOutputCacheMaxSessionBytes
+	}
+	if maxTotalBytes <= 0 {
+		maxTotalBytes = websocketToolOutputCacheMaxTotalBytes
+	}
+	if maxSessions <= 0 {
+		maxSessions = websocketToolOutputCacheMaxSessions
+	}
 	return &websocketToolOutputCache{
-		ttl:           ttl,
-		maxPerSession: maxPerSession,
-		sessions:      make(map[string]*websocketToolOutputSession),
+		ttl:                ttl,
+		maxPerSession:      maxPerSession,
+		maxItemBytes:       maxItemBytes,
+		maxBytesPerSession: maxBytesPerSession,
+		maxTotalBytes:      maxTotalBytes,
+		maxSessions:        maxSessions,
+		sessions:           make(map[string]*websocketToolOutputSession),
 	}
 }
 
-func (c *websocketToolOutputCache) record(sessionKey string, callID string, item json.RawMessage) {
+func (c *websocketToolOutputCache) record(sessionKey string, callID string, item json.RawMessage) bool {
 	sessionKey = strings.TrimSpace(sessionKey)
 	callID = strings.Clone(strings.TrimSpace(callID))
-	if sessionKey == "" || callID == "" || c == nil {
-		return
+	if sessionKey == "" || callID == "" || c == nil || len(item) == 0 ||
+		len(item) > c.maxItemBytes || len(item) > c.maxBytesPerSession || len(item) > c.maxTotalBytes {
+		return false
 	}
 
 	now := time.Now()
@@ -79,18 +130,33 @@ func (c *websocketToolOutputCache) record(sessionKey string, callID string, item
 		c.sessions[sessionKey] = session
 	}
 	session.lastSeen = now
+	c.touchSessionLocked(session)
 
-	if _, exists := session.outputs[callID]; !exists {
+	previous, exists := session.outputs[callID]
+	if !exists {
 		session.order = append(session.order, callID)
+	} else {
+		session.bytes -= len(previous)
+		c.totalBytes -= len(previous)
 	}
 	session.outputs[callID] = append(json.RawMessage(nil), item...)
+	session.bytes += len(item)
+	c.totalBytes += len(item)
 
-	for len(session.order) > c.maxPerSession {
-		evict := session.order[0]
-		session.order[0] = ""
-		session.order = session.order[1:]
-		delete(session.outputs, evict)
+	for len(session.order) > c.maxPerSession || session.bytes > c.maxBytesPerSession {
+		c.deleteOldestItemLocked(session)
 	}
+	for len(c.sessions) > c.maxSessions || c.totalBytes > c.maxTotalBytes {
+		if !c.deleteLeastRecentSessionLocked() {
+			break
+		}
+	}
+	stored, ok := c.sessions[sessionKey]
+	if !ok || stored == nil {
+		return false
+	}
+	_, ok = stored.outputs[callID]
+	return ok
 }
 
 func (c *websocketToolOutputCache) get(sessionKey string, callID string) (json.RawMessage, bool) {
@@ -111,11 +177,74 @@ func (c *websocketToolOutputCache) get(sessionKey string, callID string) (json.R
 		return nil, false
 	}
 	session.lastSeen = now
+	c.touchSessionLocked(session)
 	item, ok := session.outputs[callID]
 	if !ok || len(item) == 0 {
 		return nil, false
 	}
 	return append(json.RawMessage(nil), item...), true
+}
+
+func (c *websocketToolOutputCache) touchSessionLocked(session *websocketToolOutputSession) {
+	if c == nil || session == nil {
+		return
+	}
+	c.accessSequence++
+	session.lastAccess = c.accessSequence
+}
+
+func (c *websocketToolOutputCache) deleteOldestItemLocked(session *websocketToolOutputSession) bool {
+	if c == nil || session == nil || len(session.order) == 0 {
+		return false
+	}
+	callID := session.order[0]
+	session.order[0] = ""
+	session.order = session.order[1:]
+	item, ok := session.outputs[callID]
+	if !ok {
+		return true
+	}
+	delete(session.outputs, callID)
+	session.bytes -= len(item)
+	c.totalBytes -= len(item)
+	return true
+}
+
+func (c *websocketToolOutputCache) deleteLeastRecentSessionLocked() bool {
+	if c == nil || len(c.sessions) == 0 {
+		return false
+	}
+	oldestKey := ""
+	var oldestAccess uint64
+	for key, session := range c.sessions {
+		if session == nil {
+			oldestKey = key
+			break
+		}
+		if oldestKey == "" || session.lastAccess < oldestAccess || (session.lastAccess == oldestAccess && key < oldestKey) {
+			oldestKey = key
+			oldestAccess = session.lastAccess
+		}
+	}
+	if oldestKey == "" {
+		return false
+	}
+	c.deleteSessionLocked(oldestKey)
+	return true
+}
+
+func (c *websocketToolOutputCache) deleteSessionLocked(sessionKey string) {
+	if c == nil {
+		return
+	}
+	session, ok := c.sessions[sessionKey]
+	if !ok {
+		return
+	}
+	if session != nil {
+		c.totalBytes -= session.bytes
+	}
+	delete(c.sessions, sessionKey)
 }
 
 func (c *websocketToolOutputCache) cleanupLocked(now time.Time) {
@@ -125,11 +254,11 @@ func (c *websocketToolOutputCache) cleanupLocked(now time.Time) {
 
 	for key, session := range c.sessions {
 		if session == nil {
-			delete(c.sessions, key)
+			c.deleteSessionLocked(key)
 			continue
 		}
 		if now.Sub(session.lastSeen) > c.ttl {
-			delete(c.sessions, key)
+			c.deleteSessionLocked(key)
 		}
 	}
 }
@@ -143,28 +272,39 @@ func (c *websocketToolOutputCache) deleteSession(sessionKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	delete(c.sessions, sessionKey)
+	c.deleteSessionLocked(sessionKey)
 }
 
 func websocketDownstreamSessionKey(req *http.Request) string {
 	if req == nil {
 		return ""
 	}
+	sessionKey := ""
 	if requestID := strings.TrimSpace(req.Header.Get("X-Client-Request-Id")); requestID != "" {
-		return requestID
+		sessionKey = requestID
 	}
-	if raw := strings.TrimSpace(req.Header.Get("X-Codex-Turn-Metadata")); raw != "" {
+	if sessionKey == "" {
+		raw := strings.TrimSpace(req.Header.Get("X-Codex-Turn-Metadata"))
 		if sessionID := strings.TrimSpace(gjson.Get(raw, "session_id").String()); sessionID != "" {
-			return sessionID
+			sessionKey = sessionID
 		}
 	}
-	if sessionID := strings.TrimSpace(req.Header.Get("Session-Id")); sessionID != "" {
-		return sessionID
+	if sessionKey == "" {
+		sessionKey = strings.TrimSpace(req.Header.Get("Session-Id"))
 	}
-	if sessionID := strings.TrimSpace(req.Header.Get("Session_id")); sessionID != "" {
-		return sessionID
+	if sessionKey == "" {
+		sessionKey = strings.TrimSpace(req.Header.Get("Session_id"))
 	}
-	return ""
+	if sessionKey == "" {
+		return ""
+	}
+	callerScope, _ := req.Context().Value(responsesWebsocketCallerScopeContextKey{}).(string)
+	callerScope = strings.TrimSpace(callerScope)
+	if callerScope == "" {
+		return sessionKey
+	}
+	sum := sha256.Sum256([]byte("cli-proxy-api:responses-websocket-tool-cache:v1\x00" + callerScope + "\x00" + sessionKey))
+	return "ws-tool-cache:" + hex.EncodeToString(sum[:])
 }
 
 type websocketToolSessionRefCounter struct {
