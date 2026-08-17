@@ -167,6 +167,47 @@ func TestFileTokenStoreSaveRejectsInvalidWeight(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreSaveRejectsPathOutsideBaseDir(t *testing.T) {
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID: "escape.json",
+		Attributes: map[string]string{
+			cliproxyauth.AttributePath: filepath.Join(outsideDir, "escape.json"),
+		},
+		Metadata: map[string]any{
+			"type": "antigravity",
+		},
+	}
+
+	if _, errSave := store.Save(context.Background(), auth); errSave == nil {
+		t.Fatal("Save() accepted a path outside the base directory")
+	}
+	if _, errStat := os.Stat(filepath.Join(outsideDir, "escape.json")); !os.IsNotExist(errStat) {
+		t.Fatalf("escaped auth file was persisted: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreDeleteRejectsPathOutsideBaseDir(t *testing.T) {
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsidePath := filepath.Join(outsideDir, "escape.json")
+	if errWrite := os.WriteFile(outsidePath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
+		t.Fatalf("write escaped auth file: %v", errWrite)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	if errDelete := store.Delete(context.Background(), outsidePath); errDelete == nil {
+		t.Fatal("Delete() accepted a path outside the base directory")
+	}
+	if _, errStat := os.Stat(outsidePath); errStat != nil {
+		t.Fatalf("escaped auth file should still exist: %v", errStat)
+	}
+}
+
 func TestFileTokenStoreListSkipsInvalidPluginSourceWeight(t *testing.T) {
 	baseDir := t.TempDir()
 	path := filepath.Join(baseDir, "plugin.json")
