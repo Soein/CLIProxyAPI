@@ -1821,6 +1821,73 @@ func TestCleanJSONSchemaForAntigravityResponse_DirectAllOfUsesCanonicalConjuncti
 	}
 }
 
+func TestCleanJSONSchema_AllOfMatchesScalarConstAndProjectedEnum(t *testing.T) {
+	values := []struct {
+		name      string
+		typeName  string
+		valueJSON string
+		want      string
+	}{
+		{name: "numeric", typeName: "number", valueJSON: "1", want: "1"},
+		{name: "boolean", typeName: "boolean", valueJSON: "true", want: "true"},
+	}
+	shapes := []struct {
+		name  string
+		input func(typeName, valueJSON string) string
+	}{
+		{
+			name: "direct",
+			input: func(typeName, valueJSON string) string {
+				return fmt.Sprintf(`{"allOf":[{"type":%q,"const":%s},{"enum":[%s]}]}`, typeName, valueJSON, valueJSON)
+			},
+		},
+		{
+			name: "nested",
+			input: func(typeName, valueJSON string) string {
+				return fmt.Sprintf(`{"allOf":[{"allOf":[{"type":%q,"const":%s},{"enum":[%s]}]}]}`, typeName, valueJSON, valueJSON)
+			},
+		},
+		{
+			name: "outer",
+			input: func(typeName, valueJSON string) string {
+				return fmt.Sprintf(`{"type":%q,"const":%s,"allOf":[{"enum":[%s]}]}`, typeName, valueJSON, valueJSON)
+			},
+		},
+	}
+	cleaners := []struct {
+		name  string
+		clean func(string) string
+	}{
+		{name: "gemini", clean: CleanJSONSchemaForGemini},
+		{name: "antigravity", clean: CleanJSONSchemaForAntigravityResponse},
+	}
+
+	for _, value := range values {
+		for _, shape := range shapes {
+			for _, cleaner := range cleaners {
+				name := value.name + "/" + shape.name + "/" + cleaner.name
+				t.Run(name, func(t *testing.T) {
+					result := gjson.Parse(cleaner.clean(shape.input(value.typeName, value.valueJSON)))
+					enum := result.Get("enum").Array()
+					if len(enum) != 1 || enum[0].String() != value.want {
+						t.Fatalf("matching const/enum became impossible: %s", result.Raw)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCleanJSONSchema_AllOfKeepsMismatchedProjectedConstEnumImpossible(t *testing.T) {
+	input := `{"allOf":[{"type":"number","const":1},{"enum":[2]}]}`
+	for _, clean := range []func(string) string{CleanJSONSchemaForGemini, CleanJSONSchemaForAntigravityResponse} {
+		result := gjson.Parse(clean(input))
+		if enum := result.Get("enum"); !enum.IsArray() || len(enum.Array()) != 0 {
+			t.Fatalf("mismatched projected const/enum was widened: %s", result.Raw)
+		}
+	}
+}
+
 func TestMergeAllOf_IntersectsAndNormalizesTypeSets(t *testing.T) {
 	tests := []struct {
 		name     string

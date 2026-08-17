@@ -1574,7 +1574,8 @@ func convertConstToEnum(jsonStr string) string {
 		if !val.Exists() {
 			continue
 		}
-		enumPath := trimSuffix(p, ".const") + ".enum"
+		parentPath := trimSuffix(p, ".const")
+		enumPath := joinPath(parentPath, "enum")
 		if !gjson.Get(jsonStr, enumPath).Exists() {
 			updated, _ := sjson.SetBytes([]byte(jsonStr), enumPath, []interface{}{val.Value()})
 			jsonStr = string(updated)
@@ -1601,8 +1602,14 @@ func convertEnumValuesToStrings(jsonStr string, forceStringType bool) string {
 
 		updated, _ := sjson.SetBytes([]byte(jsonStr), p, stringVals)
 		jsonStr = string(updated)
+		parentPath := trimSuffix(p, ".enum")
+		constPath := joinPath(parentPath, "const")
+		constValue := gjson.Get(jsonStr, constPath)
+		if constValue.Exists() && !constValue.IsArray() && !constValue.IsObject() {
+			updated, _ = sjson.SetBytes([]byte(jsonStr), constPath, constValue.String())
+			jsonStr = string(updated)
+		}
 		if forceStringType {
-			parentPath := trimSuffix(p, ".enum")
 			updated, _ = sjson.SetBytes([]byte(jsonStr), joinPath(parentPath, "type"), "string")
 			jsonStr = string(updated)
 		}
