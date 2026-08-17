@@ -701,6 +701,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	result = prepareSessionAffinityResult(ctx, result)
 	modelKey := canonicalModelKey(result.Model)
 
 	shouldResumeModel := false
@@ -946,6 +947,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 }
 
 func (m *Manager) updateSessionAffinity(result Result) {
+	if result.sessionAffinity.intermediate {
+		return
+	}
 	lease := m.acquireSelectorReadLease()
 	defer lease.Release()
 	if affinity, ok := lease.selector.(interface {
@@ -990,6 +994,7 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	if result.AuthID == "" {
 		return
 	}
+	result = prepareSessionAffinityResult(ctx, result)
 
 	var authSnapshot *Auth
 	m.mu.Lock()
@@ -1008,6 +1013,7 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+	m.updateSessionAffinity(result)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

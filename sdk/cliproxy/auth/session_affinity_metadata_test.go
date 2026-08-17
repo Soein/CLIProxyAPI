@@ -55,38 +55,31 @@ func TestSessionAffinityXAIOnResultUsesPickedKeys(t *testing.T) {
 			if selected.ID != auth.ID {
 				t.Fatalf("Pick() auth = %q, want %q", selected.ID, auth.ID)
 			}
-			primaryKey, _ := tt.opts.Metadata["session_affinity_primary_key"].(string)
-			if !strings.HasPrefix(primaryKey, "xai::") {
-				t.Fatalf("propagated primary key = %q, want xai key", primaryKey)
+			before := affinityCacheExpirations(affinity)
+			if len(before) != 1 && !tt.wantFallback || len(before) != 2 && tt.wantFallback {
+				t.Fatalf("picked cache entries = %d, want fallback=%v", len(before), tt.wantFallback)
 			}
-			fallbackKey, _ := tt.opts.Metadata["session_affinity_fallback_key"].(string)
-			if tt.wantFallback && !strings.HasPrefix(fallbackKey, "xai::") {
-				t.Fatalf("propagated fallback key = %q, want xai key", fallbackKey)
+			for key := range tt.opts.Metadata {
+				if strings.HasPrefix(key, "session_affinity_") && key != cliproxyexecutor.SessionAffinityProviderMetadataKey && key != cliproxyexecutor.SessionAffinityModelMetadataKey {
+					t.Fatalf("internal affinity key leaked through Options.Metadata: %q", key)
+				}
 			}
 
-			affinity.cache.mu.RLock()
-			before := affinity.cache.entries[primaryKey].expiresAt
-			affinity.cache.mu.RUnlock()
 			time.Sleep(time.Millisecond)
 			affinity.OnResult(Result{AuthID: auth.ID, Provider: "xai", Model: "grok-model", Success: true, Options: tt.opts})
-			affinity.cache.mu.RLock()
-			after := affinity.cache.entries[primaryKey].expiresAt
-			affinity.cache.mu.RUnlock()
-			if !after.After(before) {
-				t.Fatalf("success did not touch picked binding: before=%v after=%v", before, after)
+			after := affinityCacheExpirations(affinity)
+			for key, beforeExpiry := range before {
+				if !after[key].After(beforeExpiry) {
+					t.Fatalf("success did not touch picked binding %q: before=%v after=%v", key, beforeExpiry, after[key])
+				}
 			}
 
 			affinity.OnResult(Result{
 				AuthID: auth.ID, Provider: "xai", Model: "grok-model", Success: false,
 				Error: &Error{HTTPStatus: http.StatusInternalServerError, Message: "failed"}, Options: tt.opts,
 			})
-			if _, ok := affinity.cache.Get(primaryKey); ok {
-				t.Fatalf("failure did not remove picked binding %q", primaryKey)
-			}
-			if fallbackKey != "" {
-				if _, ok := affinity.cache.Get(fallbackKey); ok {
-					t.Fatalf("failure did not remove picked fallback binding %q", fallbackKey)
-				}
+			if remaining := affinityCacheExpirations(affinity); len(remaining) != 0 {
+				t.Fatalf("failure retained picked bindings: %v", remaining)
 			}
 		})
 	}
@@ -115,17 +108,115 @@ func TestSessionAffinityExplicitSessionIsCallerScoped(t *testing.T) {
 	}
 
 	callerA := pick("caller-a")
+	afterA := affinityCacheExpirations(affinity)
 	callerB := pick("caller-b")
-	if callerA == callerB {
-		t.Fatalf("different caller scopes shared explicit-session auth %q", callerA)
+	afterB := affinityCacheExpirations(affinity)
+	if len(afterA) != 1 || len(afterB) != 2 {
+		t.Fatalf("caller-scoped cache sizes = %d then %d, want 1 then 2", len(afterA), len(afterB))
 	}
-	if got := pick("caller-a"); got != callerA {
+	bindings := make(map[string]bool)
+	affinity.cache.mu.RLock()
+	for _, entry := range affinity.cache.entries {
+		bindings[entry.authID] = true
+	}
+	affinity.cache.mu.RUnlock()
+	if !bindings[callerA] || !bindings[callerB] {
+		t.Fatalf("caller-scoped cache bindings = %v, want %q and %q", bindings, callerA, callerB)
+	}
+	if got := pick("caller-a"); got != callerA || len(affinityCacheExpirations(affinity)) != 2 {
 		t.Fatalf("caller A binding changed from %q to %q", callerA, got)
 	}
 
 	unscopedFirst := pick("")
-	if got := pick(""); got != unscopedFirst {
+	unscopedCount := len(affinityCacheExpirations(affinity))
+	if got := pick(""); got != unscopedFirst || len(affinityCacheExpirations(affinity)) != unscopedCount {
 		t.Fatalf("trusted empty-scope binding changed from %q to %q", unscopedFirst, got)
+	}
+}
+
+func affinityCacheExpirations(affinity *SessionAffinitySelector) map[string]time.Time {
+	affinity.cache.mu.RLock()
+	defer affinity.cache.mu.RUnlock()
+	out := make(map[string]time.Time, len(affinity.cache.entries))
+	for key, entry := range affinity.cache.entries {
+		out[key] = entry.expiresAt
+	}
+	return out
+}
+
+type metadataTamperingHook struct {
+	NoopHook
+	sawPrivateMetadata bool
+}
+
+func (h *metadataTamperingHook) OnResult(_ context.Context, result Result) {
+	for key := range result.Options.Metadata {
+		if key == "session_affinity_primary_key" || key == "session_affinity_fallback_key" || key == "session_affinity_intermediate" {
+			h.sawPrivateMetadata = true
+		}
+		delete(result.Options.Metadata, key)
+	}
+	result.Options.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "tampered-provider"
+	result.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = "tampered-model"
+}
+
+func TestSessionAffinityResultKeysArePrivateFromHooks(t *testing.T) {
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{TTL: time.Hour})
+	defer affinity.Stop()
+	hook := &metadataTamperingHook{}
+	manager := NewManager(nil, affinity, hook)
+	auth := &Auth{ID: "xai-private-auth", Provider: "xai", Status: StatusActive}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.ExecutionSessionMetadataKey: "private-result-session",
+	}}
+	if _, errPick := affinity.Pick(context.Background(), "xai", "grok-private", opts, []*Auth{auth}); errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	keys := affinityCacheExpirations(affinity)
+	manager.MarkResult(context.Background(), Result{
+		AuthID: auth.ID, Provider: "xai", Model: "grok-private", Success: false,
+		Error: &Error{HTTPStatus: http.StatusInternalServerError, Message: "failed"}, Options: opts,
+	})
+	if hook.sawPrivateMetadata {
+		t.Fatal("Hook observed private session-affinity metadata")
+	}
+	for key := range keys {
+		if _, ok := affinity.cache.Get(key); ok {
+			t.Fatal("Hook metadata mutation prevented affinity cleanup")
+		}
+	}
+}
+
+type sequentialSelector struct {
+	n int
+}
+
+func (s *sequentialSelector) Pick(_ context.Context, _, _ string, _ cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	selected := auths[s.n%len(auths)]
+	s.n++
+	return selected, nil
+}
+
+func TestSessionAffinityStructuredKeyDoesNotCollideOnSeparators(t *testing.T) {
+	fallback := &sequentialSelector{}
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: fallback, TTL: time.Hour})
+	defer affinity.Stop()
+	auths := []*Auth{{ID: "auth-a", Status: StatusActive}, {ID: "auth-b", Status: StatusActive}}
+	pick := func(sessionID, model string) *Auth {
+		opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {sessionID}}, Metadata: map[string]any{}}
+		selected, errPick := affinity.Pick(context.Background(), "provider", model, opts, auths)
+		if errPick != nil {
+			t.Fatalf("Pick(%q, %q) error = %v", sessionID, model, errPick)
+		}
+		return selected
+	}
+	first := pick("foo::bar", "baz")
+	second := pick("foo", "bar::baz")
+	if first.ID == second.ID || fallback.n != 2 {
+		t.Fatalf("selections = %q, %q with %d fallback calls; want independent cold bindings", first.ID, second.ID, fallback.n)
+	}
+	if got := len(affinityCacheExpirations(affinity)); got != 2 {
+		t.Fatalf("structured affinity cache entries = %d, want 2", got)
 	}
 }
 
@@ -218,8 +309,7 @@ func TestManagerSessionAffinityMixedPoolNilMetadataPropagatesFailureCleanup(t *t
 		t.Fatalf("expected test initial opts.Metadata to be nil")
 	}
 
-	// 1. Execute request: auth-1 is selected, fails, Result carries propagated "mixed" affinity namespace,
-	// MarkResult unbinds "mixed::sess-mixed-1::test-model", and execution falls over to auth-2 which succeeds.
+	// 1. Execute request: auth-1 is selected, fails, and execution falls over to auth-2 which succeeds.
 	resp, errExec := manager.Execute(ctx, []string{p1, p2}, req, opts)
 	if errExec != nil {
 		t.Fatalf("first Execute failed: %v", errExec)
@@ -235,7 +325,8 @@ func TestManagerSessionAffinityMixedPoolNilMetadataPropagatesFailureCleanup(t *t
 	}
 
 	// Verify the affinity cache has auth-2 bound under the "mixed" namespace
-	cachedAuthID, ok := affinity.cache.Get("mixed::header:sess-mixed-1::" + model)
+	mixedKey := sessionAffinityCacheKey("mixed", "header:sess-mixed-1", model)
+	cachedAuthID, ok := affinity.cache.Get(mixedKey)
 	if !ok {
 		t.Fatalf("expected mixed cache key to be bound to auth-2, but not found in cache")
 	}
@@ -244,7 +335,7 @@ func TestManagerSessionAffinityMixedPoolNilMetadataPropagatesFailureCleanup(t *t
 	}
 
 	// Verify mismatched provider cache key was NOT used
-	if _, okP1 := affinity.cache.Get("affinity-p1::header:sess-mixed-1::" + model); okP1 {
+	if _, okP1 := affinity.cache.Get(sessionAffinityCacheKey(p1, "header:sess-mixed-1", model)); okP1 {
 		t.Fatalf("unexpected p1 provider cache key created")
 	}
 
@@ -313,7 +404,7 @@ func TestSessionAffinityDelayedSuccessDoesNotOverwriteReboundAuth(t *testing.T) 
 	})
 	defer affinity.Stop()
 
-	sessionKey := "mixed::header:sess-delay-success::model-x"
+	sessionKey := sessionAffinityCacheKey("mixed", "header:sess-delay-success", "model-x")
 
 	// 1. Initially auth-A is bound
 	affinity.cache.Set(sessionKey, "auth-A")
@@ -356,7 +447,7 @@ func TestSessionAffinityOnResultWithMismatchedNamespaceFailsToUnbind(t *testing.
 	authID := "auth-1"
 
 	// Bind under "mixed" namespace
-	mixedKey := "mixed::" + sessionID + "::" + model
+	mixedKey := sessionAffinityCacheKey("mixed", sessionID, model)
 	affinity.cache.Set(mixedKey, authID)
 
 	// Call OnResult with options carrying the propagated "mixed" namespace

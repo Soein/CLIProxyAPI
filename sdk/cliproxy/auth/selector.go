@@ -632,12 +632,6 @@ type SessionAffinityConfig struct {
 	TTL      time.Duration
 }
 
-const (
-	sessionAffinityPrimaryKeyMetadataKey   = "session_affinity_primary_key"
-	sessionAffinityFallbackKeyMetadataKey  = "session_affinity_fallback_key"
-	sessionAffinityIntermediateMetadataKey = "session_affinity_intermediate"
-)
-
 // NewSessionAffinitySelector creates a new session-aware selector.
 func NewSessionAffinitySelector(fallback Selector) *SessionAffinitySelector {
 	return NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -685,11 +679,10 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
 	}
-	delete(opts.Metadata, sessionAffinityPrimaryKeyMetadataKey)
-	delete(opts.Metadata, sessionAffinityFallbackKeyMetadataKey)
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
-	primaryID, fallbackID := extractSessionIDsForProvider(ctx, provider, opts)
+	keys := sessionAffinityKeysForRequest(ctx, provider, model, opts)
+	primaryID, fallbackID := keys.primaryID, keys.fallbackID
 	now := time.Now()
 	availabilityCandidates := auths
 	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
@@ -713,16 +706,7 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	}
 	fallbackAuths := highestPriorityAuths(available)
 
-	modelKey := canonicalModelKey(model)
-	cacheKey := provider + "::" + primaryID + "::" + modelKey
-	fallbackKey := ""
-	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
-	}
-	opts.Metadata[sessionAffinityPrimaryKeyMetadataKey] = cacheKey
-	if fallbackKey != "" {
-		opts.Metadata[sessionAffinityFallbackKeyMetadataKey] = fallbackKey
-	}
+	cacheKey, fallbackKey := keys.primaryKey, keys.fallbackKey
 	unlock := s.lockSessionKeys(cacheKey, fallbackKey)
 	defer unlock()
 
@@ -869,35 +853,18 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || s.cache == nil || res.AuthID == "" {
 		return
 	}
-	if intermediate, _ := res.Options.Metadata[sessionAffinityIntermediateMetadataKey].(bool); intermediate {
+	state := res.sessionAffinity
+	if !state.prepared {
+		res = prepareSessionAffinityResult(context.Background(), res)
+		state = res.sessionAffinity
+	}
+	if state.primaryKey == "" {
 		return
 	}
-	cacheKey := metadataStringValue(res.Options.Metadata, sessionAffinityPrimaryKeyMetadataKey)
-	fallbackKey := metadataStringValue(res.Options.Metadata, sessionAffinityFallbackKeyMetadataKey)
-	if cacheKey == "" {
-		primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
-		if primaryID == "" && fallbackID == "" {
-			return
-		}
-
-		ns := res.Provider
-		if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey].(string); ok && raw != "" {
-			ns = raw
-		}
-		nsModel := canonicalModelKey(res.Model)
-		if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
-			nsModel = canonicalModelKey(raw)
-		}
-
-		cacheKey = ns + "::" + primaryID + "::" + nsModel
-		if fallbackID != "" && fallbackID != primaryID {
-			fallbackKey = ns + "::" + fallbackID + "::" + nsModel
-		}
-	}
 	if res.Success {
-		s.cache.Touch(cacheKey, res.AuthID)
-		if fallbackKey != "" {
-			s.cache.Touch(fallbackKey, res.AuthID)
+		s.cache.Touch(state.primaryKey, res.AuthID)
+		if state.fallbackKey != "" {
+			s.cache.Touch(state.fallbackKey, res.AuthID)
 		}
 		return
 	}
@@ -906,9 +873,57 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		return
 	}
 
-	s.cache.CompareAndDelete(cacheKey, res.AuthID)
-	if fallbackKey != "" {
-		s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+	s.cache.CompareAndDelete(state.primaryKey, res.AuthID)
+	if state.fallbackKey != "" {
+		s.cache.CompareAndDelete(state.fallbackKey, res.AuthID)
+	}
+}
+
+type sessionAffinityKeys struct {
+	primaryID   string
+	fallbackID  string
+	primaryKey  string
+	fallbackKey string
+}
+
+func sessionAffinityKeysForRequest(ctx context.Context, provider, model string, opts cliproxyexecutor.Options) sessionAffinityKeys {
+	primaryID, fallbackID := extractSessionIDsForProvider(ctx, provider, opts)
+	keys := sessionAffinityKeys{primaryID: primaryID, fallbackID: fallbackID}
+	if primaryID == "" {
+		return keys
+	}
+	modelKey := canonicalModelKey(model)
+	keys.primaryKey = sessionAffinityCacheKey(provider, primaryID, modelKey)
+	if fallbackID != "" && fallbackID != primaryID {
+		keys.fallbackKey = sessionAffinityCacheKey(provider, fallbackID, modelKey)
+	}
+	return keys
+}
+
+func sessionAffinityCacheKey(provider, sessionID, model string) string {
+	return fmt.Sprintf("affinity:v2:%d:%s:%d:%s:%d:%s", len(provider), provider, len(sessionID), sessionID, len(model), model)
+}
+
+func prepareSessionAffinityResult(ctx context.Context, result Result) Result {
+	if result.sessionAffinity.prepared {
+		return result
+	}
+	result.sessionAffinity = sessionAffinityResultForRequest(ctx, result.Provider, result.Model, result.Options)
+	return result
+}
+
+func sessionAffinityResultForRequest(ctx context.Context, provider, model string, opts cliproxyexecutor.Options) resultSessionAffinity {
+	if raw := metadataStringValue(opts.Metadata, cliproxyexecutor.SessionAffinityProviderMetadataKey); raw != "" {
+		provider = raw
+	}
+	if raw := metadataStringValue(opts.Metadata, cliproxyexecutor.SessionAffinityModelMetadataKey); raw != "" {
+		model = raw
+	}
+	keys := sessionAffinityKeysForRequest(ctx, provider, model, opts)
+	return resultSessionAffinity{
+		primaryKey:  keys.primaryKey,
+		fallbackKey: keys.fallbackKey,
+		prepared:    true,
 	}
 }
 

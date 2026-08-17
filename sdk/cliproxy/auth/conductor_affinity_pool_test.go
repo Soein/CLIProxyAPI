@@ -20,12 +20,9 @@ type affinityPoolResultSelector struct {
 }
 
 func (s *affinityPoolResultSelector) OnResult(result Result) {
-	intermediate, _ := result.Options.Metadata["session_affinity_intermediate"].(bool)
-	if !intermediate {
-		s.mu.Lock()
-		s.finalResults = append(s.finalResults, result)
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	s.finalResults = append(s.finalResults, result)
+	s.mu.Unlock()
 	s.SessionAffinitySelector.OnResult(result)
 }
 
@@ -111,9 +108,9 @@ func TestModelPoolLaterSuccessPreservesAffinityBinding(t *testing.T) {
 			if errRun := tt.run(manager, alias); errRun != nil {
 				t.Fatalf("execution error = %v", errRun)
 			}
-			key := "mixed::header:pool-success::" + alias
-			if got, ok := selector.cache.Get(key); !ok || got != authID {
-				t.Fatalf("affinity binding = %q, %v; want %q, true", got, ok, authID)
+			bindings := affinityCacheBindings(selector.SessionAffinitySelector)
+			if len(bindings) != 1 || bindings[0] != authID {
+				t.Fatalf("affinity bindings = %v, want [%s]", bindings, authID)
 			}
 			final := selector.FinalResults()
 			if len(final) != 1 || !final[0].Success {
@@ -162,9 +159,8 @@ func TestModelPoolAllFailuresRemoveAffinityOnlyOnFinalOutcome(t *testing.T) {
 			if errRun := tt.run(manager, alias); errRun == nil {
 				t.Fatal("execution error = nil, want pool failure")
 			}
-			key := "mixed::header:pool-failure::" + alias
-			if _, ok := selector.cache.Get(key); ok {
-				t.Fatalf("failed pool retained affinity binding %q", key)
+			if bindings := affinityCacheBindings(selector.SessionAffinitySelector); len(bindings) != 0 {
+				t.Fatalf("failed pool retained affinity bindings %v", bindings)
 			}
 			final := selector.FinalResults()
 			if len(final) != 1 || final[0].Success {
@@ -174,12 +170,73 @@ func TestModelPoolAllFailuresRemoveAffinityOnlyOnFinalOutcome(t *testing.T) {
 	}
 }
 
-type requestScopedPoolExecutor struct {
-	mu    sync.Mutex
-	calls []string
+func TestCountTokensModelPoolNeutralFailuresProduceOneFinalAffinityOutcome(t *testing.T) {
+	endpointNotFound := &Error{HTTPStatus: http.StatusNotFound, Message: "count_tokens endpoint not found"}
+	tests := []struct {
+		name        string
+		countErrors map[string]error
+		wantSuccess bool
+	}{
+		{
+			name:        "404 then success",
+			countErrors: map[string]error{"upstream-a": endpointNotFound},
+			wantSuccess: true,
+		},
+		{
+			name:        "all 404",
+			countErrors: map[string]error{"upstream-a": endpointNotFound, "upstream-b": endpointNotFound},
+			wantSuccess: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &openAICompatPoolExecutor{id: openAICompatPoolProviderKey, countErrors: tt.countErrors}
+			manager, selector, alias, authID := newAffinityPoolManager(t, executor)
+			_, errCount := manager.ExecuteCount(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"count-neutral"}}})
+			if tt.wantSuccess && errCount != nil {
+				t.Fatalf("ExecuteCount() error = %v", errCount)
+			}
+			if !tt.wantSuccess && errCount == nil {
+				t.Fatal("ExecuteCount() error = nil, want endpoint failure")
+			}
+			final := selector.FinalResults()
+			if len(final) != 1 || final[0].Success != tt.wantSuccess {
+				t.Fatalf("final affinity outcomes = %+v, want one success=%v", final, tt.wantSuccess)
+			}
+			bindings := affinityCacheBindings(selector.SessionAffinitySelector)
+			if tt.wantSuccess {
+				if len(bindings) != 1 || bindings[0] != authID {
+					t.Fatalf("affinity bindings = %v, want [%s]", bindings, authID)
+				}
+			} else if len(bindings) != 0 {
+				t.Fatalf("all-neutral failures retained affinity bindings %v", bindings)
+			}
+		})
+	}
 }
 
-func (*requestScopedPoolExecutor) Identifier() string { return openAICompatPoolProviderKey }
+func affinityCacheBindings(affinity *SessionAffinitySelector) []string {
+	affinity.cache.mu.RLock()
+	defer affinity.cache.mu.RUnlock()
+	bindings := make([]string, 0, len(affinity.cache.entries))
+	for _, entry := range affinity.cache.entries {
+		bindings = append(bindings, entry.authID)
+	}
+	return bindings
+}
+
+type requestScopedPoolExecutor struct {
+	identifier string
+	mu         sync.Mutex
+	calls      []string
+}
+
+func (e *requestScopedPoolExecutor) Identifier() string {
+	if e.identifier != "" {
+		return e.identifier
+	}
+	return openAICompatPoolProviderKey
+}
 
 func (e *requestScopedPoolExecutor) record(auth *Auth, req cliproxyexecutor.Request) error {
 	e.mu.Lock()
@@ -228,10 +285,11 @@ func (e *requestScopedPoolExecutor) Calls() []string {
 	return append([]string(nil), e.calls...)
 }
 
-func newRequestScopedPoolManager(t *testing.T, action string) (*Manager, *requestScopedPoolExecutor, string) {
+func newRequestScopedPoolManager(t *testing.T, action string) (*Manager, *requestScopedPoolExecutor, *resultCaptureHook, string) {
 	t.Helper()
 	alias := "request-scoped-pool"
-	manager := NewManager(nil, nil, nil)
+	hook := &resultCaptureHook{}
+	manager := NewManager(nil, nil, hook)
 	manager.SetConfig(&internalconfig.Config{OpenAICompatibility: []internalconfig.OpenAICompatibility{{
 		Name: "pool",
 		Models: []internalconfig.OpenAICompatibilityModel{
@@ -260,14 +318,14 @@ func newRequestScopedPoolManager(t *testing.T, action string) (*Manager, *reques
 		authID := auth.ID
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
 	}
-	return manager, executor, alias
+	return manager, executor, hook, alias
 }
 
 func TestRequestScopedContinueAdvancesCredentialBeforeNextPoolModel(t *testing.T) {
 	for _, action := range []string{RequestScopedActionContinue, RequestScopedActionContinueAndCooldown} {
 		for _, path := range []string{"execute", "count", "stream"} {
 			t.Run(action+"/"+path, func(t *testing.T) {
-				manager, executor, alias := newRequestScopedPoolManager(t, action)
+				manager, executor, hook, alias := newRequestScopedPoolManager(t, action)
 				var errRun error
 				switch path {
 				case "execute":
@@ -292,7 +350,68 @@ func TestRequestScopedContinueAdvancesCredentialBeforeNextPoolModel(t *testing.T
 				if calls[0][:len("request-scoped-auth-a|")] != "request-scoped-auth-a|" || calls[1][:len("request-scoped-auth-b|")] != "request-scoped-auth-b|" {
 					t.Fatalf("calls = %v, want credential A then credential B", calls)
 				}
+				results := hook.Results()
+				if len(results) != 2 || results[0].AuthID != "request-scoped-auth-a" || results[0].Success || results[1].AuthID != "request-scoped-auth-b" || !results[1].Success {
+					t.Fatalf("results = %+v, want one failed A outcome then one successful B outcome", results)
+				}
+				wantCode := ErrorCodeRequestScoped
+				wantUnavailable := false
+				if action == RequestScopedActionContinueAndCooldown {
+					wantCode = ErrorCodeForceCooldown
+					wantUnavailable = true
+				}
+				if results[0].Error == nil || results[0].Error.Code != wantCode {
+					t.Fatalf("first result error = %+v, want code %q", results[0].Error, wantCode)
+				}
+				firstAuth, ok := manager.GetByID("request-scoped-auth-a")
+				if !ok || firstAuth.Unavailable != wantUnavailable {
+					t.Fatalf("first auth unavailable = %v, want %v", firstAuth.Unavailable, wantUnavailable)
+				}
 			})
 		}
+	}
+}
+
+func TestRequestScopedStreamContinueReleasesXAICredentialLeases(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &requestScopedPoolExecutor{identifier: "xai"}
+	manager.RegisterExecutor(executor)
+	model := "grok-request-scoped-release"
+	auths := []*Auth{
+		{
+			ID: "request-scoped-auth-a", Provider: "xai", Status: StatusActive,
+			Attributes: map[string]string{"priority": "10"},
+			Metadata: map[string]any{"request_scoped_errors": []internalconfig.RequestScopedErrorRule{{
+				Status: http.StatusBadRequest, Match: []string{"advance_credential"}, Action: RequestScopedActionContinue,
+			}}},
+		},
+		{ID: "request-scoped-auth-b", Provider: "xai", Status: StatusActive},
+	}
+	for _, auth := range auths {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "xai", []*registry.ModelInfo{{ID: model}})
+		authID := auth.ID
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+
+	result, errStream := manager.ExecuteStream(context.Background(), []string{"xai"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	if got := manager.xaiInflight.count("request-scoped-auth-a"); got != 0 {
+		t.Fatalf("failed credential in-flight = %d, want 0 before replacement stream returns", got)
+	}
+	if got := manager.xaiInflight.count("request-scoped-auth-b"); got != 1 {
+		t.Fatalf("successful credential in-flight = %d, want 1 while stream is open", got)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	if got := manager.xaiInflight.count("request-scoped-auth-b"); got != 0 {
+		t.Fatalf("successful credential in-flight after drain = %d, want 0", got)
 	}
 }
