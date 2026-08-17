@@ -1037,12 +1037,21 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 }
 
 func (m *Manager) useSchedulerFastPath() bool {
+	lease, ok := m.acquireSchedulerFastPathLease()
+	defer lease.Release()
+	return ok
+}
+
+func (m *Manager) acquireSchedulerFastPathLease() (selectorReadLease, bool) {
 	if m == nil || m.scheduler == nil {
-		return false
+		return selectorReadLease{}, false
 	}
 	lease := m.acquireSelectorReadLease()
-	defer lease.Release()
-	return isBuiltInSelector(lease.selector)
+	if !isBuiltInSelector(lease.selector) {
+		lease.Release()
+		return selectorReadLease{}, false
+	}
+	return lease, true
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -1100,14 +1109,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return true
 	}
 	for {
-		selectorLease := m.acquireSelectorReadLease()
-		selector := selectorLease.selector
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
 		executor, okExecutor := m.executors[provider]
 		if !okExecutor {
 			m.mu.RUnlock()
-			selectorLease.Release()
 			return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		candidates := make([]*Auth, 0, len(m.auths))
@@ -1134,29 +1140,38 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		if len(candidates) == 0 {
 			m.mu.RUnlock()
-			selectorLease.Release()
 			if spillover() {
 				continue
 			}
 			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
+		candidateSnapshots := cloneAuthSlice(candidates)
+		m.mu.RUnlock()
+
+		available, errAvailable := m.availableAuthsForRouteModel(candidateSnapshots, provider, model, time.Now())
 		if errAvailable != nil {
-			m.mu.RUnlock()
-			selectorLease.Release()
 			if spillover() {
 				continue
 			}
 			return nil, nil, errAvailable
 		}
-		m.mu.RUnlock()
+		available = cloneAuthSlice(available)
 
 		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 		if errPick != nil {
-			selectorLease.Release()
 			return nil, nil, errPick
 		}
 		if !handled {
+			selectorLease := m.acquireSelectorReadLease()
+			selector := selectorLease.selector
+			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(selector, candidateSnapshots, provider, model, time.Now())
+			if errSelectorAvailable != nil {
+				selectorLease.Release()
+				if spillover() {
+					continue
+				}
+				return nil, nil, errSelectorAvailable
+			}
 			selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
 			selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 			if errPick != nil {
@@ -1166,8 +1181,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 				selectorLease.Release()
 				return nil, nil, errPick
 			}
+			selectorLease.Release()
 		}
-		selectorLease.Release()
 		if selected == nil {
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
@@ -1352,7 +1367,11 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if m.hasPluginScheduler() {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
+	selectorLease, useFastPath := m.acquireSchedulerFastPathLease()
+	if !useFastPath {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -1370,11 +1389,13 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
+				selectorLease.Release()
 				return m.pickNextLegacy(ctx, provider, model, opts, tried)
 			}
 		}
 		m.mu.RUnlock()
 	}
+	defer selectorLease.Release()
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}

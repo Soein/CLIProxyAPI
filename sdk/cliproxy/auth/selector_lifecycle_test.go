@@ -2,11 +2,13 @@ package auth
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 type selectorLifecycleOperation string
@@ -89,6 +91,29 @@ func (s *blockingLifecycleSelector) stopCallCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopCalls
+}
+
+type blockingSelectorReadyRing struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingSelectorReadyRing) Ready() bool {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return true
+}
+
+func (*blockingSelectorReadyRing) IsMine(string) bool { return true }
+
+type selectorReplacingPluginScheduler struct {
+	manager *Manager
+}
+
+func (s *selectorReplacingPluginScheduler) PickAuth(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
+	s.manager.SetSelector(&FillFirstSelector{})
+	return pluginapi.SchedulerPickResponse{}, false, nil
 }
 
 func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
@@ -184,13 +209,16 @@ func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
 			}()
 
 			var failure string
+			if !awaitSelectorWriterQueued(t, manager, replacementDone) {
+				failure = "selector replacement completed while the old selector was still active"
+			}
 			if test.operation == selectorLifecycleStop {
 				select {
 				case <-selector.overlapped:
 					failure = "replacement stopped the selector concurrently with StopAutoRefresh"
 				case <-replacementDone:
 					failure = "selector replacement completed while StopAutoRefresh was still active"
-				case <-time.After(100 * time.Millisecond):
+				default:
 				}
 			} else {
 				select {
@@ -198,7 +226,7 @@ func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
 					failure = "replacement stopped the selector while it was still active"
 				case <-replacementDone:
 					failure = "selector replacement completed while the old selector was still active"
-				case <-time.After(100 * time.Millisecond):
+				default:
 				}
 			}
 
@@ -218,6 +246,133 @@ func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
 				t.Fatalf("Stop call count = %d, want %d", gotStopCalls, wantStopCalls)
 			}
 		})
+	}
+}
+
+func TestManagerFastPathKeepsSelectorGenerationThroughSchedulerPick(t *testing.T) {
+	tests := []struct {
+		name string
+		pick func(*Manager) error
+	}{
+		{
+			name: "single provider",
+			pick: func(manager *Manager) error {
+				_, _, err := manager.pickNext(context.Background(), "test", "", cliproxyexecutor.Options{}, nil)
+				return err
+			},
+		},
+		{
+			name: "mixed provider",
+			pick: func(manager *Manager) error {
+				_, _, _, err := manager.pickNextMixedWithInflight(context.Background(), []string{"test"}, "", cliproxyexecutor.Options{}, nil, nil, "")
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			initialSelector := &FillFirstSelector{}
+			manager := NewManager(nil, initialSelector, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "test"})
+			manager.mu.Lock()
+			auth := &Auth{ID: "auth-1", Provider: "test", Status: StatusActive}
+			manager.auths[auth.ID] = auth
+			manager.mu.Unlock()
+			manager.schedulerUpsert(auth.Clone())
+
+			ring := &blockingSelectorReadyRing{started: make(chan struct{}), release: make(chan struct{})}
+			manager.SetAuthRing(ring)
+			manager.SetAuthShardingEnabled(true)
+			manager.scheduler.mu.Lock()
+
+			pickDone := make(chan error, 1)
+			go func() { pickDone <- test.pick(manager) }()
+			awaitSelectorLifecycleSignal(t, ring.started, "fast-path pick did not reach scheduler preparation")
+
+			replacementDone := make(chan struct{})
+			go func() {
+				manager.SetSelector(newBlockingLifecycleSelector(""))
+				close(replacementDone)
+			}()
+			replacementCompletedEarly := !awaitSelectorWriterQueued(t, manager, replacementDone)
+			manager.mu.RLock()
+			selectorChangedEarly := !isSameSelector(manager.selector, initialSelector)
+			manager.mu.RUnlock()
+
+			manager.scheduler.mu.Unlock()
+			close(ring.release)
+			if err := awaitSelectorLifecycleResult(t, pickDone); err != nil {
+				t.Fatalf("fast-path pick failed: %v", err)
+			}
+			awaitSelectorLifecycleSignal(t, replacementDone, "selector replacement did not complete")
+			if replacementCompletedEarly || selectorChangedEarly {
+				t.Fatal("selector generation changed before the scheduler pick completed")
+			}
+		})
+	}
+}
+
+func TestManagerPluginSchedulerCanReplaceSelector(t *testing.T) {
+	tests := []struct {
+		name string
+		pick func(*Manager) error
+	}{
+		{
+			name: "single provider",
+			pick: func(manager *Manager) error {
+				_, err := manager.SelectAuth(context.Background(), "test", "", cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "mixed provider",
+			pick: func(manager *Manager) error {
+				_, _, _, err := manager.pickNextMixedLegacy(context.Background(), []string{"test"}, "", cliproxyexecutor.Options{}, nil)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "test"})
+			manager.mu.Lock()
+			manager.auths["auth-1"] = &Auth{ID: "auth-1", Provider: "test", Status: StatusActive}
+			manager.mu.Unlock()
+			manager.SetPluginScheduler(&selectorReplacingPluginScheduler{manager: manager})
+
+			done := make(chan error, 1)
+			go func() { done <- test.pick(manager) }()
+			if err := awaitSelectorLifecycleResult(t, done); err != nil {
+				t.Fatalf("selection failed after plugin replaced selector: %v", err)
+			}
+			if _, ok := manager.Selector().(*FillFirstSelector); !ok {
+				t.Fatalf("selector = %T, want *FillFirstSelector", manager.Selector())
+			}
+		})
+	}
+}
+
+func awaitSelectorWriterQueued(t *testing.T, manager *Manager, replacementDone <-chan struct{}) bool {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		if !manager.selectorMu.TryRLock() {
+			return true
+		}
+		manager.selectorMu.RUnlock()
+		select {
+		case <-replacementDone:
+			return false
+		case <-timer.C:
+			t.Fatal("selector replacement writer was not queued")
+			return false
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 

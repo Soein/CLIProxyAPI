@@ -1096,8 +1096,6 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		return true
 	}
 	for {
-		selectorLease := m.acquireSelectorReadLease()
-		selector := selectorLease.selector
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
 		candidates := make([]*Auth, 0, len(m.auths))
@@ -1134,29 +1132,38 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		}
 		if len(candidates) == 0 {
 			m.mu.RUnlock()
-			selectorLease.Release()
 			if spillover() {
 				continue
 			}
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
+		candidateSnapshots := cloneAuthSlice(candidates)
+		m.mu.RUnlock()
+
+		available, errAvailable := m.availableAuthsForRouteModel(candidateSnapshots, "mixed", model, time.Now())
 		if errAvailable != nil {
-			m.mu.RUnlock()
-			selectorLease.Release()
 			if spillover() {
 				continue
 			}
 			return nil, nil, "", errAvailable
 		}
-		m.mu.RUnlock()
+		available = cloneAuthSlice(available)
 
 		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 		if errPick != nil {
-			selectorLease.Release()
 			return nil, nil, "", errPick
 		}
 		if !handled {
+			selectorLease := m.acquireSelectorReadLease()
+			selector := selectorLease.selector
+			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(selector, candidateSnapshots, "mixed", model, time.Now())
+			if errSelectorAvailable != nil {
+				selectorLease.Release()
+				if spillover() {
+					continue
+				}
+				return nil, nil, "", errSelectorAvailable
+			}
 			selectorProvider := "mixed"
 			if _, sessionAffinity := selector.(*SessionAffinitySelector); sessionAffinity && len(providerSet) == 1 {
 				if _, xaiOnly := providerSet["xai"]; xaiOnly {
@@ -1185,8 +1192,8 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 				selectorLease.Release()
 				return nil, nil, "", errPick
 			}
+			selectorLease.Release()
 		}
-		selectorLease.Release()
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
@@ -1211,7 +1218,11 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if m.hasPluginScheduler() {
+		return m.pickNextMixedLegacyWithInflight(ctx, providers, model, opts, tried, inflight, preferredAuthID)
+	}
+	selectorLease, useFastPath := m.acquireSchedulerFastPathLease()
+	if !useFastPath {
 		return m.pickNextMixedLegacyWithInflight(ctx, providers, model, opts, tried, inflight, preferredAuthID)
 	}
 
@@ -1232,6 +1243,7 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 		eligibleProviders = append(eligibleProviders, providerKey)
 	}
 	if len(eligibleProviders) == 0 {
+		selectorLease.Release()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	if strings.TrimSpace(model) != "" {
@@ -1252,11 +1264,13 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
+				selectorLease.Release()
 				return m.pickNextMixedLegacyWithInflight(ctx, providers, model, opts, tried, inflight, preferredAuthID)
 			}
 		}
 		m.mu.RUnlock()
 	}
+	defer selectorLease.Release()
 
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 	for {
