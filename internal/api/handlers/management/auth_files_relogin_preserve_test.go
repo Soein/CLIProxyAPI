@@ -29,6 +29,7 @@ func TestSaveTokenRecord_PreservesExistingAuthFileSettings(t *testing.T) {
 		"email":         "user@example.com",
 		"access_token":  "old-access",
 		"refresh_token": "old-refresh",
+		"account_id":    "old-account",
 		"prefix":        "custom-prefix",
 		"websockets":    false,
 		"note":          "my important account",
@@ -97,6 +98,9 @@ func TestSaveTokenRecord_PreservesExistingAuthFileSettings(t *testing.T) {
 	if saved["refresh_token"] != "new-refresh-token" {
 		t.Errorf("refresh_token = %v, want new-refresh-token", saved["refresh_token"])
 	}
+	if saved["account_id"] != "act-123" {
+		t.Errorf("account_id = %v, want act-123", saved["account_id"])
+	}
 
 	// Verify user-configured fields were preserved
 	if saved["prefix"] != "custom-prefix" {
@@ -127,6 +131,83 @@ func TestSaveTokenRecord_PreservesExistingAuthFileSettings(t *testing.T) {
 		t.Errorf("priority = %v, want 2", saved["priority"])
 	}
 }
+
+func TestSaveTokenRecordRejectsAuthPathEscapesBeforePostAuthHook(t *testing.T) {
+	authDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsidePath := filepath.Join(outsideDir, "outside.json")
+	if errWrite := os.WriteFile(outsidePath, []byte(`{"note":"outside"}`), 0o600); errWrite != nil {
+		t.Fatalf("write outside auth file: %v", errWrite)
+	}
+	linkDir := filepath.Join(authDir, "link")
+	if errLink := os.Symlink(outsideDir, linkDir); errLink != nil {
+		t.Skipf("symlink unavailable: %v", errLink)
+	}
+	linkFile := filepath.Join(authDir, "linked.json")
+	if errLink := os.Symlink(outsidePath, linkFile); errLink != nil {
+		t.Skipf("file symlink unavailable: %v", errLink)
+	}
+	relativeOutsidePath, errRel := filepath.Rel(authDir, outsidePath)
+	if errRel != nil {
+		t.Fatalf("resolve relative outside path: %v", errRel)
+	}
+
+	tests := []struct {
+		name     string
+		fileName string
+	}{
+		{name: "parent traversal", fileName: relativeOutsidePath},
+		{name: "absolute outside", fileName: outsidePath},
+		{name: "symlink parent", fileName: filepath.Join("link", "outside.json")},
+		{name: "symlink target", fileName: "linked.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &managementRecordingStore{}
+			h := NewHandler(&config.Config{AuthDir: authDir}, "", nil)
+			h.tokenStore = store
+			hookCalled := false
+			h.postAuthHook = func(context.Context, *coreauth.Auth) error {
+				hookCalled = true
+				return nil
+			}
+			record := &coreauth.Auth{
+				ID:       tt.fileName,
+				FileName: tt.fileName,
+				Provider: "demo",
+				Metadata: map[string]any{"type": "demo"},
+			}
+
+			if _, errSave := h.saveTokenRecord(context.Background(), record); errSave == nil {
+				t.Fatal("saveTokenRecord() accepted a path outside AuthDir")
+			}
+			if hookCalled {
+				t.Fatal("post-auth hook ran after an unsafe metadata path was supplied")
+			}
+			if store.saved {
+				t.Fatal("unsafe auth record was persisted")
+			}
+			if _, ok := record.Metadata["note"]; ok {
+				t.Fatal("metadata from outside AuthDir was merged into the record")
+			}
+		})
+	}
+}
+
+type managementRecordingStore struct {
+	saved bool
+}
+
+func (*managementRecordingStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
+
+func (s *managementRecordingStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	s.saved = true
+	return "saved", nil
+}
+
+func (*managementRecordingStore) Delete(context.Context, string) error { return nil }
+
+func (*managementRecordingStore) SetBaseDir(string) {}
 
 func TestPatchAuthFileFields_DeletesPluginFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)

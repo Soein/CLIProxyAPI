@@ -26,35 +26,33 @@ func LogCredentialSeparator() {
 	log.Debug(credentialSeparator)
 }
 
-// MergeMetadata serializes the source struct into a map and merges the provided metadata into it.
+// MergeMetadata serializes source into a map and adds metadata fields that are
+// not owned by the source payload. Source fields remain authoritative so stale
+// metadata cannot replace newly acquired credential or identity values.
 func MergeMetadata(source any, metadata map[string]any) (map[string]any, error) {
-	var data map[string]any
+	data := make(map[string]any, len(metadata))
+	for k, v := range metadata {
+		data[k] = v
+	}
 
-	// Fast path: if source is already a map, just copy it to avoid mutation of original
+	var sourceData map[string]any
 	if srcMap, ok := source.(map[string]any); ok {
-		data = make(map[string]any, len(srcMap)+len(metadata))
+		sourceData = make(map[string]any, len(srcMap))
 		for k, v := range srcMap {
-			data[k] = v
+			sourceData[k] = v
 		}
 	} else if source != nil {
-		// Slow path: marshal to JSON and back to map to respect JSON tags
 		temp, errMarshal := json.Marshal(source)
 		if errMarshal != nil {
 			return nil, fmt.Errorf("failed to marshal source: %w", errMarshal)
 		}
-		if errUnmarshal := json.Unmarshal(temp, &data); errUnmarshal != nil {
+		if errUnmarshal := json.Unmarshal(temp, &sourceData); errUnmarshal != nil {
 			return nil, fmt.Errorf("failed to unmarshal to map: %w", errUnmarshal)
 		}
 	}
 
-	// Merge extra metadata
-	if metadata != nil {
-		if data == nil {
-			data = make(map[string]any)
-		}
-		for k, v := range metadata {
-			data[k] = v
-		}
+	for k, v := range sourceData {
+		data[k] = v
 	}
 
 	return data, nil

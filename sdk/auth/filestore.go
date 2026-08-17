@@ -91,9 +91,10 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
+	baseDir := s.baseDirSnapshot()
 
 	if auth.Disabled {
-		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		if _, statErr := statAuthFile(baseDir, path); os.IsNotExist(statErr) {
 			return "", nil
 		}
 	}
@@ -101,7 +102,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err = mkdirAuthFileParent(baseDir, path, 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
@@ -128,26 +129,18 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
+		if existing, errRead := readAuthFile(baseDir, path); errRead == nil {
 			if jsonEqual(existing, raw) {
 				break
 			}
-			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-			if errOpen != nil {
-				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
-			}
-			if _, errWrite := file.Write(raw); errWrite != nil {
-				_ = file.Close()
+			if errWrite := writeAuthFile(baseDir, path, raw, 0o600); errWrite != nil {
 				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
-			}
-			if errClose := file.Close(); errClose != nil {
-				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
 			}
 			break
 		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+		if errWrite := writeAuthFile(baseDir, path, raw, 0o600); errWrite != nil {
 			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 		}
 	default:
@@ -210,7 +203,7 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err = removeAuthFile(s.baseDirSnapshot(), path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
 	return nil
@@ -223,7 +216,7 @@ func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {
 		if !filepath.IsAbs(candidate) {
 			candidate = filepath.Join(dir, candidate)
 		}
-		return validatePathWithinBaseDir(dir, candidate)
+		return cliproxyauth.ResolveAuthFilePath(dir, candidate)
 	}
 	if strings.ContainsRune(id, os.PathSeparator) || filepath.IsAbs(id) {
 		return id, nil
@@ -232,7 +225,14 @@ func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {
 }
 
 func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Auth, error) {
-	data, err := os.ReadFile(path)
+	if strings.TrimSpace(baseDir) != "" {
+		var errResolve error
+		path, errResolve = cliproxyauth.ResolveAuthFilePath(baseDir, path)
+		if errResolve != nil {
+			return nil, errResolve
+		}
+	}
+	data, err := readAuthFile(baseDir, path)
 	if err != nil {
 		return nil, fmt.Errorf("read file: %w", err)
 	}
@@ -251,7 +251,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	if strings.EqualFold(provider, "gemini") {
 		return nil, nil
 	}
-	info, errStat := os.Stat(path)
+	info, errStat := statAuthFile(baseDir, path)
 	if errStat != nil {
 		return nil, fmt.Errorf("stat file: %w", errStat)
 	}
@@ -314,16 +314,13 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 				if errFetch == nil && strings.TrimSpace(fetchedProjectID) != "" {
 					metadata["project_id"] = strings.TrimSpace(fetchedProjectID)
 					if raw, errMarshal := json.Marshal(metadata); errMarshal == nil {
-						if file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600); errOpen == nil {
-							_, _ = file.Write(raw)
-							_ = file.Close()
-						}
+						_ = writeAuthFile(baseDir, path, raw, 0o600)
 					}
 				}
 			}
 		}
 	}
-	info, errStat = os.Stat(path)
+	info, errStat = statAuthFile(baseDir, path)
 	if errStat != nil {
 		return nil, fmt.Errorf("stat file: %w", errStat)
 	}
@@ -423,7 +420,7 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 		if !filepath.IsAbs(candidate) {
 			candidate = filepath.Join(dir, candidate)
 		}
-		return validatePathWithinBaseDir(dir, candidate)
+		return cliproxyauth.ResolveAuthFilePath(dir, candidate)
 	}
 	if auth.Attributes != nil {
 		if p := strings.TrimSpace(auth.Attributes["path"]); p != "" {
@@ -437,25 +434,6 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 		return "", fmt.Errorf("auth filestore: missing id")
 	}
 	return resolve(auth.ID)
-}
-
-func validatePathWithinBaseDir(baseDir, path string) (string, error) {
-	absBase, errAbsBase := filepath.Abs(baseDir)
-	if errAbsBase != nil {
-		return "", fmt.Errorf("auth filestore: resolve base dir failed: %w", errAbsBase)
-	}
-	absPath, errAbsPath := filepath.Abs(path)
-	if errAbsPath != nil {
-		return "", fmt.Errorf("auth filestore: resolve auth path failed: %w", errAbsPath)
-	}
-	rel, errRel := filepath.Rel(absBase, absPath)
-	if errRel != nil {
-		return "", fmt.Errorf("auth filestore: resolve path relation failed: %w", errRel)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", fmt.Errorf("auth filestore: path %q escapes base directory %q", path, baseDir)
-	}
-	return absPath, nil
 }
 
 func (s *FileTokenStore) labelFor(metadata map[string]any) string {
@@ -478,6 +456,41 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	s.dirLock.RLock()
 	defer s.dirLock.RUnlock()
 	return s.baseDir
+}
+
+func readAuthFile(baseDir, path string) ([]byte, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return os.ReadFile(path)
+	}
+	return cliproxyauth.ReadAuthFile(baseDir, path)
+}
+
+func statAuthFile(baseDir, path string) (os.FileInfo, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return os.Stat(path)
+	}
+	return cliproxyauth.StatAuthFile(baseDir, path)
+}
+
+func writeAuthFile(baseDir, path string, data []byte, perm os.FileMode) error {
+	if strings.TrimSpace(baseDir) == "" {
+		return os.WriteFile(path, data, perm)
+	}
+	return cliproxyauth.WriteAuthFile(baseDir, path, data, perm)
+}
+
+func mkdirAuthFileParent(baseDir, path string, perm os.FileMode) error {
+	if strings.TrimSpace(baseDir) == "" {
+		return os.MkdirAll(filepath.Dir(path), perm)
+	}
+	return cliproxyauth.MkdirAuthFileParent(baseDir, path, perm)
+}
+
+func removeAuthFile(baseDir, path string) error {
+	if strings.TrimSpace(baseDir) == "" {
+		return os.Remove(path)
+	}
+	return cliproxyauth.RemoveAuthFile(baseDir, path)
 }
 
 func extractAccessToken(metadata map[string]any) string {

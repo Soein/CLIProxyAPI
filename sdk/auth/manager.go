@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -81,8 +80,11 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 				targetFile = record.ID
 			}
 			if targetFile != "" {
-				fullPath := filepath.Join(cfg.AuthDir, targetFile)
-				if raw, errRead := os.ReadFile(fullPath); errRead == nil && len(raw) > 0 {
+				raw, errRead := coreauth.ReadAuthFile(cfg.AuthDir, targetFile)
+				if errRead != nil && !os.IsNotExist(errRead) {
+					return record, "", fmt.Errorf("cliproxy auth: read existing credential: %w", errRead)
+				}
+				if len(raw) > 0 {
 					var existingMap map[string]any
 					if errUnmarshal := json.Unmarshal(raw, &existingMap); errUnmarshal == nil && len(existingMap) > 0 {
 						coreauth.MergeExistingAuthMetadata(record, existingMap)

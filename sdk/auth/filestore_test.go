@@ -170,22 +170,28 @@ func TestFileTokenStoreSaveRejectsInvalidWeight(t *testing.T) {
 func TestFileTokenStoreSaveRejectsPathOutsideBaseDir(t *testing.T) {
 	baseDir := t.TempDir()
 	outsideDir := t.TempDir()
+	outsidePath := filepath.Join(outsideDir, "escape.json")
+	relativeOutsidePath, errRel := filepath.Rel(baseDir, outsidePath)
+	if errRel != nil {
+		t.Fatalf("resolve relative outside path: %v", errRel)
+	}
 	store := NewFileTokenStore()
 	store.SetBaseDir(baseDir)
-	auth := &cliproxyauth.Auth{
-		ID: "escape.json",
-		Attributes: map[string]string{
-			cliproxyauth.AttributePath: filepath.Join(outsideDir, "escape.json"),
-		},
-		Metadata: map[string]any{
-			"type": "antigravity",
-		},
+	for _, candidate := range []string{outsidePath, relativeOutsidePath} {
+		auth := &cliproxyauth.Auth{
+			ID: "escape.json",
+			Attributes: map[string]string{
+				cliproxyauth.AttributePath: candidate,
+			},
+			Metadata: map[string]any{
+				"type": "antigravity",
+			},
+		}
+		if _, errSave := store.Save(context.Background(), auth); errSave == nil {
+			t.Errorf("Save() accepted outside path %q", candidate)
+		}
 	}
-
-	if _, errSave := store.Save(context.Background(), auth); errSave == nil {
-		t.Fatal("Save() accepted a path outside the base directory")
-	}
-	if _, errStat := os.Stat(filepath.Join(outsideDir, "escape.json")); !os.IsNotExist(errStat) {
+	if _, errStat := os.Stat(outsidePath); !os.IsNotExist(errStat) {
 		t.Fatalf("escaped auth file was persisted: %v", errStat)
 	}
 }
@@ -197,14 +203,114 @@ func TestFileTokenStoreDeleteRejectsPathOutsideBaseDir(t *testing.T) {
 	if errWrite := os.WriteFile(outsidePath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
 		t.Fatalf("write escaped auth file: %v", errWrite)
 	}
+	relativeOutsidePath, errRel := filepath.Rel(baseDir, outsidePath)
+	if errRel != nil {
+		t.Fatalf("resolve relative outside path: %v", errRel)
+	}
 
 	store := NewFileTokenStore()
 	store.SetBaseDir(baseDir)
-	if errDelete := store.Delete(context.Background(), outsidePath); errDelete == nil {
-		t.Fatal("Delete() accepted a path outside the base directory")
+	for _, candidate := range []string{outsidePath, relativeOutsidePath} {
+		if errDelete := store.Delete(context.Background(), candidate); errDelete == nil {
+			t.Errorf("Delete() accepted outside path %q", candidate)
+		}
 	}
 	if _, errStat := os.Stat(outsidePath); errStat != nil {
 		t.Fatalf("escaped auth file should still exist: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreRejectsSymlinkEscapes(t *testing.T) {
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsidePath := filepath.Join(outsideDir, "outside.json")
+	initial := []byte(`{"type":"outside","access_token":"secret"}`)
+	if errWrite := os.WriteFile(outsidePath, initial, 0o600); errWrite != nil {
+		t.Fatalf("write outside auth file: %v", errWrite)
+	}
+	linkDir := filepath.Join(baseDir, "link")
+	if errLink := os.Symlink(outsideDir, linkDir); errLink != nil {
+		t.Skipf("symlink unavailable: %v", errLink)
+	}
+	linkFile := filepath.Join(baseDir, "linked.json")
+	if errLink := os.Symlink(outsidePath, linkFile); errLink != nil {
+		t.Skipf("file symlink unavailable: %v", errLink)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	for _, authPath := range []string{filepath.Join("link", "outside.json"), "linked.json"} {
+		auth := &cliproxyauth.Auth{
+			ID:       authPath,
+			FileName: authPath,
+			Metadata: map[string]any{"type": "replacement"},
+		}
+		if _, errSave := store.Save(context.Background(), auth); errSave == nil {
+			t.Errorf("Save() accepted symlink escape %q", authPath)
+		}
+	}
+	got, errRead := os.ReadFile(outsidePath)
+	if errRead != nil {
+		t.Fatalf("read outside auth file: %v", errRead)
+	}
+	if string(got) != string(initial) {
+		t.Fatalf("outside auth file changed through symlink: %s", got)
+	}
+
+	for _, authPath := range []string{filepath.Join("link", "outside.json"), "linked.json"} {
+		if errDelete := store.Delete(context.Background(), authPath); errDelete == nil {
+			t.Errorf("Delete() accepted symlink escape %q", authPath)
+		}
+	}
+	if _, errStat := os.Stat(outsidePath); errStat != nil {
+		t.Fatalf("outside auth file should still exist: %v", errStat)
+	}
+
+	auths, errList := store.List(context.Background())
+	if errList != nil {
+		t.Fatalf("List() error = %v", errList)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("List() followed symlink outside base directory: %#v", auths)
+	}
+}
+
+func TestFileTokenStoreAllowsAbsolutePathInsideBaseDir(t *testing.T) {
+	baseDir := t.TempDir()
+	path := filepath.Join(baseDir, "inside.json")
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       path,
+		FileName: path,
+		Metadata: map[string]any{"type": "demo"},
+	}
+
+	if savedPath, errSave := store.Save(context.Background(), auth); errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	} else if savedPath != path {
+		t.Fatalf("Save() path = %q, want %q", savedPath, path)
+	}
+	if errDelete := store.Delete(context.Background(), path); errDelete != nil {
+		t.Fatalf("Delete() error = %v", errDelete)
+	}
+}
+
+func TestFileTokenStoreCreatesConfiguredBaseDir(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "auths")
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       filepath.Join("nested", "inside.json"),
+		FileName: filepath.Join("nested", "inside.json"),
+		Metadata: map[string]any{"type": "demo"},
+	}
+
+	if _, errSave := store.Save(context.Background(), auth); errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+	if _, errStat := os.Stat(filepath.Join(baseDir, "nested", "inside.json")); errStat != nil {
+		t.Fatalf("saved auth file is unavailable: %v", errStat)
 	}
 }
 
