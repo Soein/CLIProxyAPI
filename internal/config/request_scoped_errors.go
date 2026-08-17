@@ -75,21 +75,27 @@ func validateRequestScopedErrorRules(field string, rules []RequestScopedErrorRul
 
 		hasMatcher := false
 		for _, match := range rule.Match {
-			if strings.TrimSpace(match) != "" {
-				hasMatcher = true
+			hasMatcher = hasMatcher || strings.TrimSpace(match) != ""
+		}
+		for _, pattern := range rule.MatchRegexr {
+			hasMatcher = hasMatcher || strings.TrimSpace(pattern) != ""
+		}
+		if !hasMatcher {
+			return fmt.Errorf("%s: at least one non-empty matcher is required", ruleField)
+		}
+
+		for matchIndex, match := range rule.Match {
+			if strings.TrimSpace(match) == "" {
+				return fmt.Errorf("%s.match[%d] must not be empty", ruleField, matchIndex)
 			}
 		}
 		for regexIndex, pattern := range rule.MatchRegexr {
 			if strings.TrimSpace(pattern) == "" {
-				continue
+				return fmt.Errorf("%s.match-regexr[%d] must not be empty", ruleField, regexIndex)
 			}
-			hasMatcher = true
 			if _, errCompile := regexp.Compile(pattern); errCompile != nil {
 				return fmt.Errorf("%s.match-regexr[%d] must be a valid regular expression", ruleField, regexIndex)
 			}
-		}
-		if !hasMatcher {
-			return fmt.Errorf("%s: at least one non-empty matcher is required", ruleField)
 		}
 	}
 	return nil

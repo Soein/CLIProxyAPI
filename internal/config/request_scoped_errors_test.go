@@ -142,6 +142,16 @@ func TestParseConfigBytesRejectsInvalidRequestScopedErrors(t *testing.T) {
         match: ["  "]
         match-regexr: []
         action: stop`, wantErr: "at least one non-empty matcher is required"},
+		{name: "empty matcher lists", rule: `status: 400
+        match: []
+        match-regexr: []
+        action: stop`, wantErr: "at least one non-empty matcher is required"},
+		{name: "whitespace match alongside valid matcher", rule: `status: 400
+        match: ["   ", "body"]
+        action: stop`, wantErr: "match[0] must not be empty"},
+		{name: "whitespace regex alongside valid matcher", rule: `status: 400
+        match-regexr: ["   ", "^body$"]
+        action: stop`, wantErr: "match-regexr[0] must not be empty"},
 		{name: "malformed regex", rule: `status: 400
         match-regexr: ["(?P<private>"]
         action: stop`, wantErr: "match-regexr[0] must be a valid regular expression"},

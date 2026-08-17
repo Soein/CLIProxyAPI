@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -104,27 +105,41 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	}
 	m.configCooldownMu.Lock()
 	defer m.configCooldownMu.Unlock()
-	if m.setConfigSnapshotLocked(cfg) {
+	clearedCooldowns, errSetConfig := m.setConfigSnapshotLocked(cfg)
+	if errSetConfig != nil {
+		log.WithError(errSetConfig).Warn("rejected config update with invalid request-scoped error rules")
+		return
+	}
+	if clearedCooldowns {
 		m.persistCooldownStatesLocked(context.Background())
 	}
 }
 
 // SetConfigSnapshot updates only in-memory configuration state. It reports whether
 // a caller must persist cleared cooldown state after its commit critical section.
+// Invalid request-scoped error rules are rejected and reported as no change.
 func (m *Manager) SetConfigSnapshot(cfg *internalconfig.Config) bool {
 	if m == nil {
 		return false
 	}
 	m.configCooldownMu.Lock()
 	defer m.configCooldownMu.Unlock()
-	return m.setConfigSnapshotLocked(cfg)
+	clearedCooldowns, errSetConfig := m.setConfigSnapshotLocked(cfg)
+	if errSetConfig != nil {
+		log.WithError(errSetConfig).Warn("rejected config snapshot with invalid request-scoped error rules")
+		return false
+	}
+	return clearedCooldowns
 }
 
-func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
+func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) (bool, error) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	} else {
 		cfg = cfg.CloneForRuntime()
+	}
+	if errValidate := cfg.ValidateRequestScopedErrorRules(); errValidate != nil {
+		return false, errValidate
 	}
 	m.mu.RLock()
 	oldCooldownStore := m.cooldownStore
@@ -146,7 +161,7 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.clearHomeRuntimeAuths()
 	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
-	return clearedCooldowns
+	return clearedCooldowns, nil
 }
 
 // ApplyConfigWithCooldownStateStore serializes a config update with its cooldown
@@ -168,7 +183,10 @@ func (m *Manager) ApplyConfigWithCooldownStateStore(ctx context.Context, cfg *in
 	m.mu.RLock()
 	oldStore := m.cooldownStore
 	m.mu.RUnlock()
-	m.setConfigSnapshotLocked(cfg)
+	if _, errSetConfig := m.setConfigSnapshotLocked(cfg); errSetConfig != nil {
+		log.WithError(errSetConfig).Warn("rejected config transition with invalid request-scoped error rules")
+		return false
+	}
 	if oldStore != nil && !m.persistCooldownStatesToLocked(ctx, oldStore) {
 		return false
 	}
