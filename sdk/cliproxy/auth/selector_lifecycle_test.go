@@ -23,10 +23,13 @@ type blockingLifecycleSelector struct {
 	started     chan struct{}
 	release     chan struct{}
 	overlapped  chan struct{}
+	stopCalled  chan struct{}
 	startOnce   sync.Once
 	overlapOnce sync.Once
+	stopOnce    sync.Once
 	mu          sync.Mutex
 	active      int
+	stopCalls   int
 }
 
 func newBlockingLifecycleSelector(target selectorLifecycleOperation) *blockingLifecycleSelector {
@@ -35,6 +38,7 @@ func newBlockingLifecycleSelector(target selectorLifecycleOperation) *blockingLi
 		started:    make(chan struct{}),
 		release:    make(chan struct{}),
 		overlapped: make(chan struct{}),
+		stopCalled: make(chan struct{}),
 	}
 }
 
@@ -74,7 +78,17 @@ func (s *blockingLifecycleSelector) InvalidateAuth(string) {
 }
 
 func (s *blockingLifecycleSelector) Stop() {
+	s.mu.Lock()
+	s.stopCalls++
+	s.stopOnce.Do(func() { close(s.stopCalled) })
+	s.mu.Unlock()
 	s.block(selectorLifecycleStop)
+}
+
+func (s *blockingLifecycleSelector) stopCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopCalls
 }
 
 func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
@@ -170,12 +184,22 @@ func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
 			}()
 
 			var failure string
-			select {
-			case <-selector.overlapped:
-				failure = "replacement stopped the selector while it was still active"
-			case <-replacementDone:
-				failure = "selector replacement completed while the old selector was still active"
-			case <-time.After(100 * time.Millisecond):
+			if test.operation == selectorLifecycleStop {
+				select {
+				case <-selector.overlapped:
+					failure = "replacement stopped the selector concurrently with StopAutoRefresh"
+				case <-replacementDone:
+					failure = "selector replacement completed while StopAutoRefresh was still active"
+				case <-time.After(100 * time.Millisecond):
+				}
+			} else {
+				select {
+				case <-selector.stopCalled:
+					failure = "replacement stopped the selector while it was still active"
+				case <-replacementDone:
+					failure = "selector replacement completed while the old selector was still active"
+				case <-time.After(100 * time.Millisecond):
+				}
 			}
 
 			close(selector.release)
@@ -185,6 +209,13 @@ func TestManagerSelectorReplacementWaitsForActiveUsers(t *testing.T) {
 			}
 			if failure != "" {
 				t.Fatal(failure)
+			}
+			wantStopCalls := 1
+			if test.operation == selectorLifecycleStop {
+				wantStopCalls = 2
+			}
+			if gotStopCalls := selector.stopCallCount(); gotStopCalls != wantStopCalls {
+				t.Fatalf("Stop call count = %d, want %d", gotStopCalls, wantStopCalls)
 			}
 		})
 	}
