@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -247,6 +248,20 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 }
 
+func isSameSelector(a, b Selector) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb {
+		return false
+	}
+	if ta.Comparable() {
+		return a == b
+	}
+	return false
+}
+
 func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
@@ -254,9 +269,23 @@ func (m *Manager) SetSelector(selector Selector) {
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
+	m.selectorMu.Lock()
+	defer m.selectorMu.Unlock()
+
 	m.mu.Lock()
+	oldSelector := m.selector
+	if isSameSelector(oldSelector, selector) {
+		m.mu.Unlock()
+		return
+	}
 	m.selector = selector
 	m.mu.Unlock()
+
+	if oldSelector != nil {
+		if stoppable, ok := oldSelector.(StoppableSelector); ok {
+			stoppable.Stop()
+		}
+	}
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
@@ -825,7 +854,7 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if status == http.StatusOK {
 		return 0, false
 	}
-	if isRequestInvalidError(err) {
+	if isRequestInvalidError(err) || isRequestStopError(err) {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
@@ -1027,6 +1056,10 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if tried == nil {
 		tried = make(map[string]struct{})
 	}
+
+	opts.EnsureMetadata()
+	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(m.Selector(), model)
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -1285,10 +1318,13 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	opts.EnsureMetadata()
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
 	}
+	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
@@ -1348,9 +1384,15 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	opts.EnsureMetadata()
+	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(m.Selector(), model)
 	return m.pickNextMixedLegacyWithInflight(ctx, providers, model, opts, tried, nil, "")
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	opts.EnsureMetadata()
+	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 	return m.pickNextMixedWithInflight(ctx, providers, model, opts, tried, nil, "")
 }
