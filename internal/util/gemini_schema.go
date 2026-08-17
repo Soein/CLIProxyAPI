@@ -102,49 +102,116 @@ func CleanJSONSchemaForGemini(jsonStr string) string {
 
 // cleanJSONSchema performs the core cleaning operations on the JSON schema.
 func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
+	fallback := schemaCleanBudgetFallback("", options.addPlaceholder)
+	if len(jsonStr) > maxInlineLocalRefOutputBytes {
+		return fallback
+	}
+	fallback = schemaCleanBudgetFallback(jsonStr, options.addPlaceholder)
+	apply := func(transform func(string) string) bool {
+		jsonStr = transform(jsonStr)
+		return len(jsonStr) <= maxInlineLocalRefOutputBytes
+	}
+
 	// Phase 1: Convert and add hints
 	if options.antigravitySemantics {
-		jsonStr = inlineLocalRefs(jsonStr)
+		if !apply(inlineLocalRefs) {
+			return fallback
+		}
 	}
-	jsonStr = convertRefsToHints(jsonStr, options.antigravitySemantics)
-	jsonStr = convertConstToEnum(jsonStr)
-	jsonStr = convertEnumValuesToStrings(jsonStr, options.forceEnumStringType)
-	jsonStr = addEnumHints(jsonStr)
-	jsonStr = dropIgnoredEnumsToHints(jsonStr, options)
+	if !apply(func(schema string) string { return convertRefsToHints(schema, options.antigravitySemantics) }) ||
+		!apply(convertConstToEnum) ||
+		!apply(func(schema string) string { return convertEnumValuesToStrings(schema, options.forceEnumStringType) }) ||
+		!apply(addEnumHints) ||
+		!apply(func(schema string) string { return dropIgnoredEnumsToHints(schema, options) }) {
+		return fallback
+	}
 	if !options.preserveAdditionalPropertiesFalse {
-		jsonStr = addAdditionalPropertiesHints(jsonStr)
+		if !apply(addAdditionalPropertiesHints) {
+			return fallback
+		}
 	}
-	jsonStr = moveConstraintsToDescription(jsonStr, options)
+	if !apply(func(schema string) string { return moveConstraintsToDescription(schema, options) }) {
+		return fallback
+	}
 	if options.antigravitySemantics {
-		jsonStr = moveNotToDescription(jsonStr)
+		if !apply(moveNotToDescription) {
+			return fallback
+		}
 	}
 
 	// Phase 2: Flatten complex structures
-	jsonStr = mergeConditionals(jsonStr)
-	jsonStr = mergeAllOf(jsonStr)
-	if options.flattenUnions {
-		jsonStr = flattenAnyOfOneOf(jsonStr)
+	if !apply(mergeConditionals) || !apply(mergeAllOf) {
+		return fallback
 	}
-	jsonStr = flattenTypeArrays(jsonStr, options.antigravitySemantics)
+	if options.flattenUnions {
+		if !apply(flattenAnyOfOneOf) {
+			return fallback
+		}
+	}
+	if !apply(func(schema string) string { return flattenTypeArrays(schema, options.antigravitySemantics) }) {
+		return fallback
+	}
 
 	// Phase 3: Cleanup
-	jsonStr = removeUnsupportedKeywords(jsonStr, options)
+	if !apply(func(schema string) string { return removeUnsupportedKeywords(schema, options) }) {
+		return fallback
+	}
 	if options.removeGeminiMetadata {
 		// Gemini schema cleanup: remove nullable/title and placeholder-only fields.
-		jsonStr = removeKeywords(jsonStr, []string{"nullable", "title"})
-		jsonStr = removePlaceholderFields(jsonStr)
+		if !apply(func(schema string) string { return removeKeywords(schema, []string{"nullable", "title"}) }) ||
+			!apply(removePlaceholderFields) {
+			return fallback
+		}
 	} else if options.removeToolTitle {
 		// Legacy non-VALIDATED Antigravity requests used the Gemini cleaner, which drops title.
 		// Keep that harmless metadata policy without losing Antigravity's native nullable support.
-		jsonStr = removeKeywords(jsonStr, []string{"title"})
+		if !apply(func(schema string) string { return removeKeywords(schema, []string{"title"}) }) {
+			return fallback
+		}
 	}
-	jsonStr = cleanupRequiredFields(jsonStr)
+	if !apply(cleanupRequiredFields) {
+		return fallback
+	}
 	// Phase 4: Add placeholder for empty object schemas (Claude VALIDATED mode requirement)
 	if options.addPlaceholder {
-		jsonStr = addEmptySchemaPlaceholder(jsonStr)
+		if !apply(addEmptySchemaPlaceholder) {
+			return fallback
+		}
 	}
 
 	return jsonStr
+}
+
+func schemaCleanBudgetFallback(schema string, requirePlaceholder bool) string {
+	typeName := schemaTypeForBudgetFallback(schema)
+	if requirePlaceholder && typeName == "object" {
+		return `{"type":"object","description":"Schema cleaning output limit exceeded","properties":{"reason":{"type":"string","description":"Brief explanation of why you are calling this tool"}},"required":["reason"]}`
+	}
+	return fmt.Sprintf(`{"type":%q,"description":"Schema cleaning output limit exceeded"}`, typeName)
+}
+
+func schemaTypeForBudgetFallback(schema string) string {
+	if schema == "" {
+		return "object"
+	}
+	typeValue := gjson.Get(schema, "type")
+	candidates := []gjson.Result{typeValue}
+	if typeValue.IsArray() {
+		candidates = typeValue.Array()
+	}
+	for _, candidate := range candidates {
+		switch candidate.String() {
+		case "array", "boolean", "integer", "number", "object", "string":
+			return candidate.String()
+		}
+	}
+	if gjson.Get(schema, "properties").IsObject() {
+		return "object"
+	}
+	if gjson.Get(schema, "items").Exists() {
+		return "array"
+	}
+	return "object"
 }
 
 // removeKeywords removes all occurrences of specified keywords from the JSON schema.
@@ -387,12 +454,14 @@ func (r *localRefResolver) resolveMapEntries(root any, node map[string]any, acti
 	if !r.commitContainer(count, structuralBytes) {
 		return nil, false
 	}
+	keys, okKeys := r.sortedRetainedMapKeys(node, skipRef)
+	if !okKeys {
+		return nil, false
+	}
 
 	out := make(map[string]any, count)
-	for key, item := range node {
-		if isLocalDefinitionContainer(key) || (skipRef && key == "$ref") {
-			continue
-		}
+	for _, key := range keys {
+		item := node[key]
 		resolved, ok := r.resolve(root, item, active, depth+1)
 		if !ok {
 			return nil, false
@@ -403,17 +472,26 @@ func (r *localRefResolver) resolveMapEntries(root any, node map[string]any, acti
 }
 
 func (r *localRefResolver) mergeRefSchemaMaps(base, sibling map[string]any) (map[string]any, bool) {
-	if !r.reserveAllocation(len(base) + len(sibling)) {
+	if !r.reserveAllocation(len(base) + len(sibling) + 2) {
 		return nil, false
 	}
-	out := make(map[string]any, len(base)+len(sibling))
+	out := make(map[string]any, len(base)+len(sibling)+2)
 	for key, value := range base {
 		if isLocalDefinitionContainer(key) {
 			continue
 		}
 		out[key] = value
 	}
-	for key, value := range sibling {
+	keys, okKeys := r.sortedMapKeys(sibling)
+	if !okKeys {
+		return nil, false
+	}
+	allOfMerged := false
+	for _, key := range keys {
+		value := sibling[key]
+		if key == "const" || key == "enum" || key == "type" {
+			continue
+		}
 		baseValue, exists := out[key]
 		if !exists {
 			out[key] = value
@@ -470,20 +548,16 @@ func (r *localRefResolver) mergeRefSchemaMaps(base, sibling map[string]any) (map
 				out[key] = baseBool && siblingBool
 				continue
 			}
-		case "enum":
-			baseEnum, baseOK := baseValue.([]any)
-			siblingEnum, siblingOK := value.([]any)
+		case "allOf":
+			baseAllOf, baseOK := baseValue.([]any)
+			siblingAllOf, siblingOK := value.([]any)
 			if baseOK && siblingOK {
-				intersection, ok := r.intersectSchemaEnums(baseEnum, siblingEnum)
+				merged, ok := r.flattenAllOfClauses(baseAllOf, siblingAllOf)
 				if !ok {
 					return nil, false
 				}
-				out[key] = intersection
-				continue
-			}
-		case "const", "type":
-			if !schemaValuesEqual(baseValue, value) {
-				markImpossibleSchema(out)
+				out[key] = merged
+				allOfMerged = true
 				continue
 			}
 		case "minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties":
@@ -526,6 +600,21 @@ func (r *localRefResolver) mergeRefSchemaMaps(base, sibling map[string]any) (map
 		if !r.appendAllOfConstraint(out, key, value) {
 			return nil, false
 		}
+		if !r.appendConjunctionConflictHint(out, key, baseValue, value) {
+			return nil, false
+		}
+	}
+	if !allOfMerged {
+		if clauses, ok := out["allOf"].([]any); ok {
+			flattened, okFlattened := r.flattenAllOfClauses(clauses)
+			if !okFlattened {
+				return nil, false
+			}
+			out["allOf"] = flattened
+		}
+	}
+	if !r.mergeCoreSchemaConstraints(out, base, sibling) {
+		return nil, false
 	}
 	return out, true
 }
@@ -538,7 +627,12 @@ func (r *localRefResolver) mergeRefProperties(base, sibling map[string]any) (map
 	for key, value := range base {
 		out[key] = value
 	}
-	for key, value := range sibling {
+	keys, okKeys := r.sortedMapKeys(sibling)
+	if !okKeys {
+		return nil, false
+	}
+	for _, key := range keys {
+		value := sibling[key]
 		baseValue, exists := out[key]
 		if !exists {
 			out[key] = value
@@ -569,6 +663,240 @@ func (r *localRefResolver) mergeRefProperties(base, sibling map[string]any) (map
 		}
 	}
 	return out, true
+}
+
+func (r *localRefResolver) mergeCoreSchemaConstraints(out, base, sibling map[string]any) bool {
+	impossible := hasEmptySchemaEnum(base) || hasEmptySchemaEnum(sibling)
+
+	baseType, baseHasType := base["type"]
+	siblingType, siblingHasType := sibling["type"]
+	switch {
+	case baseHasType && siblingHasType:
+		if !schemaValuesEqual(baseType, siblingType) {
+			impossible = true
+		}
+	case siblingHasType:
+		out["type"] = siblingType
+	}
+
+	baseEnum, baseHasEnum := base["enum"].([]any)
+	siblingEnum, siblingHasEnum := sibling["enum"].([]any)
+	var enum []any
+	hasEnum := baseHasEnum || siblingHasEnum
+	switch {
+	case baseHasEnum && siblingHasEnum:
+		intersection, ok := r.intersectSchemaEnums(baseEnum, siblingEnum)
+		if !ok {
+			return false
+		}
+		enum = intersection
+	case baseHasEnum:
+		enum = baseEnum
+	case siblingHasEnum:
+		enum = siblingEnum
+	}
+
+	baseConst, baseHasConst := base["const"]
+	siblingConst, siblingHasConst := sibling["const"]
+	var constValue any
+	hasConst := baseHasConst || siblingHasConst
+	switch {
+	case baseHasConst && siblingHasConst:
+		constValue = baseConst
+		if !schemaValuesEqual(baseConst, siblingConst) {
+			impossible = true
+		}
+	case baseHasConst:
+		constValue = baseConst
+	case siblingHasConst:
+		constValue = siblingConst
+	}
+
+	if hasConst && hasEnum {
+		if !schemaEnumContains(enum, constValue) {
+			impossible = true
+		} else {
+			if !r.reserveAllocation(1) {
+				return false
+			}
+			enum = make([]any, 1)
+			enum[0] = constValue
+		}
+	}
+	if hasEnum && len(enum) == 0 {
+		impossible = true
+	}
+
+	if impossible {
+		markImpossibleSchema(out)
+		return true
+	}
+	if hasEnum {
+		out["enum"] = enum
+	}
+	if hasConst {
+		out["const"] = constValue
+	}
+	return true
+}
+
+func hasEmptySchemaEnum(schema map[string]any) bool {
+	enum, ok := schema["enum"].([]any)
+	return ok && len(enum) == 0
+}
+
+func schemaEnumContains(enum []any, value any) bool {
+	for _, candidate := range enum {
+		if schemaValuesEqual(candidate, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *localRefResolver) sortedRetainedMapKeys(node map[string]any, skipRef bool) ([]string, bool) {
+	count := retainedMapEntries(node, skipRef)
+	if !r.reserveAllocation(count) {
+		return nil, false
+	}
+	keys := make([]string, 0, count)
+	for key := range node {
+		if isLocalDefinitionContainer(key) || (skipRef && key == "$ref") {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, true
+}
+
+func (r *localRefResolver) sortedMapKeys(node map[string]any) ([]string, bool) {
+	if !r.reserveAllocation(len(node)) {
+		return nil, false
+	}
+	keys := make([]string, 0, len(node))
+	for key := range node {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, true
+}
+
+func (r *localRefResolver) flattenAllOfClauses(groups ...[]any) ([]any, bool) {
+	clauseCount := 0
+	splitEntries := 0
+	for _, group := range groups {
+		for _, clause := range group {
+			count, entries, ok := countFlattenedAllOfClause(clause, 0)
+			if !ok {
+				return nil, false
+			}
+			clauseCount += count
+			splitEntries += entries
+		}
+	}
+	if !r.reserveAllocation(clauseCount + splitEntries) {
+		return nil, false
+	}
+	out := make([]any, 0, clauseCount)
+	for _, group := range groups {
+		for _, clause := range group {
+			appendFlattenedAllOfClause(&out, clause, 0)
+		}
+	}
+	return out, true
+}
+
+func countFlattenedAllOfClause(clause any, depth int) (count, splitEntries int, ok bool) {
+	if depth > maxInlineLocalRefDepth {
+		return 0, 0, false
+	}
+	clauseMap, isMap := clause.(map[string]any)
+	if !isMap {
+		return 1, 0, true
+	}
+	nested, hasNested := clauseMap["allOf"].([]any)
+	if !hasNested {
+		return 1, 0, true
+	}
+	if len(clauseMap) > 1 {
+		count++
+		splitEntries += len(clauseMap) - 1
+	}
+	for _, child := range nested {
+		childCount, childEntries, childOK := countFlattenedAllOfClause(child, depth+1)
+		if !childOK {
+			return 0, 0, false
+		}
+		count += childCount
+		splitEntries += childEntries
+	}
+	return count, splitEntries, true
+}
+
+func appendFlattenedAllOfClause(out *[]any, clause any, depth int) {
+	clauseMap, isMap := clause.(map[string]any)
+	if !isMap {
+		*out = append(*out, clause)
+		return
+	}
+	nested, hasNested := clauseMap["allOf"].([]any)
+	if !hasNested {
+		*out = append(*out, clause)
+		return
+	}
+	if len(clauseMap) > 1 {
+		siblings := make(map[string]any, len(clauseMap)-1)
+		for key, value := range clauseMap {
+			if key != "allOf" {
+				siblings[key] = value
+			}
+		}
+		*out = append(*out, siblings)
+	}
+	for _, child := range nested {
+		appendFlattenedAllOfClause(out, child, depth+1)
+	}
+}
+
+func (r *localRefResolver) appendConjunctionConflictHint(schema map[string]any, key string, base, sibling any) bool {
+	hint := "Conjunction " + boundedHintText(key, 64) + ": " + boundedSchemaValueHint(base) + " AND " + boundedSchemaValueHint(sibling)
+	if !r.reserveBytes(jsonStringEncodedLen(hint) + jsonStringEncodedLen("description") + 2) {
+		return false
+	}
+	description, _ := schema["description"].(string)
+	schema["description"] = mergeHint(description, hint)
+	return true
+}
+
+func boundedSchemaValueHint(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return strconv.FormatBool(typed)
+	case string:
+		return strconv.Quote(boundedHintText(typed, 64))
+	case json.Number:
+		return boundedHintText(typed.String(), 64)
+	case []any:
+		return "array(" + strconv.Itoa(len(typed)) + ")"
+	case map[string]any:
+		return "object(" + strconv.Itoa(len(typed)) + ")"
+	default:
+		return "value"
+	}
+}
+
+func boundedHintText(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return value[:end] + "..."
 }
 
 func (r *localRefResolver) stableRequiredUnion(base, sibling []any) ([]any, bool) {
@@ -696,19 +1024,92 @@ func stricterNumericConstraint(base, sibling any, chooseGreater bool) (any, bool
 	if !baseOK || !siblingOK {
 		return nil, false
 	}
-	if len(baseNumber.String()) > 128 || len(siblingNumber.String()) > 128 {
+	comparison, ok := compareJSONNumbers(baseNumber, siblingNumber)
+	if !ok {
 		return nil, false
 	}
-	baseRat, baseOK := new(big.Rat).SetString(baseNumber.String())
-	siblingRat, siblingOK := new(big.Rat).SetString(siblingNumber.String())
-	if !baseOK || !siblingOK {
-		return nil, false
-	}
-	comparison := siblingRat.Cmp(baseRat)
-	if (chooseGreater && comparison > 0) || (!chooseGreater && comparison < 0) {
+	if (chooseGreater && comparison < 0) || (!chooseGreater && comparison > 0) {
 		return sibling, true
 	}
 	return base, true
+}
+
+func compareJSONNumbers(left, right json.Number) (int, bool) {
+	leftRaw := left.String()
+	rightRaw := right.String()
+	if !preflightJSONNumber(leftRaw) || !preflightJSONNumber(rightRaw) {
+		return 0, false
+	}
+	leftRat, leftOK := new(big.Rat).SetString(leftRaw)
+	rightRat, rightOK := new(big.Rat).SetString(rightRaw)
+	if !leftOK || !rightOK {
+		return 0, false
+	}
+	return leftRat.Cmp(rightRat), true
+}
+
+func preflightJSONNumber(raw string) bool {
+	const (
+		maxLiteralBytes      = 128
+		maxSignificantDigits = 128
+		maxExponentMagnitude = 1024
+		maxExpandedDigits    = 1024
+	)
+	if raw == "" || len(raw) > maxLiteralBytes {
+		return false
+	}
+
+	exponentIndex := strings.IndexAny(raw, "eE")
+	mantissa := raw
+	exponent := 0
+	if exponentIndex >= 0 {
+		mantissa = raw[:exponentIndex]
+		exponentRaw := raw[exponentIndex+1:]
+		if exponentRaw == "" {
+			return false
+		}
+		sign := 1
+		if exponentRaw[0] == '+' || exponentRaw[0] == '-' {
+			if exponentRaw[0] == '-' {
+				sign = -1
+			}
+			exponentRaw = exponentRaw[1:]
+		}
+		if exponentRaw == "" {
+			return false
+		}
+		for _, digit := range exponentRaw {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+			if exponent > maxExponentMagnitude {
+				return false
+			}
+			exponent = exponent*10 + int(digit-'0')
+		}
+		if exponent > maxExponentMagnitude {
+			return false
+		}
+		exponent *= sign
+	}
+
+	digits := 0
+	for i, char := range mantissa {
+		if (char == '-' && i == 0) || char == '.' {
+			continue
+		}
+		if char < '0' || char > '9' {
+			return false
+		}
+		digits++
+	}
+	if digits == 0 || digits > maxSignificantDigits {
+		return false
+	}
+	if exponent < 0 {
+		exponent = -exponent
+	}
+	return digits+exponent <= maxExpandedDigits
 }
 
 func schemaValuesEqual(left, right any) bool {
@@ -1149,8 +1550,7 @@ func mergeAllOf(jsonStr string) string {
 }
 
 // mergeMissingSchemaAtPath recursively fills absent fields without replacing any existing
-// definition. A parent schema is the canonical definition; allOf and conditional branches may
-// enrich gaps in it, but can never replace it with a narrower branch shell.
+// definition. Conflicting allOf leaves remain visible as bounded conjunction hints.
 func mergeMissingSchemaAtPath(jsonStr, destination string, incoming gjson.Result) string {
 	existing := gjson.Get(jsonStr, destination)
 	if !existing.Exists() {
@@ -1158,6 +1558,15 @@ func mergeMissingSchemaAtPath(jsonStr, destination string, incoming gjson.Result
 		return string(updated)
 	}
 	if !existing.IsObject() || !incoming.IsObject() {
+		if existing.Raw != incoming.Raw {
+			parts := splitGJSONPath(destination)
+			if len(parts) > 0 {
+				field := unescapeGJSONPathKey(parts[len(parts)-1])
+				parentPath := strings.Join(parts[:len(parts)-1], ".")
+				hint := "Conjunction " + boundedHintText(field, 64) + ": " + boundedGJSONValueHint(existing) + " AND " + boundedGJSONValueHint(incoming)
+				jsonStr = appendHint(jsonStr, parentPath, hint)
+			}
+		}
 		return jsonStr
 	}
 	incoming.ForEach(func(key, value gjson.Result) bool {
@@ -1166,6 +1575,29 @@ func mergeMissingSchemaAtPath(jsonStr, destination string, incoming gjson.Result
 		return true
 	})
 	return jsonStr
+}
+
+func boundedGJSONValueHint(value gjson.Result) string {
+	switch value.Type {
+	case gjson.Null:
+		return "null"
+	case gjson.False:
+		return "false"
+	case gjson.True:
+		return "true"
+	case gjson.Number:
+		return boundedHintText(value.Raw, 64)
+	case gjson.String:
+		return strconv.Quote(boundedHintText(value.String(), 64))
+	case gjson.JSON:
+		trimmed := strings.TrimSpace(value.Raw)
+		if strings.HasPrefix(trimmed, "[") {
+			return "array"
+		}
+		return "object"
+	default:
+		return "value"
+	}
 }
 
 func flattenAnyOfOneOf(jsonStr string) string {

@@ -1686,6 +1686,175 @@ func TestCleanJSONSchemaForAntigravityResponse_PreservesSiblingConjunction(t *te
 	}
 }
 
+func TestInlineLocalRefs_IntersectsConstAndEnumRegardlessOfSide(t *testing.T) {
+	tests := []struct {
+		name    string
+		base    string
+		sibling string
+	}{
+		{name: "base const", base: `{"type":"string","const":"a"}`, sibling: `"enum":["b"]`},
+		{name: "sibling const", base: `{"type":"string","enum":["b"]}`, sibling: `"const":"a"`},
+		{name: "type conflict with enum", base: `{"type":"string","enum":["a"]}`, sibling: `"enum":["a"],"type":"integer"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := fmt.Sprintf(`{"definitions":{"Value":%s},"$ref":"#/definitions/Value",%s}`, tt.base, tt.sibling)
+			for i := 0; i < 50; i++ {
+				result := gjson.Parse(inlineLocalRefs(input))
+				enum := result.Get("enum")
+				if !enum.IsArray() || len(enum.Array()) != 0 || result.Get("const").Exists() {
+					t.Fatalf("run %d widened const/enum/type conjunction: %s", i, result.Raw)
+				}
+			}
+		})
+	}
+}
+
+func TestInlineLocalRefs_IsDeterministicAcrossMapIterationOrder(t *testing.T) {
+	input := `{
+		"definitions":{"Value":{"type":"string","pattern":"^base","format":"email","contentEncoding":"base64"}},
+		"$ref":"#/definitions/Value",
+		"pattern":"local$",
+		"format":"uuid",
+		"contentEncoding":"hex"
+	}`
+
+	want := inlineLocalRefs(input)
+	wantCleaned := CleanJSONSchemaForAntigravityResponse(input)
+	for i := 0; i < 200; i++ {
+		if got := inlineLocalRefs(input); got != want {
+			t.Fatalf("run %d produced nondeterministic output:\nwant %s\n got %s", i, want, got)
+		}
+		if got := CleanJSONSchemaForAntigravityResponse(input); got != wantCleaned {
+			t.Fatalf("run %d produced nondeterministic cleaned output:\nwant %s\n got %s", i, wantCleaned, got)
+		}
+	}
+}
+
+func TestInlineLocalRefs_FlattensBothAllOfSides(t *testing.T) {
+	input := `{
+		"definitions":{"Value":{"type":"object","allOf":[
+			{"properties":{"a":{"type":"string"}}},
+			{"allOf":[{"properties":{"b":{"type":"integer"}}}]}
+		]}},
+		"$ref":"#/definitions/Value",
+		"allOf":[
+			{"properties":{"c":{"type":"boolean"}}},
+			{"allOf":[{"properties":{"d":{"type":"number"}}}]}
+		]
+	}`
+
+	inlined := gjson.Parse(inlineLocalRefs(input))
+	clauses := inlined.Get("allOf").Array()
+	if len(clauses) != 4 {
+		t.Fatalf("allOf sides were not flattened: %s", inlined.Raw)
+	}
+	for i, clause := range clauses {
+		if clause.Get("allOf").Exists() {
+			t.Fatalf("clause %d retained nested allOf: %s", i, inlined.Raw)
+		}
+	}
+
+	cleaned := gjson.Parse(CleanJSONSchemaForAntigravityResponse(input))
+	for _, path := range []string{"properties.a", "properties.b", "properties.c", "properties.d"} {
+		if !cleaned.Get(path).Exists() {
+			t.Fatalf("nested allOf lost %s: %s", path, cleaned.Raw)
+		}
+	}
+}
+
+func TestCleanJSONSchemaForAntigravityResponse_HintsUnknownSiblingConflict(t *testing.T) {
+	input := `{
+		"definitions":{"Value":{"type":"array","minContains":1}},
+		"$ref":"#/definitions/Value",
+		"minContains":2
+	}`
+
+	result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(input))
+	description := result.Get("description").String()
+	if !strings.Contains(description, "minContains") || !strings.Contains(description, "1") || !strings.Contains(description, "2") {
+		t.Fatalf("unknown sibling constraint was silently dropped: %s", result.Raw)
+	}
+	if len(description) > 512 {
+		t.Fatalf("unknown constraint hint was not bounded: len=%d", len(description))
+	}
+}
+
+func TestCleanJSONSchemaForAntigravityResponse_HintsDirectAllOfConflict(t *testing.T) {
+	input := `{"type":"array","minContains":1,"allOf":[{"minContains":2}]}`
+
+	result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(input))
+	description := result.Get("description").String()
+	if !strings.Contains(description, "minContains") || !strings.Contains(description, "1") || !strings.Contains(description, "2") {
+		t.Fatalf("direct allOf conflict was silently dropped: %s", result.Raw)
+	}
+}
+
+func TestStricterNumericConstraintRejectsExtremeExponentBeforeBigRat(t *testing.T) {
+	_, ok := stricterNumericConstraint(json.Number("1e1000000"), json.Number("2"), false)
+	if ok {
+		t.Fatal("extreme exponent was compared instead of taking the bounded conjunction path")
+	}
+	allocations := testing.AllocsPerRun(100, func() {
+		_, _ = stricterNumericConstraint(json.Number("1e1000000"), json.Number("2"), false)
+	})
+	if allocations != 0 {
+		t.Fatalf("extreme exponent comparison allocated %.0f objects per run", allocations)
+	}
+}
+
+func TestInlineLocalRefs_ExtremeNumericConstraintUsesBoundedConjunction(t *testing.T) {
+	input := `{
+		"definitions":{"Value":{"type":"number","maximum":1e1000000}},
+		"$ref":"#/definitions/Value",
+		"maximum":2
+	}`
+
+	result := gjson.Parse(inlineLocalRefs(input))
+	if !result.Get("allOf").IsArray() || !strings.Contains(result.Get("description").String(), "maximum") {
+		t.Fatalf("extreme numeric constraint was not preserved through a bounded conjunction: %s", result.Raw)
+	}
+}
+
+func TestCleanJSONSchema_FinalOutputBudgetIncludesGeneratedHints(t *testing.T) {
+	values := make([]string, 10)
+	for i := range values {
+		values[i] = strings.Repeat(string(rune('a'+i)), 5000)
+	}
+	enumJSON, err := json.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := fmt.Sprintf(`{"type":"object","properties":{"value":{"type":"string","enum":%s}}}`, enumJSON)
+	if len(input) >= maxInlineLocalRefOutputBytes {
+		t.Fatalf("test input must begin below the output cap: %d", len(input))
+	}
+
+	cleaners := []struct {
+		name  string
+		clean func(string) string
+	}{
+		{name: "response", clean: CleanJSONSchemaForAntigravityResponse},
+		{name: "gemini", clean: CleanJSONSchemaForGemini},
+		{name: "tool", clean: func(schema string) string { return CleanJSONSchemaForAntigravityTool(schema, false) }},
+	}
+	for _, tt := range cleaners {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.clean(input)
+			if len(result) > maxInlineLocalRefOutputBytes || !gjson.Valid(result) {
+				t.Fatalf("final schema exceeded output budget: len=%d", len(result))
+			}
+		})
+	}
+
+	for _, clean := range []func(string) string{CleanJSONSchemaForAntigravityResponse, CleanJSONSchemaForGemini} {
+		if result := clean(input); !strings.Contains(result, "Schema cleaning output limit exceeded") {
+			t.Fatalf("hint expansion did not use fixed fallback: len=%d result=%s", len(result), result)
+		}
+	}
+}
+
 func TestInlineLocalRefs_RejectsOversizedInputBeforeDecode(t *testing.T) {
 	input := `{"$ref":"#/definitions/Value","padding":"` + strings.Repeat("x", maxInlineLocalRefInputBytes)
 
