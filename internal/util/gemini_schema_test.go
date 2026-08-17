@@ -1620,6 +1620,176 @@ func TestInlineLocalRefs_MergesSiblingObjectSchemas(t *testing.T) {
 	}
 }
 
+func TestInlineLocalRefs_MergesSiblingConstraintsAsConjunction(t *testing.T) {
+	input := `{
+		"definitions":{"Value":{"type":"string","maxLength":5,"minimum":5,"maximum":5,"enum":["a","b"]}},
+		"$ref":"#/definitions/Value",
+		"maxLength":10,
+		"minimum":3,
+		"maximum":10,
+		"enum":["b","c"]
+	}`
+
+	result := gjson.Parse(inlineLocalRefs(input))
+	if got := result.Get("maxLength").Int(); got != 5 {
+		t.Fatalf("sibling merge widened maxLength to %d: %s", got, result.Raw)
+	}
+	if result.Get("minimum").Int() != 5 || result.Get("maximum").Int() != 5 {
+		t.Fatalf("numeric bounds were widened: %s", result.Raw)
+	}
+	if enum := result.Get("enum").Array(); len(enum) != 1 || enum[0].String() != "b" {
+		t.Fatalf("enum intersection was not preserved: %s", result.Raw)
+	}
+}
+
+func TestInlineLocalRefs_PreservesConflictingSiblingConstraints(t *testing.T) {
+	tests := []struct {
+		name  string
+		base  string
+		local string
+	}{
+		{name: "const", base: `{"type":"string","const":"base"}`, local: `{"const":"local"}`},
+		{name: "type", base: `{"type":"string"}`, local: `{"type":"integer"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := fmt.Sprintf(`{"definitions":{"Value":%s},"properties":{"value":{"$ref":"#/definitions/Value",%s}}}`,
+				tt.base, strings.TrimPrefix(tt.local, "{"))
+			result := gjson.Parse(inlineLocalRefs(input)).Get("properties.value")
+			enum := result.Get("enum")
+			if !enum.IsArray() || len(enum.Array()) != 0 {
+				t.Fatalf("conflicting %s constraints were widened: %s", tt.name, result.Raw)
+			}
+		})
+	}
+}
+
+func TestCleanJSONSchemaForAntigravityResponse_PreservesSiblingConjunction(t *testing.T) {
+	input := `{
+		"definitions":{"Value":{"type":"string","maxLength":5,"pattern":"^base","const":"base"}},
+		"properties":{"value":{"$ref":"#/definitions/Value","type":"integer","maxLength":10,"pattern":"local$","const":"local"}}
+	}`
+
+	result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(input)).Get("properties.value")
+	if result.Get("type").String() != "string" || !result.Get("enum").IsArray() || len(result.Get("enum").Array()) != 0 {
+		t.Fatalf("type/const conflicts were widened: %s", result.Raw)
+	}
+	description := result.Get("description").String()
+	for _, hint := range []string{"maxLength: 5", "pattern: ^base", "pattern: local$"} {
+		if !strings.Contains(description, hint) {
+			t.Fatalf("conjunctive hint %q was lost: %s", hint, result.Raw)
+		}
+	}
+	if strings.Contains(description, "maxLength: 10") {
+		t.Fatalf("weaker maxLength survived conjunction merge: %s", result.Raw)
+	}
+}
+
+func TestInlineLocalRefs_RejectsOversizedInputBeforeDecode(t *testing.T) {
+	input := `{"$ref":"#/definitions/Value","padding":"` + strings.Repeat("x", maxInlineLocalRefInputBytes)
+
+	result := inlineLocalRefs(input)
+	if len(result) > 256 || !gjson.Valid(result) || !strings.Contains(result, "Local reference input limit exceeded") {
+		t.Fatalf("oversized input did not use the fixed fallback: len=%d result=%s", len(result), result)
+	}
+}
+
+func TestJSONStringEncodedLenIsConservative(t *testing.T) {
+	for _, value := range []string{
+		"plain ASCII",
+		"quotes: \" and slash: \\",
+		"controls:\x00\n\t",
+		"HTML: <script>&",
+		"Unicode: 世界\u2028next",
+		string([]byte{'a', 0xff, 'b'}),
+	} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("json.Marshal(%q): %v", value, err)
+		}
+		if estimate := jsonStringEncodedLen(value); estimate < len(encoded) {
+			t.Fatalf("jsonStringEncodedLen(%q) = %d, encoded size = %d", value, estimate, len(encoded))
+		}
+	}
+}
+
+func TestInlineLocalRefs_WideContainersUseBoundedFallback(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix string
+		entry  func(int) string
+		suffix string
+	}{
+		{
+			name:   "map",
+			prefix: `{"definitions":{"Wide":{"type":"object","properties":{`,
+			entry:  func(i int) string { return fmt.Sprintf(`"field%d":"value"`, i) },
+			suffix: `}}},"$ref":"#/definitions/Wide"}`,
+		},
+		{
+			name:   "array",
+			prefix: `{"definitions":{"Wide":{"type":"array","enum":[`,
+			entry:  func(i int) string { return fmt.Sprintf(`"value%d"`, i) },
+			suffix: `]}},"$ref":"#/definitions/Wide"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b strings.Builder
+			b.WriteString(tt.prefix)
+			for i := 0; i <= maxInlineLocalRefNodes; i++ {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				b.WriteString(tt.entry(i))
+			}
+			b.WriteString(tt.suffix)
+
+			result := inlineLocalRefs(b.String())
+			if len(result) > 256 || !gjson.Valid(result) || !strings.Contains(result, "See: Wide") {
+				t.Fatalf("wide %s did not use a bounded typed fallback: len=%d result=%s", tt.name, len(result), result)
+			}
+		})
+	}
+}
+
+func TestInlineLocalRefs_HugeStringsInDAGUseBoundedFallback(t *testing.T) {
+	largeDescription := strings.Repeat("x", maxInlineLocalRefOutputBytes/2)
+	input := fmt.Sprintf(`{
+		"definitions":{
+			"Leaf":{"type":"string","description":%q},
+			"Branch":{"type":"object","properties":{"left":{"$ref":"#/definitions/Leaf"},"right":{"$ref":"#/definitions/Leaf"}}}
+		},
+		"$ref":"#/definitions/Branch"
+	}`, largeDescription)
+
+	result := inlineLocalRefs(input)
+	if len(result) > 256 || !gjson.Valid(result) || !strings.Contains(result, "See: Branch") {
+		t.Fatalf("large DAG did not use a bounded typed fallback: len=%d result=%s", len(result), result)
+	}
+}
+
+func TestInlineLocalRefs_DoesNotChargeUnusedDefinitions(t *testing.T) {
+	unusedDescription := strings.Repeat("x", maxInlineLocalRefOutputBytes+1)
+	input := fmt.Sprintf(`{
+		"definitions":{
+			"Unused":{"type":"object","description":%q},
+			"Used":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}
+		},
+		"$ref":"#/definitions/Used"
+	}`, unusedDescription)
+
+	result := gjson.Parse(inlineLocalRefs(input))
+	if result.Get("properties.id.type").String() != "integer" || result.Get("required.0").String() != "id" {
+		t.Fatalf("unused definition exhausted the resolver budget: %s", result.Raw)
+	}
+	if strings.Contains(result.Raw, unusedDescription[:128]) {
+		t.Fatalf("unused definition leaked into expanded output: %s", result.Raw)
+	}
+}
+
 func TestCleanJSONSchemaForAntigravityResponseTypeArrayUsesNativeNullable(t *testing.T) {
 	input := `{"type":"object","properties":{"value":{"type":["number","null"]}},"required":["value"]}`
 	result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(input))

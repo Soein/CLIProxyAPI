@@ -4,9 +4,11 @@ package util
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -17,9 +19,12 @@ var gjsonPathKeyReplacer = strings.NewReplacer(".", "\\.", "*", "\\*", "?", "\\?
 const placeholderReasonDescription = "Brief explanation of why you are calling this tool"
 
 const (
-	maxInlineLocalRefDepth       = 24
-	maxInlineLocalRefNodes       = 512
-	maxInlineLocalRefOutputBytes = 64 << 10
+	maxInlineLocalRefInputBytes   = 256 << 10
+	maxInlineLocalRefDepth        = 24
+	maxInlineLocalRefNodes        = 512
+	maxInlineLocalRefOutputBytes  = 64 << 10
+	maxInlineLocalRefAllocItems   = maxInlineLocalRefNodes * 4
+	maxInlineLocalRefPointerBytes = 1024
 )
 
 // Pass a single JSON schema to the functions below — never a whole request document.
@@ -235,6 +240,9 @@ func inlineLocalRefs(jsonStr string) string {
 	if !strings.Contains(jsonStr, `"$ref"`) {
 		return jsonStr
 	}
+	if len(jsonStr) > maxInlineLocalRefInputBytes {
+		return `{"type":"object","description":"Local reference input limit exceeded"}`
+	}
 
 	decoder := json.NewDecoder(strings.NewReader(jsonStr))
 	decoder.UseNumber()
@@ -244,27 +252,32 @@ func inlineLocalRefs(jsonStr string) string {
 	}
 
 	resolver := localRefResolver{
-		maxDepth: maxInlineLocalRefDepth,
-		maxNodes: maxInlineLocalRefNodes,
+		maxDepth:      maxInlineLocalRefDepth,
+		maxNodes:      maxInlineLocalRefNodes,
+		maxAllocItems: maxInlineLocalRefAllocItems,
+		maxBytes:      maxInlineLocalRefOutputBytes,
 	}
 	resolved, ok := resolver.resolve(root, root, make(map[string]bool), 0)
 	if !ok {
 		resolved = compactLocalRefFallback(root)
 	}
+	// estimatedBytes is deliberately conservative, so json.Marshal cannot allocate a result above
+	// the output cap on the successful resolver path.
 	out, err := json.Marshal(resolved)
 	if err != nil || len(out) > maxInlineLocalRefOutputBytes {
-		out, err = json.Marshal(compactLocalRefFallback(root))
-		if err != nil || len(out) > maxInlineLocalRefOutputBytes {
-			return `{"type":"object","description":"Local reference expansion limit exceeded"}`
-		}
+		return marshalCompactLocalRefFallback(root)
 	}
 	return string(out)
 }
 
 type localRefResolver struct {
-	maxDepth int
-	maxNodes int
-	nodes    int
+	maxDepth       int
+	maxNodes       int
+	maxAllocItems  int
+	maxBytes       int
+	nodes          int
+	allocItems     int
+	estimatedBytes int
 }
 
 func (r *localRefResolver) resolve(root, value any, active map[string]bool, depth int) (any, bool) {
@@ -274,9 +287,12 @@ func (r *localRefResolver) resolve(root, value any, active map[string]bool, dept
 	if depth > r.maxDepth {
 		return nil, false
 	}
+	if !r.reserveNode() {
+		return nil, false
+	}
 	switch node := value.(type) {
 	case []any:
-		if !r.reserveNode() {
+		if !r.preflightContainerLength(len(node)) || !r.commitContainer(len(node), arrayStructuralBytes(len(node))) {
 			return nil, false
 		}
 		out := make([]any, len(node))
@@ -289,110 +305,107 @@ func (r *localRefResolver) resolve(root, value any, active map[string]bool, dept
 		}
 		return out, true
 	case map[string]any:
-		if !r.reserveNode() {
+		if !r.preflightContainerLength(retainedMapEntries(node, false)) {
 			return nil, false
 		}
 		ref, hasRef := node["$ref"].(string)
-		if hasRef && strings.HasPrefix(ref, "#/") {
+		if hasRef && len(ref) <= maxInlineLocalRefPointerBytes && strings.HasPrefix(ref, "#/") {
 			if target, ok := resolveJSONPointer(root, ref); ok {
 				if active[ref] {
-					return cyclicRefFallback(node, target, ref), true
+					hint, okHint := r.typedLocalRefHint(target, ref)
+					if !okHint {
+						return nil, false
+					}
+					siblings, okSiblings := r.resolveMapEntries(root, node, active, depth, true)
+					if !okSiblings {
+						return nil, false
+					}
+					if len(siblings) == 0 {
+						return hint, true
+					}
+					return r.mergeRefSchemaMaps(hint, siblings)
 				}
 				active[ref] = true
 				resolvedTarget, okResolved := r.resolve(root, target, active, depth+1)
 				delete(active, ref)
 				if !okResolved {
-					return cyclicRefFallback(node, target, ref), true
+					return nil, false
 				}
 				if targetMap, okTarget := resolvedTarget.(map[string]any); okTarget {
-					siblings := make(map[string]any, len(node)-1)
-					for key, item := range node {
-						if key == "$ref" || isLocalDefinitionContainer(key) {
-							continue
-						}
-						resolved, okResolved := r.resolve(root, item, active, depth+1)
-						if !okResolved {
-							return cyclicRefFallback(node, target, ref), true
-						}
-						siblings[key] = resolved
+					siblings, okSiblings := r.resolveMapEntries(root, node, active, depth, true)
+					if !okSiblings {
+						return nil, false
 					}
-					return mergeRefSchemaMaps(targetMap, siblings), true
+					if len(siblings) == 0 {
+						return targetMap, true
+					}
+					return r.mergeRefSchemaMaps(targetMap, siblings)
 				}
 			}
 		}
-
-		out := make(map[string]any, len(node))
-		for key, item := range node {
-			if isLocalDefinitionContainer(key) {
-				continue
-			}
-			resolved, ok := r.resolve(root, item, active, depth+1)
-			if !ok {
-				return nil, false
-			}
-			out[key] = resolved
-		}
-		return out, true
+		return r.resolveMapEntries(root, node, active, depth, false)
 	default:
+		if !r.reserveBytes(scalarJSONSize(node)) {
+			return nil, false
+		}
 		return value, true
 	}
 }
 
 func compactLocalRefFallback(root any) map[string]any {
-	ref, target, ok := findLocalRef(root, root, 0, new(int))
-	if !ok {
-		return map[string]any{
-			"type":        "object",
-			"description": "Local reference expansion limit exceeded",
+	typeName := boundedSchemaType(root)
+	description := "Local reference expansion limit exceeded"
+	if rootMap, ok := root.(map[string]any); ok {
+		if ref, okRef := rootMap["$ref"].(string); okRef && len(ref) <= maxInlineLocalRefPointerBytes && strings.HasPrefix(ref, "#/") {
+			if target, found := resolveJSONPointer(root, ref); found {
+				typeName = boundedSchemaType(target)
+				description = "See: " + boundedRefName(ref)
+			}
 		}
 	}
-
-	fallback := cyclicRefFallback(nil, target, ref)
-	// The target description may itself be what exceeded the output budget. Keep the existing
-	// typed-reference hint, but discard all unbounded text and sibling constraints on this final
-	// safety path.
-	fallback["description"] = "See: " + refName(ref)
-	return fallback
+	return map[string]any{"type": typeName, "description": description}
 }
 
-func findLocalRef(root, value any, depth int, nodes *int) (string, any, bool) {
-	if depth > maxInlineLocalRefDepth || nodes == nil || *nodes >= maxInlineLocalRefNodes {
-		return "", nil, false
+func marshalCompactLocalRefFallback(root any) string {
+	out, err := json.Marshal(compactLocalRefFallback(root))
+	if err != nil {
+		return `{"type":"object","description":"Local reference expansion limit exceeded"}`
 	}
-	*nodes++
-
-	switch node := value.(type) {
-	case []any:
-		for _, item := range node {
-			if ref, target, ok := findLocalRef(root, item, depth+1, nodes); ok {
-				return ref, target, true
-			}
-		}
-	case map[string]any:
-		if ref, ok := node["$ref"].(string); ok && strings.HasPrefix(ref, "#/") {
-			if target, found := resolveJSONPointer(root, ref); found {
-				return ref, target, true
-			}
-		}
-		keys := make([]string, 0, len(node))
-		for key := range node {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			if ref, target, ok := findLocalRef(root, node[key], depth+1, nodes); ok {
-				return ref, target, true
-			}
-		}
-	}
-	return "", nil, false
+	return string(out)
 }
 
 func isLocalDefinitionContainer(key string) bool {
 	return key == "$defs" || key == "definitions"
 }
 
-func mergeRefSchemaMaps(base, sibling map[string]any) map[string]any {
+func (r *localRefResolver) resolveMapEntries(root any, node map[string]any, active map[string]bool, depth int, skipRef bool) (map[string]any, bool) {
+	count := retainedMapEntries(node, skipRef)
+	if !r.preflightContainerLength(count) {
+		return nil, false
+	}
+	structuralBytes := objectStructuralBytes(node, skipRef)
+	if !r.commitContainer(count, structuralBytes) {
+		return nil, false
+	}
+
+	out := make(map[string]any, count)
+	for key, item := range node {
+		if isLocalDefinitionContainer(key) || (skipRef && key == "$ref") {
+			continue
+		}
+		resolved, ok := r.resolve(root, item, active, depth+1)
+		if !ok {
+			return nil, false
+		}
+		out[key] = resolved
+	}
+	return out, true
+}
+
+func (r *localRefResolver) mergeRefSchemaMaps(base, sibling map[string]any) (map[string]any, bool) {
+	if !r.reserveAllocation(len(base) + len(sibling)) {
+		return nil, false
+	}
 	out := make(map[string]any, len(base)+len(sibling))
 	for key, value := range base {
 		if isLocalDefinitionContainer(key) {
@@ -401,45 +414,167 @@ func mergeRefSchemaMaps(base, sibling map[string]any) map[string]any {
 		out[key] = value
 	}
 	for key, value := range sibling {
+		baseValue, exists := out[key]
+		if !exists {
+			out[key] = value
+			continue
+		}
 		switch key {
 		case "properties":
-			baseProperties, baseOK := out[key].(map[string]any)
+			baseProperties, baseOK := baseValue.(map[string]any)
 			siblingProperties, siblingOK := value.(map[string]any)
 			if baseOK && siblingOK {
-				out[key] = mergeRefProperties(baseProperties, siblingProperties)
+				merged, ok := r.mergeRefProperties(baseProperties, siblingProperties)
+				if !ok {
+					return nil, false
+				}
+				out[key] = merged
 				continue
 			}
 		case "required":
-			baseRequired, _ := out[key].([]any)
+			baseRequired, _ := baseValue.([]any)
 			siblingRequired, siblingOK := value.([]any)
 			if siblingOK {
-				out[key] = stableRequiredUnion(baseRequired, siblingRequired)
+				merged, ok := r.stableRequiredUnion(baseRequired, siblingRequired)
+				if !ok {
+					return nil, false
+				}
+				out[key] = merged
+				continue
+			}
+		case "items":
+			baseSchema, baseOK := baseValue.(map[string]any)
+			siblingSchema, siblingOK := value.(map[string]any)
+			if baseOK && siblingOK {
+				merged, ok := r.mergeRefSchemaMaps(baseSchema, siblingSchema)
+				if !ok {
+					return nil, false
+				}
+				out[key] = merged
+				continue
+			}
+		case "additionalProperties":
+			baseSchema, baseOK := baseValue.(map[string]any)
+			siblingSchema, siblingOK := value.(map[string]any)
+			if baseOK && siblingOK {
+				merged, ok := r.mergeRefSchemaMaps(baseSchema, siblingSchema)
+				if !ok {
+					return nil, false
+				}
+				out[key] = merged
+				continue
+			}
+			baseBool, baseBoolOK := baseValue.(bool)
+			siblingBool, siblingBoolOK := value.(bool)
+			if baseBoolOK && siblingBoolOK {
+				out[key] = baseBool && siblingBool
+				continue
+			}
+		case "enum":
+			baseEnum, baseOK := baseValue.([]any)
+			siblingEnum, siblingOK := value.([]any)
+			if baseOK && siblingOK {
+				intersection, ok := r.intersectSchemaEnums(baseEnum, siblingEnum)
+				if !ok {
+					return nil, false
+				}
+				out[key] = intersection
+				continue
+			}
+		case "const", "type":
+			if !schemaValuesEqual(baseValue, value) {
+				markImpossibleSchema(out)
+				continue
+			}
+		case "minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties":
+			if stricter, ok := stricterNumericConstraint(baseValue, value, true); ok {
+				out[key] = stricter
+				continue
+			}
+		case "maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxProperties":
+			if stricter, ok := stricterNumericConstraint(baseValue, value, false); ok {
+				out[key] = stricter
+				continue
+			}
+		case "uniqueItems":
+			baseBool, baseOK := baseValue.(bool)
+			siblingBool, siblingOK := value.(bool)
+			if baseOK && siblingOK {
+				out[key] = baseBool || siblingBool
+				continue
+			}
+		case "nullable":
+			baseBool, baseOK := baseValue.(bool)
+			siblingBool, siblingOK := value.(bool)
+			if baseOK && siblingOK {
+				out[key] = baseBool && siblingBool
+				continue
+			}
+		case "description":
+			baseDescription, baseOK := baseValue.(string)
+			siblingDescription, siblingOK := value.(string)
+			if baseOK && siblingOK {
+				out[key] = mergeHint(baseDescription, siblingDescription)
 				continue
 			}
 		}
-		out[key] = value
+		if schemaValuesEqual(baseValue, value) {
+			continue
+		}
+		// Unknown same-name schema constraints stay conjunctive instead of silently replacing the
+		// referenced constraint. Gemini cleanup later projects unsupported constraints to hints.
+		if !r.appendAllOfConstraint(out, key, value) {
+			return nil, false
+		}
 	}
-	return out
+	return out, true
 }
 
-func mergeRefProperties(base, sibling map[string]any) map[string]any {
+func (r *localRefResolver) mergeRefProperties(base, sibling map[string]any) (map[string]any, bool) {
+	if !r.reserveAllocation(len(base) + len(sibling)) {
+		return nil, false
+	}
 	out := make(map[string]any, len(base)+len(sibling))
 	for key, value := range base {
 		out[key] = value
 	}
 	for key, value := range sibling {
-		baseSchema, baseOK := out[key].(map[string]any)
-		siblingSchema, siblingOK := value.(map[string]any)
-		if baseOK && siblingOK {
-			out[key] = mergeRefSchemaMaps(baseSchema, siblingSchema)
+		baseValue, exists := out[key]
+		if !exists {
+			out[key] = value
 			continue
 		}
-		out[key] = value
+		baseSchema, baseOK := baseValue.(map[string]any)
+		siblingSchema, siblingOK := value.(map[string]any)
+		if baseOK && siblingOK {
+			merged, ok := r.mergeRefSchemaMaps(baseSchema, siblingSchema)
+			if !ok {
+				return nil, false
+			}
+			out[key] = merged
+			continue
+		}
+		if baseBool, baseBoolOK := baseValue.(bool); baseBoolOK {
+			if siblingBool, siblingBoolOK := value.(bool); siblingBoolOK {
+				out[key] = baseBool && siblingBool
+				continue
+			}
+		}
+		if !schemaValuesEqual(baseValue, value) {
+			impossible, ok := r.impossibleSchema()
+			if !ok {
+				return nil, false
+			}
+			out[key] = impossible
+		}
 	}
-	return out
+	return out, true
 }
 
-func stableRequiredUnion(base, sibling []any) []any {
+func (r *localRefResolver) stableRequiredUnion(base, sibling []any) ([]any, bool) {
+	if !r.reserveAllocation(len(base)*2 + len(sibling)*2) {
+		return nil, false
+	}
 	out := make([]any, 0, len(base)+len(sibling))
 	seen := make(map[string]struct{}, len(base)+len(sibling))
 	appendRequired := func(values []any) {
@@ -458,7 +593,7 @@ func stableRequiredUnion(base, sibling []any) []any {
 	}
 	appendRequired(base)
 	appendRequired(sibling)
-	return out
+	return out, true
 }
 
 func (r *localRefResolver) reserveNode() bool {
@@ -467,6 +602,266 @@ func (r *localRefResolver) reserveNode() bool {
 	}
 	r.nodes++
 	return r.nodes <= r.maxNodes
+}
+
+func (r *localRefResolver) preflightContainerLength(items int) bool {
+	if r == nil {
+		return true
+	}
+	return items >= 0 && items <= r.maxNodes-r.nodes && items <= r.maxAllocItems-r.allocItems
+}
+
+func (r *localRefResolver) commitContainer(items, structuralBytes int) bool {
+	return r.reserveAllocation(items) && r.reserveBytes(structuralBytes)
+}
+
+func (r *localRefResolver) reserveAllocation(items int) bool {
+	if r == nil {
+		return true
+	}
+	if items < 0 || items > r.maxAllocItems-r.allocItems {
+		return false
+	}
+	r.allocItems += items
+	return true
+}
+
+func (r *localRefResolver) reserveBytes(size int) bool {
+	if r == nil {
+		return true
+	}
+	if size < 0 || size > r.maxBytes-r.estimatedBytes {
+		return false
+	}
+	r.estimatedBytes += size
+	return true
+}
+
+func (r *localRefResolver) typedLocalRefHint(target any, ref string) (map[string]any, bool) {
+	typeName := boundedSchemaType(target)
+	description := "See: " + boundedRefName(ref)
+	structuralBytes := 2 + jsonStringEncodedLen("type") + 1 + jsonStringEncodedLen(typeName) + 1 +
+		jsonStringEncodedLen("description") + 1 + jsonStringEncodedLen(description)
+	if !r.preflightContainerLength(2) || !r.commitContainer(2, structuralBytes) || !r.reserveNode() || !r.reserveBytes(scalarJSONSize(typeName)) ||
+		!r.reserveNode() || !r.reserveBytes(scalarJSONSize(description)) {
+		return nil, false
+	}
+	return map[string]any{"type": typeName, "description": description}, true
+}
+
+func (r *localRefResolver) intersectSchemaEnums(base, sibling []any) ([]any, bool) {
+	if !r.reserveAllocation(len(base)) {
+		return nil, false
+	}
+	out := make([]any, 0, len(base))
+	for _, baseValue := range base {
+		for _, siblingValue := range sibling {
+			if schemaValuesEqual(baseValue, siblingValue) {
+				out = append(out, baseValue)
+				break
+			}
+		}
+	}
+	return out, true
+}
+
+func (r *localRefResolver) appendAllOfConstraint(schema map[string]any, key string, value any) bool {
+	allOf, _ := schema["allOf"].([]any)
+	if !r.reserveAllocation(2) || !r.reserveBytes(jsonStringEncodedLen("allOf")+jsonStringEncodedLen(key)+16) {
+		return false
+	}
+	constraint := make(map[string]any, 1)
+	constraint[key] = value
+	allOf = append(allOf, constraint)
+	schema["allOf"] = allOf
+	return true
+}
+
+func (r *localRefResolver) impossibleSchema() (map[string]any, bool) {
+	structuralBytes := 2 + jsonStringEncodedLen("enum") + 1 + 2
+	if !r.reserveNode() || !r.preflightContainerLength(1) || !r.commitContainer(1, structuralBytes) {
+		return nil, false
+	}
+	return map[string]any{"enum": []any{}}, true
+}
+
+func markImpossibleSchema(schema map[string]any) {
+	delete(schema, "const")
+	schema["enum"] = []any{}
+}
+
+func stricterNumericConstraint(base, sibling any, chooseGreater bool) (any, bool) {
+	baseNumber, baseOK := base.(json.Number)
+	siblingNumber, siblingOK := sibling.(json.Number)
+	if !baseOK || !siblingOK {
+		return nil, false
+	}
+	if len(baseNumber.String()) > 128 || len(siblingNumber.String()) > 128 {
+		return nil, false
+	}
+	baseRat, baseOK := new(big.Rat).SetString(baseNumber.String())
+	siblingRat, siblingOK := new(big.Rat).SetString(siblingNumber.String())
+	if !baseOK || !siblingOK {
+		return nil, false
+	}
+	comparison := siblingRat.Cmp(baseRat)
+	if (chooseGreater && comparison > 0) || (!chooseGreater && comparison < 0) {
+		return sibling, true
+	}
+	return base, true
+}
+
+func schemaValuesEqual(left, right any) bool {
+	switch leftValue := left.(type) {
+	case nil:
+		return right == nil
+	case bool:
+		rightValue, ok := right.(bool)
+		return ok && leftValue == rightValue
+	case string:
+		rightValue, ok := right.(string)
+		return ok && leftValue == rightValue
+	case json.Number:
+		rightValue, ok := right.(json.Number)
+		return ok && leftValue.String() == rightValue.String()
+	case []any:
+		rightValue, ok := right.([]any)
+		if !ok || len(leftValue) != len(rightValue) {
+			return false
+		}
+		for i := range leftValue {
+			if !schemaValuesEqual(leftValue[i], rightValue[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		rightValue, ok := right.(map[string]any)
+		if !ok || len(leftValue) != len(rightValue) {
+			return false
+		}
+		for key, value := range leftValue {
+			rightEntry, exists := rightValue[key]
+			if !exists || !schemaValuesEqual(value, rightEntry) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func retainedMapEntries(node map[string]any, skipRef bool) int {
+	count := len(node)
+	if _, exists := node["$defs"]; exists {
+		count--
+	}
+	if _, exists := node["definitions"]; exists {
+		count--
+	}
+	if skipRef {
+		if _, exists := node["$ref"]; exists {
+			count--
+		}
+	}
+	return count
+}
+
+func objectStructuralBytes(node map[string]any, skipRef bool) int {
+	size := 2
+	entries := 0
+	for key := range node {
+		if isLocalDefinitionContainer(key) || (skipRef && key == "$ref") {
+			continue
+		}
+		if entries > 0 {
+			size++
+		}
+		size += jsonStringEncodedLen(key) + 1
+		entries++
+	}
+	return size
+}
+
+func arrayStructuralBytes(length int) int {
+	if length <= 0 {
+		return 2
+	}
+	return length + 1
+}
+
+func scalarJSONSize(value any) int {
+	switch scalar := value.(type) {
+	case nil:
+		return 4
+	case bool:
+		if scalar {
+			return 4
+		}
+		return 5
+	case string:
+		return jsonStringEncodedLen(scalar)
+	case json.Number:
+		return len(scalar.String())
+	default:
+		return maxInlineLocalRefOutputBytes + 1
+	}
+}
+
+func jsonStringEncodedLen(value string) int {
+	// encoding/json escapes control bytes, HTML-sensitive ASCII, and U+2028/U+2029. Counting
+	// without constructing the quoted form keeps the byte budget ahead of large allocations.
+	size := 2
+	for i := 0; i < len(value); {
+		char := value[i]
+		if char < 0x80 {
+			switch char {
+			case '\\', '"', '\n', '\r', '\t', '\b', '\f':
+				size += 2
+			case '<', '>', '&':
+				size += 6
+			default:
+				if char < 0x20 {
+					size += 6
+				} else {
+					size++
+				}
+			}
+			i++
+			continue
+		}
+		runeValue, width := utf8.DecodeRuneInString(value[i:])
+		if width == 1 {
+			size += 6
+		} else if runeValue == '\u2028' || runeValue == '\u2029' {
+			size += 6
+		} else {
+			size += width
+		}
+		i += width
+	}
+	return size
+}
+
+func boundedSchemaType(target any) string {
+	if targetMap, ok := target.(map[string]any); ok {
+		if typeName, okType := targetMap["type"].(string); okType {
+			switch typeName {
+			case "array", "boolean", "integer", "number", "object", "string":
+				return typeName
+			}
+		}
+	}
+	return "object"
+}
+
+func boundedRefName(ref string) string {
+	name := refName(ref)
+	if len(name) > 128 {
+		return "local schema"
+	}
+	return name
 }
 
 func resolveJSONPointer(root any, ref string) (any, bool) {
@@ -491,30 +886,6 @@ func resolveJSONPointer(root any, ref string) (any, bool) {
 		}
 	}
 	return current, true
-}
-
-func cyclicRefFallback(node map[string]any, target any, ref string) map[string]any {
-	out := make(map[string]any, len(node)+2)
-	if targetMap, ok := target.(map[string]any); ok {
-		for _, key := range []string{"type", "nullable", "description"} {
-			if value, exists := targetMap[key]; exists {
-				out[key] = value
-			}
-		}
-	}
-	for key, value := range node {
-		if key != "$ref" && !isLocalDefinitionContainer(key) {
-			out[key] = value
-		}
-	}
-	name := refName(ref)
-	hint := "See: " + name
-	if description, _ := out["description"].(string); description != "" {
-		out["description"] = mergeHint(description, hint)
-	} else {
-		out["description"] = hint
-	}
-	return out
 }
 
 func refName(ref string) string {
@@ -576,8 +947,9 @@ func convertEnumValuesToStrings(jsonStr string, forceStringType bool) string {
 			continue
 		}
 
-		var stringVals []string
-		for _, item := range arr.Array() {
+		items := arr.Array()
+		stringVals := make([]string, 0, len(items))
+		for _, item := range items {
 			stringVals = append(stringVals, item.String())
 		}
 
@@ -759,6 +1131,11 @@ func mergeAllOf(jsonStr string) string {
 					jsonStr = string(updated)
 				case "if", "then", "else", "allOf":
 					// Conditional applicability cannot be represented by the upstream schema.
+				case "description":
+					destination := descriptionPath(parentPath)
+					merged := mergeHint(gjson.Get(jsonStr, destination).String(), value.String())
+					updated, _ := sjson.SetBytes([]byte(jsonStr), destination, merged)
+					jsonStr = string(updated)
 				default:
 					destination := joinPath(parentPath, escapeGJSONPathKey(field))
 					jsonStr = mergeMissingSchemaAtPath(jsonStr, destination, value)
