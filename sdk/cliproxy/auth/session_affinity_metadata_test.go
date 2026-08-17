@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,118 @@ import (
 type failExecutor struct {
 	provider string
 	calls    atomic.Int32
+}
+
+func TestSessionAffinityXAIOnResultUsesPickedKeys(t *testing.T) {
+	tests := []struct {
+		name         string
+		opts         cliproxyexecutor.Options
+		wantFallback bool
+	}{
+		{
+			name: "execution session",
+			opts: cliproxyexecutor.Options{Metadata: map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey: "execution-session",
+			}},
+		},
+		{
+			name:         "caller scoped prompt cache key",
+			wantFallback: true,
+			opts: cliproxyexecutor.Options{
+				SourceFormat:    "openai-response",
+				OriginalRequest: []byte(`{"prompt_cache_key":"shared-prompt","conversation":{"id":"conversation-alias"}}`),
+				Metadata: map[string]any{
+					cliproxyexecutor.CallerScopeMetadataKey: "irreversible-caller-scope",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{TTL: time.Hour})
+			defer affinity.Stop()
+			auth := &Auth{ID: "xai-auth", Provider: "xai", Status: StatusActive}
+
+			selected, errPick := affinity.Pick(context.Background(), "xai", "grok-model", tt.opts, []*Auth{auth})
+			if errPick != nil {
+				t.Fatalf("Pick() error = %v", errPick)
+			}
+			if selected.ID != auth.ID {
+				t.Fatalf("Pick() auth = %q, want %q", selected.ID, auth.ID)
+			}
+			primaryKey, _ := tt.opts.Metadata["session_affinity_primary_key"].(string)
+			if !strings.HasPrefix(primaryKey, "xai::") {
+				t.Fatalf("propagated primary key = %q, want xai key", primaryKey)
+			}
+			fallbackKey, _ := tt.opts.Metadata["session_affinity_fallback_key"].(string)
+			if tt.wantFallback && !strings.HasPrefix(fallbackKey, "xai::") {
+				t.Fatalf("propagated fallback key = %q, want xai key", fallbackKey)
+			}
+
+			affinity.cache.mu.RLock()
+			before := affinity.cache.entries[primaryKey].expiresAt
+			affinity.cache.mu.RUnlock()
+			time.Sleep(time.Millisecond)
+			affinity.OnResult(Result{AuthID: auth.ID, Provider: "xai", Model: "grok-model", Success: true, Options: tt.opts})
+			affinity.cache.mu.RLock()
+			after := affinity.cache.entries[primaryKey].expiresAt
+			affinity.cache.mu.RUnlock()
+			if !after.After(before) {
+				t.Fatalf("success did not touch picked binding: before=%v after=%v", before, after)
+			}
+
+			affinity.OnResult(Result{
+				AuthID: auth.ID, Provider: "xai", Model: "grok-model", Success: false,
+				Error: &Error{HTTPStatus: http.StatusInternalServerError, Message: "failed"}, Options: tt.opts,
+			})
+			if _, ok := affinity.cache.Get(primaryKey); ok {
+				t.Fatalf("failure did not remove picked binding %q", primaryKey)
+			}
+			if fallbackKey != "" {
+				if _, ok := affinity.cache.Get(fallbackKey); ok {
+					t.Fatalf("failure did not remove picked fallback binding %q", fallbackKey)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionAffinityExplicitSessionIsCallerScoped(t *testing.T) {
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &RoundRobinSelector{}, TTL: time.Hour})
+	defer affinity.Stop()
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "claude", Status: StatusActive},
+		{ID: "auth-b", Provider: "claude", Status: StatusActive},
+	}
+	pick := func(scope string) string {
+		opts := cliproxyexecutor.Options{
+			Headers:  http.Header{"X-Session-Id": {"shared-session"}},
+			Metadata: map[string]any{},
+		}
+		if scope != "" {
+			opts.Metadata[cliproxyexecutor.CallerScopeMetadataKey] = scope
+		}
+		selected, errPick := affinity.Pick(context.Background(), "claude", "claude-model", opts, auths)
+		if errPick != nil {
+			t.Fatalf("Pick(%q) error = %v", scope, errPick)
+		}
+		return selected.ID
+	}
+
+	callerA := pick("caller-a")
+	callerB := pick("caller-b")
+	if callerA == callerB {
+		t.Fatalf("different caller scopes shared explicit-session auth %q", callerA)
+	}
+	if got := pick("caller-a"); got != callerA {
+		t.Fatalf("caller A binding changed from %q to %q", callerA, got)
+	}
+
+	unscopedFirst := pick("")
+	if got := pick(""); got != unscopedFirst {
+		t.Fatalf("trusted empty-scope binding changed from %q to %q", unscopedFirst, got)
+	}
 }
 
 func (e *failExecutor) Identifier() string { return e.provider }

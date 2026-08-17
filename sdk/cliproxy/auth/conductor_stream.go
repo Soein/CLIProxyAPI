@@ -309,16 +309,15 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.CredentialScope = true
 			}
 			applyRequestScopedActionToResult(action, okAction, &result)
+			if !okAction && !isRequestInvalidError(errStream) && !result.CredentialScope && idx < len(execModels)-1 {
+				result = withIntermediateSessionAffinityResult(result)
+			}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			if okAction {
 				if isRequestScopedStop(action, okAction) {
 					return nil, wrapRequestStopError(errStream)
 				}
-				lastErr = errStream
-				if result.CredentialScope {
-					return nil, errStream
-				}
-				continue
+				return nil, errStream
 			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
@@ -408,11 +407,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if isRequestScopedStop(action, okAction) {
 					return nil, wrapRequestStopError(bootstrapErr)
 				}
-				lastErr = bootstrapErr
-				if result.CredentialScope {
-					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
-				}
-				continue
+				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := resultErrorFromError(bootstrapErr)
@@ -431,6 +426,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				if isCredentialScopedError(bootstrapErr) {
 					result.CredentialScope = true
+				}
+				if !result.CredentialScope {
+					result = withIntermediateSessionAffinityResult(result)
 				}
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 				discardStreamChunks(streamResult.Chunks)
@@ -455,6 +453,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			releaseDispatch()
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
+			if idx < len(execModels)-1 {
+				result = withIntermediateSessionAffinityResult(result)
+			}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr

@@ -9,6 +9,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -217,6 +218,52 @@ func TestRequestScopedErrors_ActionStopAndCooldown(t *testing.T) {
 	a1, ok1 := m.GetByID("auth-claude-stop-cool")
 	if !ok1 || !a1.Unavailable || a1.NextRetryAfter.IsZero() {
 		t.Fatalf("expected auth1 to be in cooldown, got unavailable=%v, nextRetry=%v", a1.Unavailable, a1.NextRetryAfter)
+	}
+}
+
+func TestRequestScopedErrors_HomeStopActionsReturnOriginalErrorAndReportOutcome(t *testing.T) {
+	tests := []struct {
+		action   string
+		wantCode string
+	}{
+		{action: RequestScopedActionStop, wantCode: ErrorCodeRequestScoped},
+		{action: RequestScopedActionStopAndCooldown, wantCode: ErrorCodeForceCooldown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.action, func(t *testing.T) {
+			sentinel := &customStatusError{code: http.StatusBadRequest, msg: "home_request_failure"}
+			dispatcher := &homePerSelectionDispatcher{auths: []Auth{
+				{
+					ID: "home-stop-auth-a", Provider: "claude", Status: StatusActive,
+					Metadata: map[string]any{"request_scoped_errors": []internalconfig.RequestScopedErrorRule{{
+						Status: http.StatusBadRequest, Match: []string{"home_request_failure"}, Action: tt.action,
+					}}},
+				},
+				{ID: "home-stop-auth-b", Provider: "claude", Status: StatusActive},
+			}}
+			hook := &resultCaptureHook{}
+			manager := NewManager(nil, nil, hook)
+			manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+			manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
+			manager.RegisterExecutor(&mockCustomErrorExecutor{
+				identifier: "claude",
+				executeFn: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					return cliproxyexecutor.Response{}, sentinel
+				},
+			})
+
+			_, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "claude-model"}, cliproxyexecutor.Options{})
+			if errExecute != sentinel {
+				t.Fatalf("Execute() error = %v, want original error %v", errExecute, sentinel)
+			}
+			if got := dispatcher.calls.Load(); got != 1 {
+				t.Fatalf("Home dispatch calls = %d, want 1", got)
+			}
+			results := hook.Results()
+			if len(results) != 1 || results[0].Success || results[0].Error == nil || results[0].Error.Code != tt.wantCode {
+				t.Fatalf("Home results = %+v, want one failure with code %q", results, tt.wantCode)
+			}
+		})
 	}
 }
 

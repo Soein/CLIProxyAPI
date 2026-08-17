@@ -346,7 +346,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		var authErr error
 		didRefreshOnUnauthorized := false
-		for _, upstreamModel := range models {
+		for modelIndex, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
@@ -402,16 +402,16 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
+				if !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1 {
+					result = withIntermediateSessionAffinityResult(result)
+				}
 				m.MarkResult(execCtx, result)
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
 						return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 					}
 					authErr = errExec
-					if result.CredentialScope {
-						break
-					}
-					continue
+					break
 				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
@@ -515,7 +515,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		var authErr error
 		didRefreshOnUnauthorized := false
-		for _, upstreamModel := range models {
+		for modelIndex, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
@@ -566,8 +566,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				if isCredentialScopedError(errExec) {
+					result.CredentialScope = true
+				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
+				if !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1 {
+					result = withIntermediateSessionAffinityResult(result)
+				}
 				// Some Anthropic-compatible upstreams do not implement the
 				// count_tokens route and return a generic endpoint 404. Record
 				// the failure for hooks and metrics without suspending a model
@@ -575,9 +581,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
-					if isCredentialScopedError(errExec) {
-						result.CredentialScope = true
-					}
 					m.MarkResult(execCtx, result)
 				}
 				if okAction {
@@ -585,10 +588,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 					}
 					authErr = errExec
-					if result.CredentialScope {
-						break
-					}
-					continue
+					break
 				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
@@ -838,6 +838,12 @@ func cloneRequestMetadata(src map[string]any) map[string]any {
 		dst[k] = v
 	}
 	return dst
+}
+
+func withIntermediateSessionAffinityResult(result Result) Result {
+	result.Options.Metadata = cloneRequestMetadata(result.Options.Metadata)
+	result.Options.Metadata[sessionAffinityIntermediateMetadataKey] = true
+	return result
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {

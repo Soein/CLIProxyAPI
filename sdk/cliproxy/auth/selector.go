@@ -632,6 +632,12 @@ type SessionAffinityConfig struct {
 	TTL      time.Duration
 }
 
+const (
+	sessionAffinityPrimaryKeyMetadataKey   = "session_affinity_primary_key"
+	sessionAffinityFallbackKeyMetadataKey  = "session_affinity_fallback_key"
+	sessionAffinityIntermediateMetadataKey = "session_affinity_intermediate"
+)
+
 // NewSessionAffinitySelector creates a new session-aware selector.
 func NewSessionAffinitySelector(fallback Selector) *SessionAffinitySelector {
 	return NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -679,6 +685,8 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
 	}
+	delete(opts.Metadata, sessionAffinityPrimaryKeyMetadataKey)
+	delete(opts.Metadata, sessionAffinityFallbackKeyMetadataKey)
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 	primaryID, fallbackID := extractSessionIDsForProvider(ctx, provider, opts)
@@ -710,6 +718,10 @@ func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model stri
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+	}
+	opts.Metadata[sessionAffinityPrimaryKeyMetadataKey] = cacheKey
+	if fallbackKey != "" {
+		opts.Metadata[sessionAffinityFallbackKeyMetadataKey] = fallbackKey
 	}
 	unlock := s.lockSessionKeys(cacheKey, fallbackKey)
 	defer unlock()
@@ -857,24 +869,30 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || s.cache == nil || res.AuthID == "" {
 		return
 	}
-	primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
-	if primaryID == "" && fallbackID == "" {
+	if intermediate, _ := res.Options.Metadata[sessionAffinityIntermediateMetadataKey].(bool); intermediate {
 		return
 	}
+	cacheKey := metadataStringValue(res.Options.Metadata, sessionAffinityPrimaryKeyMetadataKey)
+	fallbackKey := metadataStringValue(res.Options.Metadata, sessionAffinityFallbackKeyMetadataKey)
+	if cacheKey == "" {
+		primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
+		if primaryID == "" && fallbackID == "" {
+			return
+		}
 
-	ns := res.Provider
-	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey].(string); ok && raw != "" {
-		ns = raw
-	}
-	nsModel := canonicalModelKey(res.Model)
-	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
-		nsModel = canonicalModelKey(raw)
-	}
+		ns := res.Provider
+		if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey].(string); ok && raw != "" {
+			ns = raw
+		}
+		nsModel := canonicalModelKey(res.Model)
+		if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
+			nsModel = canonicalModelKey(raw)
+		}
 
-	cacheKey := ns + "::" + primaryID + "::" + nsModel
-	var fallbackKey string
-	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+		cacheKey = ns + "::" + primaryID + "::" + nsModel
+		if fallbackID != "" && fallbackID != primaryID {
+			fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+		}
 	}
 	if res.Success {
 		s.cache.Touch(cacheKey, res.AuthID)
@@ -1019,27 +1037,33 @@ func extractExplicitSessionIDs(headers http.Header, payload []byte) (string, str
 }
 
 func extractSessionIDsForProvider(ctx context.Context, provider string, opts cliproxyexecutor.Options) (string, string) {
+	finalize := func(primaryID, fallbackID string) (string, string) {
+		return scopeAffinitySessionIDs(opts.Metadata, primaryID, fallbackID)
+	}
 	explicitPrimary, explicitFallback := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest)
 	if explicitPrimary != "" && !strings.HasPrefix(explicitPrimary, "pck:") {
-		return explicitPrimary, explicitFallback
+		return finalize(explicitPrimary, explicitFallback)
 	}
 	if !strings.EqualFold(strings.TrimSpace(provider), "xai") {
-		return extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+		return finalize(extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata))
 	}
 	if executionSessionID := metadataStringValue(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); executionSessionID != "" {
-		return "xai:exec:" + executionSessionID, ""
+		return finalize("xai:exec:"+executionSessionID, "")
 	}
 	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
 		promptCacheKey := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "prompt_cache_key").String())
-		callerScope := callerAPIKeyScope(ctx)
+		callerScope := metadataStringValue(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey)
+		if callerScope == "" {
+			callerScope = callerAPIKeyScope(ctx)
+		}
 		if promptCacheKey != "" && callerScope != "" {
 			digest := sha256.Sum256([]byte("cli-proxy-api:xai:prompt-cache-affinity\x00" + callerScope + "\x00" + promptCacheKey))
-			return fmt.Sprintf("xai:pck:%x", digest), explicitFallback
+			return finalize(fmt.Sprintf("xai:pck:%x", digest), explicitFallback)
 		}
 	}
 	if strings.HasPrefix(explicitPrimary, "pck:") {
 		if explicitFallback != "" {
-			return explicitFallback, ""
+			return finalize(explicitFallback, "")
 		}
 		return "", ""
 	}
@@ -1047,7 +1071,22 @@ func extractSessionIDsForProvider(ctx context.Context, provider string, opts cli
 	if strings.HasPrefix(primaryID, "pck:") {
 		return "", ""
 	}
-	return primaryID, fallbackID
+	return finalize(primaryID, fallbackID)
+}
+
+func scopeAffinitySessionIDs(metadata map[string]any, primaryID, fallbackID string) (string, string) {
+	callerScope := metadataStringValue(metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	if callerScope == "" || primaryID == "" {
+		return primaryID, fallbackID
+	}
+	scopeID := func(sessionID string) string {
+		if sessionID == "" {
+			return ""
+		}
+		digest := sha256.Sum256([]byte("cli-proxy-api:session-affinity-caller:v1\x00" + callerScope + "\x00" + sessionID))
+		return fmt.Sprintf("caller:%x", digest)
+	}
+	return scopeID(primaryID), scopeID(fallbackID)
 }
 
 func metadataStringValue(metadata map[string]any, key string) string {

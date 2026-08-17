@@ -191,10 +191,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 					selection.End("request_stopped")
 					return cliproxyexecutor.Response{}, wrapRequestStopError(errExecute)
 				}
-				if result.CredentialScope {
-					break
-				}
-				continue
+				break
 			}
 			if isRequestInvalidError(errExecute) {
 				releaseAttempt()
