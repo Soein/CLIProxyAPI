@@ -177,8 +177,8 @@ func TestResponsesWebsocketToolCacheKeyIsCallerScoped(t *testing.T) {
 		return ginContext
 	}
 
-	keyA := responsesWebsocketToolCacheSessionKey(newCallerContext("api-key-a"))
-	keyB := responsesWebsocketToolCacheSessionKey(newCallerContext("api-key-b"))
+	keyA := responsesWebsocketToolCacheSessionKey(newCallerContext("api-key-a"), "connection-a")
+	keyB := responsesWebsocketToolCacheSessionKey(newCallerContext("api-key-b"), "connection-b")
 	if keyA == keyB {
 		t.Fatal("different callers received the same websocket tool-cache key")
 	}
@@ -198,5 +198,25 @@ func TestResponsesWebsocketToolCacheKeyIsCallerScoped(t *testing.T) {
 	}
 	if got, ok := cache.get(keyB, "shared-call"); !ok || !bytes.Equal(got, itemB) {
 		t.Fatalf("caller-b cache entry = %s, ok=%v", got, ok)
+	}
+}
+
+func TestResponsesWebsocketToolCacheKeyFallsBackToConnectionScope(t *testing.T) {
+	newAnonymousContext := func(setEmptyPrincipal bool) *gin.Context {
+		ginContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ginContext.Request = httptest.NewRequest(http.MethodGet, "/v1/responses/ws", nil)
+		ginContext.Request.Header.Set("Session-Id", "shared-session")
+		if setEmptyPrincipal {
+			ginContext.Set("userApiKey", "")
+		}
+		return ginContext
+	}
+
+	for _, setEmptyPrincipal := range []bool{false, true} {
+		keyA := responsesWebsocketToolCacheSessionKey(newAnonymousContext(setEmptyPrincipal), "connection-a")
+		keyB := responsesWebsocketToolCacheSessionKey(newAnonymousContext(setEmptyPrincipal), "connection-b")
+		if keyA == keyB || keyA == "shared-session" || keyB == "shared-session" {
+			t.Fatalf("anonymous connection keys with empty principal %t = %q and %q", setEmptyPrincipal, keyA, keyB)
+		}
 	}
 }

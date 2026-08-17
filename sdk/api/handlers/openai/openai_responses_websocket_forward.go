@@ -21,8 +21,9 @@ import (
 )
 
 type responsesWebsocketForwardOptions struct {
-	toolCacheTurn *responsesWebsocketToolCacheTurn
-	suppressError func(*interfaces.ErrorMessage) bool
+	downstreamSessionKey string
+	toolCacheTurn        *responsesWebsocketToolCacheTurn
+	suppressError        func(*interfaces.ErrorMessage) bool
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -39,6 +40,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	downstreamSessionKey := strings.TrimSpace(opts.downstreamSessionKey)
 	toolCacheTurn := opts.toolCacheTurn
 	completed := false
 	completedOutput := []byte("[]")
@@ -46,11 +48,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	pendingToolCallIDs := make(map[string]struct{})
-	downstreamSessionKey := ""
-	if c != nil && c.Request != nil {
-		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
-	}
-
 	for {
 		select {
 		case <-c.Request.Context().Done():

@@ -251,17 +251,21 @@ func truncateWebsocketCloseReason(reason string, maxBytes int) string {
 	return truncated.String()
 }
 
-func responsesWebsocketToolCacheSessionKey(c *gin.Context) string {
+func responsesWebsocketToolCacheSessionKey(c *gin.Context, connectionID string) string {
 	if c == nil || c.Request == nil {
 		return ""
 	}
 
 	request := c.Request
+	callerScope := ""
 	if value, exists := c.Get("userApiKey"); exists && value != nil {
-		callerScope := coresession.CallerScope(fmt.Sprint(value))
-		if callerScope != "" {
-			request = request.WithContext(context.WithValue(request.Context(), responsesWebsocketCallerScopeContextKey{}, callerScope))
-		}
+		callerScope = coresession.CallerScope(fmt.Sprint(value))
+	}
+	if callerScope == "" {
+		callerScope = coresession.CallerScope("connection:" + strings.TrimSpace(connectionID))
+	}
+	if callerScope != "" {
+		request = request.WithContext(context.WithValue(request.Context(), responsesWebsocketCallerScopeContextKey{}, callerScope))
 	}
 	return websocketDownstreamSessionKey(request)
 }
@@ -277,7 +281,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	conn.SetReadLimit(responsesWebsocketMaxInboundMessageBytes)
 	writer := newResponsesWebsocketWriter(conn)
 	passthroughSessionID := uuid.NewString()
-	downstreamSessionKey := responsesWebsocketToolCacheSessionKey(c)
+	downstreamSessionKey := responsesWebsocketToolCacheSessionKey(c, passthroughSessionID)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
@@ -621,8 +625,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			wsTimelineLog,
 			passthroughSessionID,
 			responsesWebsocketForwardOptions{
-				toolCacheTurn: toolCacheTurn,
-				suppressError: replayPinnedAuthFailure,
+				downstreamSessionKey: downstreamSessionKey,
+				toolCacheTurn:        toolCacheTurn,
+				suppressError:        replayPinnedAuthFailure,
 			},
 		)
 		if errForward != nil {
