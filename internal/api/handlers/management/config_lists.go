@@ -36,6 +36,15 @@ func rejectInvalidCredentialWeight(c *gin.Context, field string, weight *int) bo
 	return false
 }
 
+func rejectInvalidRequestScopedErrors(c *gin.Context, field string, rules []config.RequestScopedErrorRule) bool {
+	if errValidate := config.ValidateRequestScopedErrorRules(rules); errValidate != nil {
+		message := strings.Replace(errValidate.Error(), "request-scoped-errors", field, 1)
+		c.JSON(400, gin.H{"error": message})
+		return true
+	}
+	return false
+}
+
 // Generic helpers for list[string]
 func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()) {
 	data, err := c.GetRawData()
@@ -170,6 +179,9 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 		if rejectInvalidCredentialWeight(c, fmt.Sprintf("gemini-api-key[%d].weight", index), arr[index].Weight) {
 			return
 		}
+		if rejectInvalidRequestScopedErrors(c, fmt.Sprintf("gemini-api-key[%d].request-scoped-errors", index), arr[index].RequestScopedErrors) {
+			return
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -196,6 +208,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value.RequestScopedErrors != nil && rejectInvalidRequestScopedErrors(c, "request-scoped-errors", *body.Value.RequestScopedErrors) {
 		return
 	}
 
@@ -351,6 +366,9 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 		if rejectInvalidCredentialWeight(c, fmt.Sprintf("interactions-api-key[%d].weight", index), arr[index].Weight) {
 			return
 		}
+		if rejectInvalidRequestScopedErrors(c, fmt.Sprintf("interactions-api-key[%d].request-scoped-errors", index), arr[index].RequestScopedErrors) {
+			return
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -378,6 +396,9 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	errBind := c.ShouldBindJSON(&body)
 	if errBind != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value.RequestScopedErrors != nil && rejectInvalidRequestScopedErrors(c, "request-scoped-errors", *body.Value.RequestScopedErrors) {
 		return
 	}
 
@@ -533,6 +554,9 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 		if rejectInvalidCredentialWeight(c, fmt.Sprintf("claude-api-key[%d].weight", i), arr[i].Weight) {
 			return
 		}
+		if rejectInvalidRequestScopedErrors(c, fmt.Sprintf("claude-api-key[%d].request-scoped-errors", i), arr[i].RequestScopedErrors) {
+			return
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -561,6 +585,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value.RequestScopedErrors != nil && rejectInvalidRequestScopedErrors(c, "request-scoped-errors", *body.Value.RequestScopedErrors) {
 		return
 	}
 
@@ -715,6 +742,9 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 				return
 			}
 		}
+		if rejectInvalidRequestScopedErrors(c, fmt.Sprintf("openai-compatibility[%d].request-scoped-errors", i), arr[i].RequestScopedErrors) {
+			return
+		}
 		filtered = append(filtered, arr[i])
 	}
 	h.mu.Lock()
@@ -744,6 +774,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value.RequestScopedErrors != nil && rejectInvalidRequestScopedErrors(c, "request-scoped-errors", *body.Value.RequestScopedErrors) {
 		return
 	}
 
@@ -1249,6 +1282,9 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 		if rejectInvalidCredentialWeight(c, fmt.Sprintf("codex-api-key[%d].weight", i), entry.Weight) {
 			return
 		}
+		if rejectInvalidRequestScopedErrors(c, fmt.Sprintf("codex-api-key[%d].request-scoped-errors", i), entry.RequestScopedErrors) {
+			return
+		}
 		filtered = append(filtered, entry)
 	}
 	h.mu.Lock()
@@ -1278,6 +1314,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value.RequestScopedErrors != nil && rejectInvalidRequestScopedErrors(c, "request-scoped-errors", *body.Value.RequestScopedErrors) {
 		return
 	}
 
@@ -1438,6 +1477,9 @@ func (h *Handler) PutXAIKeys(c *gin.Context) {
 		if rejectInvalidCredentialWeight(c, fmt.Sprintf("xai-api-key[%d].weight", i), entry.Weight) {
 			return
 		}
+		if rejectInvalidRequestScopedErrors(c, fmt.Sprintf("xai-api-key[%d].request-scoped-errors", i), entry.RequestScopedErrors) {
+			return
+		}
 		filtered = append(filtered, entry)
 	}
 	h.mu.Lock()
@@ -1470,6 +1512,9 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 	}
 	if errBind := c.ShouldBindJSON(&body); errBind != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value.RequestScopedErrors != nil && rejectInvalidRequestScopedErrors(c, "request-scoped-errors", *body.Value.RequestScopedErrors) {
 		return
 	}
 

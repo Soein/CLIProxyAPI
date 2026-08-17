@@ -190,6 +190,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				changes = append(changes, fmt.Sprintf("gemini[%d].excluded-models: updated (%d -> %d entries)", i, oldExcluded.count, newExcluded.count))
 			}
 			changes = appendOptionalIntChange(changes, fmt.Sprintf("gemini[%d].request-retry", i), o.RequestRetry, n.RequestRetry)
+			changes = appendRequestScopedErrorRuleChange(changes, fmt.Sprintf("gemini[%d].request-scoped-errors", i), o.RequestScopedErrors, n.RequestScopedErrors)
 		}
 	}
 	if len(oldCfg.InteractionsKey) != len(newCfg.InteractionsKey) {
@@ -224,6 +225,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				changes = append(changes, fmt.Sprintf("interactions[%d].excluded-models: updated (%d -> %d entries)", i, oldExcluded.count, newExcluded.count))
 			}
 			changes = appendOptionalIntChange(changes, fmt.Sprintf("interactions[%d].request-retry", i), o.RequestRetry, n.RequestRetry)
+			changes = appendRequestScopedErrorRuleChange(changes, fmt.Sprintf("interactions[%d].request-scoped-errors", i), o.RequestScopedErrors, n.RequestScopedErrors)
 		}
 	}
 
@@ -263,6 +265,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				changes = append(changes, fmt.Sprintf("claude[%d].rebuild-mid-system-message: %t -> %t", i, o.RebuildMidSystemMessage, n.RebuildMidSystemMessage))
 			}
 			changes = appendOptionalIntChange(changes, fmt.Sprintf("claude[%d].request-retry", i), o.RequestRetry, n.RequestRetry)
+			changes = appendRequestScopedErrorRuleChange(changes, fmt.Sprintf("claude[%d].request-scoped-errors", i), o.RequestScopedErrors, n.RequestScopedErrors)
 			if o.Cloak != nil && n.Cloak != nil {
 				if strings.TrimSpace(o.Cloak.Mode) != strings.TrimSpace(n.Cloak.Mode) {
 					changes = append(changes, fmt.Sprintf("claude[%d].cloak.mode: %s -> %s", i, o.Cloak.Mode, n.Cloak.Mode))
@@ -316,6 +319,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				changes = append(changes, fmt.Sprintf("codex[%d].excluded-models: updated (%d -> %d entries)", i, oldExcluded.count, newExcluded.count))
 			}
 			changes = appendOptionalIntChange(changes, fmt.Sprintf("codex[%d].request-retry", i), o.RequestRetry, n.RequestRetry)
+			changes = appendRequestScopedErrorRuleChange(changes, fmt.Sprintf("codex[%d].request-scoped-errors", i), o.RequestScopedErrors, n.RequestScopedErrors)
 		}
 	}
 
@@ -345,6 +349,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				changes = append(changes, fmt.Sprintf("xai[%d].disable-cooling: %t -> %t", i, o.DisableCooling, n.DisableCooling))
 			}
 			changes = appendOptionalIntChange(changes, fmt.Sprintf("xai[%d].request-retry", i), o.RequestRetry, n.RequestRetry)
+			changes = appendRequestScopedErrorRuleChange(changes, fmt.Sprintf("xai[%d].request-scoped-errors", i), o.RequestScopedErrors, n.RequestScopedErrors)
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("xai[%d].api-key: updated", i))
 			}
@@ -480,6 +485,28 @@ func appendOptionalIntChange(changes []string, field string, oldVal, newVal *int
 		return changes
 	}
 	return append(changes, fmt.Sprintf("%s: %s -> %s", field, formatOptionalInt(oldVal), formatOptionalInt(newVal)))
+}
+
+func appendRequestScopedErrorRuleChange(changes []string, field string, oldRules, newRules []config.RequestScopedErrorRule) []string {
+	description := describeRequestScopedErrorRuleChange(oldRules, newRules)
+	if description == "" {
+		return changes
+	}
+	return append(changes, field+": "+description)
+}
+
+func describeRequestScopedErrorRuleChange(oldRules, newRules []config.RequestScopedErrorRule) string {
+	if reflect.DeepEqual(oldRules, newRules) || len(oldRules) == 0 && len(newRules) == 0 {
+		return ""
+	}
+	switch {
+	case len(oldRules) == 0:
+		return fmt.Sprintf("added (%d rules)", len(newRules))
+	case len(newRules) == 0:
+		return fmt.Sprintf("removed (%d rules)", len(oldRules))
+	default:
+		return fmt.Sprintf("updated (%d -> %d rules)", len(oldRules), len(newRules))
+	}
 }
 
 func optionalIntEqual(a, b *int) bool {

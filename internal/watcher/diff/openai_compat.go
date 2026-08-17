@@ -95,6 +95,9 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	if !equalStringMap(oldEntry.Headers, newEntry.Headers) {
 		details = append(details, "headers updated")
 	}
+	if ruleChange := describeRequestScopedErrorRuleChange(oldEntry.RequestScopedErrors, newEntry.RequestScopedErrors); ruleChange != "" {
+		details = append(details, "request-scoped-errors "+ruleChange)
+	}
 	if len(details) == 0 {
 		return ""
 	}

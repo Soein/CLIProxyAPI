@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -62,5 +63,62 @@ func TestGetOpenAICompatIncludesDisableCooling(t *testing.T) {
 	}
 	if body.OpenAICompatibility[0].RequestRetry == nil || *body.OpenAICompatibility[0].RequestRetry != 0 {
 		t.Fatalf("expected request-retry to be present and 0, got %#v", body.OpenAICompatibility[0].RequestRetry)
+	}
+}
+
+func TestPatchOpenAICompatRejectsInvalidRequestScopedErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		rule    string
+		wantErr string
+	}{
+		{name: "invalid status", rule: `{"status":600,"match":["body"],"action":"stop"}`, wantErr: "status must be between 100 and 599"},
+		{name: "unknown action", rule: `{"status":400,"match":["body"],"action":"retry"}`, wantErr: "action must be one of"},
+		{name: "empty matcher", rule: `{"status":400,"match":["  "],"action":"stop"}`, wantErr: "at least one non-empty matcher is required"},
+		{name: "malformed regex", rule: `{"status":400,"match-regexr":["secret-("],"action":"stop"}`, wantErr: "match-regexr[0] must be a valid regular expression"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: "provider", BaseURL: "https://example.com/v1"}}}
+			h := &Handler{cfg: cfg, configFilePath: writeTestConfigFile(t)}
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			body := `{"index":0,"value":{"request-scoped-errors":[` + test.rule + `]}}`
+			ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/openai-compatibility", strings.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			h.PatchOpenAICompat(ctx)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), test.wantErr) {
+				t.Fatalf("body = %q, want substring %q", rec.Body.String(), test.wantErr)
+			}
+			if strings.Contains(rec.Body.String(), "secret-(") {
+				t.Fatalf("response leaked matcher content: %s", rec.Body.String())
+			}
+			if len(cfg.OpenAICompatibility[0].RequestScopedErrors) != 0 {
+				t.Fatal("invalid PATCH changed config")
+			}
+		})
+	}
+}
+
+func TestPutOpenAICompatRejectsInvalidRequestScopedErrors(t *testing.T) {
+	h := &Handler{cfg: &config.Config{}, configFilePath: writeTestConfigFile(t)}
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/openai-compatibility", strings.NewReader(`[{"name":"provider","base-url":"https://example.com/v1","request-scoped-errors":[{"status":400,"match":["body"],"action":"retry"}]}]`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutOpenAICompat(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(h.cfg.OpenAICompatibility) != 0 {
+		t.Fatal("invalid PUT changed config")
 	}
 }

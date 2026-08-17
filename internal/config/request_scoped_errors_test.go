@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -119,5 +120,56 @@ openai-compatibility:
 	compatRule := cfg.OpenAICompatibility[0].RequestScopedErrors[0]
 	if compatRule.Status != 400 || len(compatRule.Match) != 2 || len(compatRule.MatchRegexr) != 2 || compatRule.Action != "stop" {
 		t.Fatalf("unexpected openai-compatibility rule: %+v", compatRule)
+	}
+}
+
+func TestParseConfigBytesRejectsInvalidRequestScopedErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		rule    string
+		wantErr string
+	}{
+		{name: "status below HTTP range", rule: `status: 99
+        match: ["body"]
+        action: stop`, wantErr: "status must be between 100 and 599"},
+		{name: "status above HTTP range", rule: `status: 600
+        match: ["body"]
+        action: stop`, wantErr: "status must be between 100 and 599"},
+		{name: "unknown action", rule: `status: 400
+        match: ["body"]
+        action: retry`, wantErr: "action must be one of"},
+		{name: "empty matcher", rule: `status: 400
+        match: ["  "]
+        match-regexr: []
+        action: stop`, wantErr: "at least one non-empty matcher is required"},
+		{name: "malformed regex", rule: `status: 400
+        match-regexr: ["(?P<private>"]
+        action: stop`, wantErr: "match-regexr[0] must be a valid regular expression"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rule := strings.ReplaceAll(test.rule, "\n        ", "\n")
+			yamlConfig := "gemini-api-key:\n  - api-key: test\n    request-scoped-errors:\n      - " + strings.ReplaceAll(rule, "\n", "\n        ") + "\n"
+			_, errParse := ParseConfigBytes([]byte(yamlConfig))
+			if errParse == nil {
+				t.Fatal("ParseConfigBytes() error = nil")
+			}
+			if !strings.Contains(errParse.Error(), test.wantErr) {
+				t.Fatalf("ParseConfigBytes() error = %q, want substring %q", errParse, test.wantErr)
+			}
+			if strings.Contains(errParse.Error(), "(?P<private>") {
+				t.Fatalf("ParseConfigBytes() leaked matcher content: %q", errParse)
+			}
+		})
+	}
+}
+
+func TestValidateRequestScopedErrorRulesAcceptsEveryDocumentedAction(t *testing.T) {
+	for _, action := range []string{"stop", "stop-and-cooldown", "continue", "continue-and-cooldown"} {
+		rules := []RequestScopedErrorRule{{Status: 400, Match: []string{"body"}, Action: action}}
+		if errValidate := ValidateRequestScopedErrorRules(rules); errValidate != nil {
+			t.Fatalf("ValidateRequestScopedErrorRules(%q) error = %v", action, errValidate)
+		}
 	}
 }

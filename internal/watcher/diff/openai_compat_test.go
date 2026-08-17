@@ -51,6 +51,26 @@ func TestDiffOpenAICompatibilityPromptCacheKey(t *testing.T) {
 	expectContains(t, changes, "provider updated: provider-a (support-prompt-cache-key false -> true)")
 }
 
+func TestDiffOpenAICompatibilityRequestScopedErrorsAreRedacted(t *testing.T) {
+	oldList := []config.OpenAICompatibility{{
+		Name:                "provider-a",
+		RequestScopedErrors: []config.RequestScopedErrorRule{{Status: 400, Match: []string{"old-secret"}, Action: "stop"}},
+	}}
+	newList := []config.OpenAICompatibility{{
+		Name:                "provider-a",
+		RequestScopedErrors: []config.RequestScopedErrorRule{{Status: 429, MatchRegexr: []string{"new-secret.*"}, Action: "continue"}},
+	}}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: provider-a (request-scoped-errors updated (1 -> 1 rules))")
+	joined := strings.Join(changes, "\n")
+	for _, sensitive := range []string{"old-secret", "new-secret", "continue", "429"} {
+		if strings.Contains(joined, sensitive) {
+			t.Fatalf("request-scoped error diff leaked %q: %s", sensitive, joined)
+		}
+	}
+}
+
 func TestDiffOpenAICompatibilityDuplicateNames(t *testing.T) {
 	oldList := []config.OpenAICompatibility{
 		{Name: "duplicate", SupportPromptCacheKey: false},

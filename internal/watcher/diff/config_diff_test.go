@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -93,6 +94,42 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 	if details := BuildConfigChangeDetails(cfg, cfg); len(details) != 0 {
 		t.Fatalf("expected no change entries, got %v", details)
+	}
+}
+
+func TestBuildConfigChangeDetailsRequestScopedErrorsAreStableAndRedacted(t *testing.T) {
+	secretMatcher := "customer-token-secret"
+	secretRegex := "private-[0-9]+"
+	oldCfg := &config.Config{
+		GeminiKey:       []config.GeminiKey{{APIKey: "gemini"}},
+		InteractionsKey: []config.GeminiKey{{APIKey: "interactions", RequestScopedErrors: []config.RequestScopedErrorRule{{Status: 400, Match: []string{"old"}, Action: "stop"}}}},
+		ClaudeKey:       []config.ClaudeKey{{APIKey: "claude", RequestScopedErrors: []config.RequestScopedErrorRule{{Status: 400, Match: []string{"old"}, Action: "stop"}}}},
+		CodexKey:        []config.CodexKey{{APIKey: "codex", RequestScopedErrors: []config.RequestScopedErrorRule{{Status: 400, Match: []string{"old"}, Action: "stop"}}}},
+		XAIKey:          []config.XAIKey{{APIKey: "xai", RequestScopedErrors: []config.RequestScopedErrorRule{{Status: 400, Match: []string{"old"}, Action: "stop"}}}},
+	}
+	newRule := config.RequestScopedErrorRule{Status: 429, Match: []string{secretMatcher}, MatchRegexr: []string{secretRegex}, Action: "continue"}
+	newCfg := &config.Config{
+		GeminiKey:       []config.GeminiKey{{APIKey: "gemini", RequestScopedErrors: []config.RequestScopedErrorRule{newRule}}},
+		InteractionsKey: []config.GeminiKey{{APIKey: "interactions"}},
+		ClaudeKey:       []config.ClaudeKey{{APIKey: "claude", RequestScopedErrors: []config.RequestScopedErrorRule{newRule}}},
+		CodexKey:        []config.CodexKey{{APIKey: "codex", RequestScopedErrors: []config.RequestScopedErrorRule{newRule}}},
+		XAIKey:          []config.XAIKey{{APIKey: "xai", RequestScopedErrors: []config.RequestScopedErrorRule{newRule}}},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "gemini[0].request-scoped-errors: added (1 rules)")
+	expectContains(t, details, "interactions[0].request-scoped-errors: removed (1 rules)")
+	expectContains(t, details, "claude[0].request-scoped-errors: updated (1 -> 1 rules)")
+	expectContains(t, details, "codex[0].request-scoped-errors: updated (1 -> 1 rules)")
+	expectContains(t, details, "xai[0].request-scoped-errors: updated (1 -> 1 rules)")
+	joined := strings.Join(details, "\n")
+	for _, sensitive := range []string{secretMatcher, secretRegex, "continue", "429"} {
+		if strings.Contains(joined, sensitive) {
+			t.Fatalf("request-scoped error diff leaked %q: %s", sensitive, joined)
+		}
+	}
+	if repeated := BuildConfigChangeDetails(oldCfg, newCfg); !reflect.DeepEqual(details, repeated) {
+		t.Fatalf("request-scoped error diff is unstable: %v != %v", details, repeated)
 	}
 }
 
