@@ -262,6 +262,29 @@ func isSameSelector(a, b Selector) bool {
 	return false
 }
 
+type selectorReadLease struct {
+	manager  *Manager
+	selector Selector
+}
+
+func (m *Manager) acquireSelectorReadLease() selectorReadLease {
+	if m == nil {
+		return selectorReadLease{}
+	}
+	m.selectorMu.RLock()
+	return selectorReadLease{
+		manager:  m,
+		selector: m.selector,
+	}
+}
+
+func (l *selectorReadLease) Release() {
+	if l != nil && l.manager != nil {
+		l.manager.selectorMu.RUnlock()
+		l.manager = nil
+	}
+}
+
 func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
@@ -272,34 +295,28 @@ func (m *Manager) SetSelector(selector Selector) {
 	m.selectorMu.Lock()
 	defer m.selectorMu.Unlock()
 
-	m.mu.Lock()
 	oldSelector := m.selector
 	if isSameSelector(oldSelector, selector) {
-		m.mu.Unlock()
 		return
 	}
+	m.mu.Lock()
 	m.selector = selector
 	m.mu.Unlock()
 
-	if oldSelector != nil {
-		if stoppable, ok := oldSelector.(StoppableSelector); ok {
-			stoppable.Stop()
-		}
-	}
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
+	}
+	if stoppable, ok := oldSelector.(StoppableSelector); ok && stoppable != nil {
+		stoppable.Stop()
 	}
 }
 
 // Selector returns the current credential selector.
 func (m *Manager) Selector() Selector {
-	if m == nil {
-		return nil
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.selector
+	lease := m.acquireSelectorReadLease()
+	defer lease.Release()
+	return lease.selector
 }
 
 // SetStore swaps the underlying persistence store.
@@ -1023,7 +1040,9 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	lease := m.acquireSelectorReadLease()
+	defer lease.Release()
+	return isBuiltInSelector(lease.selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -1081,12 +1100,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return true
 	}
 	for {
+		selectorLease := m.acquireSelectorReadLease()
+		selector := selectorLease.selector
 		m.mu.RLock()
-		selector := m.selector
 		pluginScheduler := m.pluginScheduler
 		executor, okExecutor := m.executors[provider]
 		if !okExecutor {
 			m.mu.RUnlock()
+			selectorLease.Release()
 			return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		candidates := make([]*Auth, 0, len(m.auths))
@@ -1113,6 +1134,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		if len(candidates) == 0 {
 			m.mu.RUnlock()
+			selectorLease.Release()
 			if spillover() {
 				continue
 			}
@@ -1121,6 +1143,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
 		if errAvailable != nil {
 			m.mu.RUnlock()
+			selectorLease.Release()
 			if spillover() {
 				continue
 			}
@@ -1130,6 +1153,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 		if errPick != nil {
+			selectorLease.Release()
 			return nil, nil, errPick
 		}
 		if !handled {
@@ -1139,9 +1163,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 				if isBuiltInSelector(selector) {
 					errPick = restoreModelCooldownErrorModel(errPick, model)
 				}
+				selectorLease.Release()
 				return nil, nil, errPick
 			}
 		}
+		selectorLease.Release()
 		if selected == nil {
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}

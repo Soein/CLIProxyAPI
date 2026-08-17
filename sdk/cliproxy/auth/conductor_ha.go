@@ -1096,8 +1096,9 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		return true
 	}
 	for {
+		selectorLease := m.acquireSelectorReadLease()
+		selector := selectorLease.selector
 		m.mu.RLock()
-		selector := m.selector
 		pluginScheduler := m.pluginScheduler
 		candidates := make([]*Auth, 0, len(m.auths))
 		for _, candidate := range m.auths {
@@ -1133,6 +1134,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		}
 		if len(candidates) == 0 {
 			m.mu.RUnlock()
+			selectorLease.Release()
 			if spillover() {
 				continue
 			}
@@ -1141,6 +1143,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 		if errAvailable != nil {
 			m.mu.RUnlock()
+			selectorLease.Release()
 			if spillover() {
 				continue
 			}
@@ -1150,6 +1153,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 
 		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 		if errPick != nil {
+			selectorLease.Release()
 			return nil, nil, "", errPick
 		}
 		if !handled {
@@ -1178,9 +1182,11 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 				if isBuiltInSelector(selector) {
 					errPick = restoreModelCooldownErrorModel(errPick, model)
 				}
+				selectorLease.Release()
 				return nil, nil, "", errPick
 			}
 		}
+		selectorLease.Release()
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
@@ -1305,10 +1311,11 @@ func (m *Manager) pickNextMixedForExecution(ctx context.Context, providers []str
 		return auth, executor, provider, nil, err
 	}
 	if !m.useSchedulerFastPath() {
-		m.mu.RLock()
-		sessionAffinity, okSessionAffinity := m.selector.(*SessionAffinitySelector)
-		m.mu.RUnlock()
-		if !okSessionAffinity || !isBuiltInSelector(sessionAffinity.fallback) {
+		selectorLease := m.acquireSelectorReadLease()
+		sessionAffinity, okSessionAffinity := selectorLease.selector.(*SessionAffinitySelector)
+		builtInFallback := okSessionAffinity && isBuiltInSelector(sessionAffinity.fallback)
+		selectorLease.Release()
+		if !builtInFallback {
 			auth, executor, provider, err := m.pickNextMixed(ctx, providers, model, opts, tried)
 			return auth, executor, provider, nil, err
 		}

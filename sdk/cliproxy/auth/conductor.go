@@ -113,14 +113,16 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store                        Store
-	cooldownStore                CooldownStateStore
-	pendingCooldownStateStore    CooldownStateStore
-	executors                    map[string]ProviderExecutor
-	selector                     Selector
-	hook                         Hook
-	mu                           sync.RWMutex
-	selectorMu                   sync.Mutex
+	store                     Store
+	cooldownStore             CooldownStateStore
+	pendingCooldownStateStore CooldownStateStore
+	executors                 map[string]ProviderExecutor
+	selector                  Selector
+	hook                      Hook
+	mu                        sync.RWMutex
+	// selectorMu guards selector replacement and selector method lifetimes. Code
+	// that also needs mu must acquire selectorMu first.
+	selectorMu                   sync.RWMutex
 	configCooldownMu             sync.Mutex
 	auths                        map[string]*Auth
 	authRevision                 uint64

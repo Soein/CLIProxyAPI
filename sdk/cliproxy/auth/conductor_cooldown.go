@@ -946,10 +946,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 }
 
 func (m *Manager) updateSessionAffinity(result Result) {
-	if m == nil || m.selector == nil {
-		return
-	}
-	if affinity, ok := m.selector.(interface {
+	lease := m.acquireSelectorReadLease()
+	defer lease.Release()
+	if affinity, ok := lease.selector.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {
 		affinity.OnResult(result)

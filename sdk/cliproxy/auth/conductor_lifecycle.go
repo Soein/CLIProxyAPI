@@ -278,7 +278,9 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	if m == nil || authID == "" {
 		return
 	}
-	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
+	lease := m.acquireSelectorReadLease()
+	defer lease.Release()
+	if invalidator, ok := lease.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
 	}
 }
