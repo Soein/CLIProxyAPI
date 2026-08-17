@@ -340,8 +340,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts, sessionAffinity: affinityState}
-			m.MarkResult(execCtx, result)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts}
+			m.markResult(execCtx, result, affinityState, false)
 			lastErr = errPrepare
 			continue
 		}
@@ -392,7 +392,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Options: execOpts, sessionAffinity: affinityState}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Options: execOpts}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -403,10 +403,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
-				if !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1 {
-					result = withIntermediateSessionAffinityResult(result)
-				}
-				m.MarkResult(execCtx, result)
+				intermediate := !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1
+				m.markResult(execCtx, result, affinityState, intermediate)
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
 						return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
@@ -423,7 +421,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.markResult(execCtx, result, affinityState, false)
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
@@ -510,8 +508,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts, sessionAffinity: affinityState}
-			m.MarkResult(execCtx, result)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts}
+			m.markResult(execCtx, result, affinityState, false)
 			lastErr = errPrepare
 			continue
 		}
@@ -562,7 +560,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Options: execOpts, sessionAffinity: affinityState}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Options: execOpts}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -573,17 +571,15 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
-				if !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1 {
-					result = withIntermediateSessionAffinityResult(result)
-				}
+				intermediate := !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1
 				// Some Anthropic-compatible upstreams do not implement the
 				// count_tokens route and return a generic endpoint 404. Record
 				// the failure for hooks and metrics without suspending a model
 				// that remains usable through the messages endpoint.
 				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
-					m.recordAvailabilityNeutralResult(execCtx, result)
+					m.recordAvailabilityNeutralResultWithAffinity(execCtx, result, affinityState, intermediate)
 				} else {
-					m.MarkResult(execCtx, result)
+					m.markResult(execCtx, result, affinityState, intermediate)
 				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
@@ -601,7 +597,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.markResult(execCtx, result, affinityState, false)
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
@@ -759,12 +755,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					return nil, errCancel
 				}
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts, sessionAffinity: affinityState}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts}
 			if selection != nil {
 				m.reportHomeResult(execCtx, result, auth)
 				releaseAttempt()
 			} else {
-				m.MarkResult(execCtx, result)
+				m.markResult(execCtx, result, affinityState, false)
 				lease.Release()
 			}
 			lastErr = errPrepare
@@ -841,11 +837,6 @@ func cloneRequestMetadata(src map[string]any) map[string]any {
 		dst[k] = v
 	}
 	return dst
-}
-
-func withIntermediateSessionAffinityResult(result Result) Result {
-	result.sessionAffinity.intermediate = true
-	return result
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {

@@ -853,11 +853,11 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || s.cache == nil || res.AuthID == "" {
 		return
 	}
-	state := res.sessionAffinity
-	if !state.prepared {
-		res = prepareSessionAffinityResult(context.Background(), res)
-		state = res.sessionAffinity
-	}
+	state := sessionAffinityResultForRequest(context.Background(), res.Provider, res.Model, res.Options)
+	s.onResult(res, state)
+}
+
+func (s *SessionAffinitySelector) onResult(res Result, state resultSessionAffinity) {
 	if state.primaryKey == "" {
 		return
 	}
@@ -904,14 +904,6 @@ func sessionAffinityCacheKey(provider, sessionID, model string) string {
 	return fmt.Sprintf("affinity:v2:%d:%s:%d:%s:%d:%s", len(provider), provider, len(sessionID), sessionID, len(model), model)
 }
 
-func prepareSessionAffinityResult(ctx context.Context, result Result) Result {
-	if result.sessionAffinity.prepared {
-		return result
-	}
-	result.sessionAffinity = sessionAffinityResultForRequest(ctx, result.Provider, result.Model, result.Options)
-	return result
-}
-
 func sessionAffinityResultForRequest(ctx context.Context, provider, model string, opts cliproxyexecutor.Options) resultSessionAffinity {
 	if raw := metadataStringValue(opts.Metadata, cliproxyexecutor.SessionAffinityProviderMetadataKey); raw != "" {
 		provider = raw
@@ -923,7 +915,6 @@ func sessionAffinityResultForRequest(ctx context.Context, provider, model string
 	return resultSessionAffinity{
 		primaryKey:  keys.primaryKey,
 		fallbackKey: keys.fallbackKey,
-		prepared:    true,
 	}
 }
 

@@ -62,15 +62,12 @@ type Result struct {
 	// Error describes the failure when Success is false.
 	Error *Error
 	// Options carries execution request options (headers, metadata, etc.) for result tracking.
-	Options         cliproxyexecutor.Options
-	sessionAffinity resultSessionAffinity
+	Options cliproxyexecutor.Options
 }
 
 type resultSessionAffinity struct {
-	primaryKey   string
-	fallbackKey  string
-	prepared     bool
-	intermediate bool
+	primaryKey  string
+	fallbackKey string
 }
 
 // Selector chooses an auth candidate for execution.

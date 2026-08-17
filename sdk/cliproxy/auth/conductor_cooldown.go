@@ -701,7 +701,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
-	result = prepareSessionAffinityResult(ctx, result)
+	affinityState := sessionAffinityResultForRequest(ctx, result.Provider, result.Model, result.Options)
+	m.markResult(ctx, result, affinityState, false)
+}
+
+func (m *Manager) markResult(ctx context.Context, result Result, affinityState resultSessionAffinity, affinityIntermediate bool) {
+	if result.AuthID == "" {
+		return
+	}
 	modelKey := canonicalModelKey(result.Model)
 
 	shouldResumeModel := false
@@ -943,15 +950,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
-	m.updateSessionAffinity(result)
+	if !affinityIntermediate {
+		m.updateSessionAffinity(result, affinityState)
+	}
 }
 
-func (m *Manager) updateSessionAffinity(result Result) {
-	if result.sessionAffinity.intermediate {
-		return
-	}
+func (m *Manager) updateSessionAffinity(result Result, affinityState resultSessionAffinity) {
 	lease := m.acquireSelectorReadLease()
 	defer lease.Release()
+	if affinity, ok := lease.selector.(*SessionAffinitySelector); ok && affinity != nil {
+		affinity.onResult(result, affinityState)
+		return
+	}
 	if affinity, ok := lease.selector.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {
@@ -969,9 +979,9 @@ func isRequestScopedCodexStoreMiss(message string) bool {
 		strings.Contains(message, "store")
 }
 
-func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
+func (m *Manager) recordExecutionResultWithAffinity(ctx context.Context, result Result, auth *Auth, ephemeral bool, affinityState resultSessionAffinity, affinityIntermediate bool) {
 	if !ephemeral {
-		m.MarkResult(ctx, result)
+		m.markResult(ctx, result, affinityState, affinityIntermediate)
 		return
 	}
 	m.reportHomeResult(ctx, result, auth)
@@ -994,7 +1004,14 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	if result.AuthID == "" {
 		return
 	}
-	result = prepareSessionAffinityResult(ctx, result)
+	affinityState := sessionAffinityResultForRequest(ctx, result.Provider, result.Model, result.Options)
+	m.recordAvailabilityNeutralResultWithAffinity(ctx, result, affinityState, false)
+}
+
+func (m *Manager) recordAvailabilityNeutralResultWithAffinity(ctx context.Context, result Result, affinityState resultSessionAffinity, affinityIntermediate bool) {
+	if result.AuthID == "" {
+		return
+	}
 
 	var authSnapshot *Auth
 	m.mu.Lock()
@@ -1013,7 +1030,9 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
-	m.updateSessionAffinity(result)
+	if !affinityIntermediate {
+		m.updateSessionAffinity(result, affinityState)
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
