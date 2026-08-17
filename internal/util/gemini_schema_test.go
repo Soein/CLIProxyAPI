@@ -1789,6 +1789,100 @@ func TestCleanJSONSchemaForAntigravityResponse_HintsDirectAllOfConflict(t *testi
 	if !strings.Contains(description, "minContains") || !strings.Contains(description, "1") || !strings.Contains(description, "2") {
 		t.Fatalf("direct allOf conflict was silently dropped: %s", result.Raw)
 	}
+	if result.Get("allOf").Exists() {
+		t.Fatalf("unsupported allOf survived final cleanup: %s", result.Raw)
+	}
+}
+
+func TestCleanJSONSchemaForAntigravityResponse_DirectAllOfUsesCanonicalConjunction(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "type conflict", input: `{"allOf":[{"type":"string"},{"type":"integer"}]}`},
+		{name: "nested type conflict", input: `{"allOf":[{"allOf":[{"type":"string"}]},{"type":"integer"}]}`},
+		{name: "const enum conflict", input: `{"allOf":[{"type":"string","const":"a"},{"enum":["b"]}]}`},
+		{name: "outer sibling conflict", input: `{"type":"string","allOf":[{"type":"integer"}]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := CleanJSONSchemaForAntigravityResponse(tt.input)
+			for i := 0; i < 50; i++ {
+				result := gjson.Parse(CleanJSONSchemaForAntigravityResponse(tt.input))
+				if enum := result.Get("enum"); !enum.IsArray() || len(enum.Array()) != 0 {
+					t.Fatalf("allOf conjunction was widened: %s", result.Raw)
+				}
+				if got := result.Raw; got != want {
+					t.Fatalf("run %d was nondeterministic:\nwant %s\n got %s", i, want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestMergeAllOf_IntersectsAndNormalizesTypeSets(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantType any
+	}{
+		{name: "array and scalar", input: `{"allOf":[{"type":["null","string","string"]},{"type":"string"}]}`, wantType: "string"},
+		{name: "integer subset of number", input: `{"allOf":[{"type":"number"},{"type":"integer"}]}`, wantType: "integer"},
+		{name: "ordered deduplicated array", input: `{"allOf":[{"type":["string","null","string"]},{"type":["null","string"]}]}`, wantType: []any{"string", "null"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := gjson.Parse(mergeAllOf(tt.input))
+			var got any
+			if result.Get("type").IsArray() {
+				got = result.Get("type").Value()
+			} else {
+				got = result.Get("type").String()
+			}
+			if !reflect.DeepEqual(got, tt.wantType) {
+				t.Fatalf("type intersection = %#v, want %#v: %s", got, tt.wantType, result.Raw)
+			}
+		})
+	}
+}
+
+func TestCleanJSONSchema_StructureBudgetPrecedesRecursiveWalks(t *testing.T) {
+	deep := strings.Repeat("[", 10000) + "0" + strings.Repeat("]", 10000)
+	var wide strings.Builder
+	wide.WriteString(`{"type":"object","properties":{`)
+	for i := 0; i <= maxInlineLocalRefNodes; i++ {
+		if i > 0 {
+			wide.WriteByte(',')
+		}
+		fmt.Fprintf(&wide, `"field%d":{"type":"string"}`, i)
+	}
+	wide.WriteString(`}}`)
+
+	cleaners := []struct {
+		name  string
+		clean func(string) string
+	}{
+		{name: "gemini", clean: CleanJSONSchemaForGemini},
+		{name: "antigravity response", clean: CleanJSONSchemaForAntigravityResponse},
+		{name: "antigravity tool", clean: func(schema string) string { return CleanJSONSchemaForAntigravityTool(schema, false) }},
+	}
+	for _, tt := range cleaners {
+		for _, input := range []string{deep, wide.String()} {
+			result := tt.clean(input)
+			if len(result) > 256 || !gjson.Valid(result) || !strings.Contains(result, "Schema structure limit exceeded") {
+				t.Fatalf("%s did not use fixed structure fallback: len=%d result=%s", tt.name, len(result), result)
+			}
+		}
+	}
+}
+
+func TestCleanJSONSchema_StructureBudgetAcceptsBoundaryDepth(t *testing.T) {
+	input := strings.Repeat("[", maxInlineLocalRefDepth) + "0" + strings.Repeat("]", maxInlineLocalRefDepth)
+	if result := CleanJSONSchemaForGemini(input); strings.Contains(result, "Schema structure limit exceeded") {
+		t.Fatalf("valid boundary depth was rejected: %s", result)
+	}
 }
 
 func TestStricterNumericConstraintRejectsExtremeExponentBeforeBigRat(t *testing.T) {

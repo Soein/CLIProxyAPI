@@ -4,6 +4,7 @@ package util
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"sort"
 	"strconv"
@@ -106,7 +107,15 @@ func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
 	if len(jsonStr) > maxInlineLocalRefOutputBytes {
 		return fallback
 	}
-	fallback = schemaCleanBudgetFallback(jsonStr, options.addPlaceholder)
+	structure, structureOK := preflightJSONSchemaStructure(jsonStr)
+	if !structureOK {
+		reason := "Schema structure limit exceeded"
+		if ref := gjson.Get(jsonStr, "$ref").String(); len(ref) <= maxInlineLocalRefPointerBytes && strings.HasPrefix(ref, "#/") {
+			reason = "See: " + boundedRefName(ref)
+		}
+		return schemaBudgetFallback(structure.typeName, reason, options.addPlaceholder)
+	}
+	fallback = schemaBudgetFallback(structure.typeName, "Schema cleaning output limit exceeded", options.addPlaceholder)
 	apply := func(transform func(string) string) bool {
 		jsonStr = transform(jsonStr)
 		return len(jsonStr) <= maxInlineLocalRefOutputBytes
@@ -183,11 +192,14 @@ func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
 }
 
 func schemaCleanBudgetFallback(schema string, requirePlaceholder bool) string {
-	typeName := schemaTypeForBudgetFallback(schema)
+	return schemaBudgetFallback(schemaTypeForBudgetFallback(schema), "Schema cleaning output limit exceeded", requirePlaceholder)
+}
+
+func schemaBudgetFallback(typeName, reason string, requirePlaceholder bool) string {
 	if requirePlaceholder && typeName == "object" {
-		return `{"type":"object","description":"Schema cleaning output limit exceeded","properties":{"reason":{"type":"string","description":"Brief explanation of why you are calling this tool"}},"required":["reason"]}`
+		return fmt.Sprintf(`{"type":"object","description":%q,"properties":{"reason":{"type":"string","description":"Brief explanation of why you are calling this tool"}},"required":["reason"]}`, reason)
 	}
-	return fmt.Sprintf(`{"type":%q,"description":"Schema cleaning output limit exceeded"}`, typeName)
+	return fmt.Sprintf(`{"type":%q,"description":%q}`, typeName, reason)
 }
 
 func schemaTypeForBudgetFallback(schema string) string {
@@ -212,6 +224,133 @@ func schemaTypeForBudgetFallback(schema string) string {
 		return "array"
 	}
 	return "object"
+}
+
+type schemaStructurePreflight struct {
+	typeName string
+}
+
+type schemaStructureFrame struct {
+	kind             json.Delim
+	expectingKey     bool
+	currentKey       string
+	items            int
+	capturesTypeList bool
+}
+
+func preflightJSONSchemaStructure(schema string) (schemaStructurePreflight, bool) {
+	result := schemaStructurePreflight{typeName: "object"}
+	decoder := json.NewDecoder(strings.NewReader(schema))
+	decoder.UseNumber()
+	stack := make([]schemaStructureFrame, 0, maxInlineLocalRefDepth)
+	nodes := 0
+	bytesUsed := 0
+	rootSeen := false
+
+	consumeValue := func() (string, bool) {
+		nodes++
+		if nodes > maxInlineLocalRefNodes {
+			return "", false
+		}
+		if len(stack) == 0 {
+			if rootSeen {
+				return "", false
+			}
+			rootSeen = true
+			return "", true
+		}
+		parent := &stack[len(stack)-1]
+		parent.items++
+		if parent.items > maxInlineLocalRefNodes {
+			return "", false
+		}
+		if parent.kind == '{' {
+			if parent.expectingKey {
+				return "", false
+			}
+			key := parent.currentKey
+			parent.currentKey = ""
+			parent.expectingKey = true
+			return key, true
+		}
+		return "", true
+	}
+
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return result, rootSeen && len(stack) == 0
+		}
+		if err != nil {
+			return result, false
+		}
+		switch typed := token.(type) {
+		case json.Delim:
+			switch typed {
+			case '{', '[':
+				parentIsRootTypeList := len(stack) == 1 && stack[0].kind == '{' && stack[0].currentKey == "type" && typed == '['
+				if _, ok := consumeValue(); !ok || len(stack)+1 > maxInlineLocalRefDepth {
+					return result, false
+				}
+				stack = append(stack, schemaStructureFrame{
+					kind:             typed,
+					expectingKey:     typed == '{',
+					capturesTypeList: parentIsRootTypeList,
+				})
+			case '}', ']':
+				if len(stack) == 0 {
+					return result, false
+				}
+				top := stack[len(stack)-1]
+				if (typed == '}' && top.kind != '{') || (typed == ']' && top.kind != '[') || (top.kind == '{' && !top.expectingKey) {
+					return result, false
+				}
+				stack = stack[:len(stack)-1]
+			}
+		case string:
+			if len(stack) > 0 && stack[len(stack)-1].kind == '{' && stack[len(stack)-1].expectingKey {
+				bytesUsed += jsonStringEncodedLen(typed)
+				if bytesUsed > maxInlineLocalRefInputBytes {
+					return result, false
+				}
+				frame := &stack[len(stack)-1]
+				frame.currentKey = typed
+				frame.expectingKey = false
+				continue
+			}
+			key, ok := consumeValue()
+			if !ok {
+				return result, false
+			}
+			bytesUsed += jsonStringEncodedLen(typed)
+			if bytesUsed > maxInlineLocalRefInputBytes {
+				return result, false
+			}
+			if (len(stack) == 1 && stack[0].kind == '{' && key == "type") ||
+				(len(stack) > 0 && stack[len(stack)-1].capturesTypeList) {
+				if typeName := supportedSchemaType(typed); typeName != "" && typeName != "null" {
+					result.typeName = typeName
+				}
+			}
+		default:
+			if _, ok := consumeValue(); !ok {
+				return result, false
+			}
+			bytesUsed += scalarJSONSize(typed)
+			if bytesUsed > maxInlineLocalRefInputBytes {
+				return result, false
+			}
+		}
+	}
+}
+
+func supportedSchemaType(value string) string {
+	switch value {
+	case "array", "boolean", "integer", "number", "object", "string", "null":
+		return value
+	default:
+		return ""
+	}
 }
 
 // removeKeywords removes all occurrences of specified keywords from the JSON schema.
@@ -672,11 +811,26 @@ func (r *localRefResolver) mergeCoreSchemaConstraints(out, base, sibling map[str
 	siblingType, siblingHasType := sibling["type"]
 	switch {
 	case baseHasType && siblingHasType:
-		if !schemaValuesEqual(baseType, siblingType) {
+		intersection, ok := intersectSchemaTypes(baseType, siblingType)
+		if !ok {
 			impossible = true
+		} else {
+			out["type"] = intersection
+		}
+	case baseHasType:
+		normalized, ok := normalizeSchemaTypes(baseType)
+		if !ok {
+			impossible = true
+		} else {
+			out["type"] = normalized
 		}
 	case siblingHasType:
-		out["type"] = siblingType
+		normalized, ok := normalizeSchemaTypes(siblingType)
+		if !ok {
+			impossible = true
+		} else {
+			out["type"] = normalized
+		}
 	}
 
 	baseEnum, baseHasEnum := base["enum"].([]any)
@@ -738,6 +892,97 @@ func (r *localRefResolver) mergeCoreSchemaConstraints(out, base, sibling map[str
 		out["const"] = constValue
 	}
 	return true
+}
+
+const (
+	schemaTypeArray uint16 = 1 << iota
+	schemaTypeBoolean
+	schemaTypeInteger
+	schemaTypeNonIntegerNumber
+	schemaTypeObject
+	schemaTypeString
+	schemaTypeNull
+)
+
+func intersectSchemaTypes(left, right any) (any, bool) {
+	leftTypes, leftOK := schemaTypeSet(left)
+	rightTypes, rightOK := schemaTypeSet(right)
+	if !leftOK || !rightOK {
+		return nil, false
+	}
+	return schemaTypeValue(leftTypes & rightTypes)
+}
+
+func normalizeSchemaTypes(value any) (any, bool) {
+	types, ok := schemaTypeSet(value)
+	if !ok {
+		return nil, false
+	}
+	return schemaTypeValue(types)
+}
+
+func schemaTypeSet(value any) (uint16, bool) {
+	var values []any
+	switch typed := value.(type) {
+	case string:
+		values = []any{typed}
+	case []any:
+		values = typed
+	default:
+		return 0, false
+	}
+	var types uint16
+	for _, value := range values {
+		typeName, ok := value.(string)
+		if !ok {
+			return 0, false
+		}
+		switch typeName {
+		case "array":
+			types |= schemaTypeArray
+		case "boolean":
+			types |= schemaTypeBoolean
+		case "integer":
+			types |= schemaTypeInteger
+		case "number":
+			types |= schemaTypeInteger | schemaTypeNonIntegerNumber
+		case "object":
+			types |= schemaTypeObject
+		case "string":
+			types |= schemaTypeString
+		case "null":
+			types |= schemaTypeNull
+		default:
+			return 0, false
+		}
+	}
+	return types, types != 0
+}
+
+func schemaTypeValue(types uint16) (any, bool) {
+	if types == 0 {
+		return nil, false
+	}
+	values := make([]any, 0, 7)
+	appendType := func(mask uint16, name string) {
+		if types&mask != 0 {
+			values = append(values, name)
+		}
+	}
+	appendType(schemaTypeArray, "array")
+	appendType(schemaTypeBoolean, "boolean")
+	if types&schemaTypeNonIntegerNumber != 0 {
+		values = append(values, "number")
+	} else {
+		appendType(schemaTypeInteger, "integer")
+	}
+	appendType(schemaTypeObject, "object")
+	appendType(schemaTypeString, "string")
+	appendType(schemaTypeNull, "null")
+	if len(values) == 1 {
+		return values[0], true
+	}
+	return values, true
 }
 
 func hasEmptySchemaEnum(schema map[string]any) bool {
@@ -1500,104 +1745,117 @@ func mergeConditionals(jsonStr string) string {
 }
 
 func mergeAllOf(jsonStr string) string {
-	paths := findPaths(jsonStr, "allOf")
-	sortByDepth(paths)
-
-	for _, p := range paths {
-		allOf := gjson.Get(jsonStr, p)
-		if !allOf.IsArray() {
-			continue
-		}
-		parentPath := trimSuffix(p, ".allOf")
-
-		for _, item := range allOf.Array() {
-			if !item.IsObject() {
-				continue
-			}
-			item.ForEach(func(key, value gjson.Result) bool {
-				field := key.String()
-				switch field {
-				case "required":
-					if !value.IsArray() {
-						return true
-					}
-					reqPath := joinPath(parentPath, "required")
-					current := getStrings(jsonStr, reqPath)
-					for _, required := range value.Array() {
-						if name := required.String(); !contains(current, name) {
-							current = append(current, name)
-						}
-					}
-					updated, _ := sjson.SetBytes([]byte(jsonStr), reqPath, current)
-					jsonStr = string(updated)
-				case "if", "then", "else", "allOf":
-					// Conditional applicability cannot be represented by the upstream schema.
-				case "description":
-					destination := descriptionPath(parentPath)
-					merged := mergeHint(gjson.Get(jsonStr, destination).String(), value.String())
-					updated, _ := sjson.SetBytes([]byte(jsonStr), destination, merged)
-					jsonStr = string(updated)
-				default:
-					destination := joinPath(parentPath, escapeGJSONPathKey(field))
-					jsonStr = mergeMissingSchemaAtPath(jsonStr, destination, value)
-				}
-				return true
-			})
-		}
-		jsonStr, _ = sjson.Delete(jsonStr, p)
-	}
-	return jsonStr
-}
-
-// mergeMissingSchemaAtPath recursively fills absent fields without replacing any existing
-// definition. Conflicting allOf leaves remain visible as bounded conjunction hints.
-func mergeMissingSchemaAtPath(jsonStr, destination string, incoming gjson.Result) string {
-	existing := gjson.Get(jsonStr, destination)
-	if !existing.Exists() {
-		updated, _ := sjson.SetRawBytes([]byte(jsonStr), destination, []byte(incoming.Raw))
-		return string(updated)
-	}
-	if !existing.IsObject() || !incoming.IsObject() {
-		if existing.Raw != incoming.Raw {
-			parts := splitGJSONPath(destination)
-			if len(parts) > 0 {
-				field := unescapeGJSONPathKey(parts[len(parts)-1])
-				parentPath := strings.Join(parts[:len(parts)-1], ".")
-				hint := "Conjunction " + boundedHintText(field, 64) + ": " + boundedGJSONValueHint(existing) + " AND " + boundedGJSONValueHint(incoming)
-				jsonStr = appendHint(jsonStr, parentPath, hint)
-			}
-		}
+	if !strings.Contains(jsonStr, `"allOf"`) {
 		return jsonStr
 	}
-	incoming.ForEach(func(key, value gjson.Result) bool {
-		child := joinPath(destination, escapeGJSONPathKey(key.String()))
-		jsonStr = mergeMissingSchemaAtPath(jsonStr, child, value)
-		return true
-	})
-	return jsonStr
+	decoder := json.NewDecoder(strings.NewReader(jsonStr))
+	decoder.UseNumber()
+	var root any
+	if err := decoder.Decode(&root); err != nil {
+		return jsonStr
+	}
+	resolver := localRefResolver{
+		maxDepth:      maxInlineLocalRefDepth,
+		maxNodes:      maxInlineLocalRefNodes,
+		maxAllocItems: maxInlineLocalRefAllocItems,
+		maxBytes:      maxInlineLocalRefOutputBytes,
+	}
+	merged, ok := resolver.normalizeAllOf(root, 0)
+	if !ok {
+		return `{"type":"object","description":"Schema conjunction limit exceeded"}`
+	}
+	out, err := json.Marshal(merged)
+	if err != nil || len(out) > maxInlineLocalRefOutputBytes {
+		return `{"type":"object","description":"Schema conjunction limit exceeded"}`
+	}
+	return string(out)
 }
 
-func boundedGJSONValueHint(value gjson.Result) string {
-	switch value.Type {
-	case gjson.Null:
-		return "null"
-	case gjson.False:
-		return "false"
-	case gjson.True:
-		return "true"
-	case gjson.Number:
-		return boundedHintText(value.Raw, 64)
-	case gjson.String:
-		return strconv.Quote(boundedHintText(value.String(), 64))
-	case gjson.JSON:
-		trimmed := strings.TrimSpace(value.Raw)
-		if strings.HasPrefix(trimmed, "[") {
-			return "array"
-		}
-		return "object"
-	default:
-		return "value"
+func (r *localRefResolver) normalizeAllOf(value any, depth int) (any, bool) {
+	if depth > r.maxDepth || !r.reserveNode() {
+		return nil, false
 	}
+	switch node := value.(type) {
+	case []any:
+		if !r.preflightContainerLength(len(node)) || !r.commitContainer(len(node), arrayStructuralBytes(len(node))) {
+			return nil, false
+		}
+		out := make([]any, len(node))
+		for i, item := range node {
+			normalized, ok := r.normalizeAllOf(item, depth+1)
+			if !ok {
+				return nil, false
+			}
+			out[i] = normalized
+		}
+		return out, true
+	case map[string]any:
+		count := len(node)
+		if _, exists := node["allOf"]; exists {
+			count--
+		}
+		if !r.preflightContainerLength(count) || !r.commitContainer(count, objectStructuralBytesSkipping(node, "allOf")) {
+			return nil, false
+		}
+		keys, okKeys := r.sortedMapKeys(node)
+		if !okKeys {
+			return nil, false
+		}
+		out := make(map[string]any, count)
+		for _, key := range keys {
+			if key == "allOf" {
+				continue
+			}
+			normalized, ok := r.normalizeAllOf(node[key], depth+1)
+			if !ok {
+				return nil, false
+			}
+			out[key] = normalized
+		}
+		clauses, hasAllOf := node["allOf"].([]any)
+		if !hasAllOf {
+			return out, true
+		}
+		for _, clause := range clauses {
+			normalized, ok := r.normalizeAllOf(clause, depth+1)
+			if !ok {
+				return nil, false
+			}
+			clauseMap, isMap := normalized.(map[string]any)
+			if !isMap {
+				continue
+			}
+			out, ok = r.mergeRefSchemaMaps(out, clauseMap)
+			if !ok {
+				return nil, false
+			}
+			// Unsupported same-name constraints are retained by mergeRefSchemaMaps as both a
+			// bounded hint and allOf. The hint is the Gemini-compatible projection here.
+			delete(out, "allOf")
+		}
+		return out, true
+	default:
+		if !r.reserveBytes(scalarJSONSize(node)) {
+			return nil, false
+		}
+		return value, true
+	}
+}
+
+func objectStructuralBytesSkipping(node map[string]any, skipKey string) int {
+	size := 2
+	entries := 0
+	for key := range node {
+		if key == skipKey {
+			continue
+		}
+		if entries > 0 {
+			size++
+		}
+		size += jsonStringEncodedLen(key) + 1
+		entries++
+	}
+	return size
 }
 
 func flattenAnyOfOneOf(jsonStr string) string {
