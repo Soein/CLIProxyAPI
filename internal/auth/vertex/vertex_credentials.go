@@ -3,6 +3,7 @@
 package vertex
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,6 +45,29 @@ func (s *VertexCredentialStorage) SetMetadata(meta map[string]any) {
 	s.Metadata = meta
 }
 
+// MarshalTokenJSON serializes the complete Vertex auth-file payload without
+// opening a filesystem path.
+func (s *VertexCredentialStorage) MarshalTokenJSON() ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("vertex credential: storage is nil")
+	}
+	if s.ServiceAccount == nil {
+		return nil, fmt.Errorf("vertex credential: service account content is empty")
+	}
+	s.Type = "vertex"
+	data, errMerge := misc.MergeMetadata(s, s.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
+	}
+	var payload bytes.Buffer
+	encoder := json.NewEncoder(&payload)
+	encoder.SetIndent("", "  ")
+	if errEncode := encoder.Encode(data); errEncode != nil {
+		return nil, fmt.Errorf("vertex credential: encode failed: %w", errEncode)
+	}
+	return payload.Bytes(), nil
+}
+
 // SaveTokenToFile writes the credential payload to the given file path in JSON format.
 // It ensures the parent directory exists and logs the operation for transparency.
 func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
@@ -54,16 +78,13 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	if s.ServiceAccount == nil {
 		return fmt.Errorf("vertex credential: service account content is empty")
 	}
-	// Ensure we tag the file with the provider type.
-	s.Type = "vertex"
-
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
 		return fmt.Errorf("vertex credential: create directory failed: %w", err)
 	}
 
-	data, errMerge := misc.MergeMetadata(s, s.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
+	payload, errMarshal := s.MarshalTokenJSON()
+	if errMarshal != nil {
+		return errMarshal
 	}
 
 	f, err := os.Create(authFilePath)
@@ -75,9 +96,7 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 			log.Errorf("vertex credential: failed to close file: %v", errClose)
 		}
 	}()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err = enc.Encode(data); err != nil {
+	if _, err = f.Write(payload); err != nil {
 		return fmt.Errorf("vertex credential: encode failed: %w", err)
 	}
 	return nil

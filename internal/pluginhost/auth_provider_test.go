@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	baseauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -344,8 +345,15 @@ func TestPluginTokenStorageMergesRawMetadataAndProviderType(t *testing.T) {
 		"new": "value",
 		"old": "override",
 	})
+	marshaler, ok := any(storage).(baseauth.TokenJSONMarshaler)
+	if !ok {
+		t.Fatalf("%T does not implement TokenJSONMarshaler", storage)
+	}
 
-	raw := storage.RawJSON()
+	raw, errMarshal := marshaler.MarshalTokenJSON()
+	if errMarshal != nil {
+		t.Fatalf("MarshalTokenJSON() error = %v", errMarshal)
+	}
 	var decoded map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
 		t.Fatalf("RawJSON() decode error = %v", errUnmarshal)

@@ -4,6 +4,7 @@
 package claude
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -60,6 +61,24 @@ func (ts *ClaudeTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// MarshalTokenJSON serializes the complete Claude auth-file payload without
+// opening a filesystem path.
+func (ts *ClaudeTokenStorage) MarshalTokenJSON() ([]byte, error) {
+	if ts == nil {
+		return nil, fmt.Errorf("claude token storage is nil")
+	}
+	ts.Type = "claude"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+	var payload bytes.Buffer
+	if errEncode := json.NewEncoder(&payload).Encode(data); errEncode != nil {
+		return nil, fmt.Errorf("failed to encode token payload: %w", errEncode)
+	}
+	return payload.Bytes(), nil
+}
+
 // SaveTokenToFile serializes the Claude token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
@@ -72,17 +91,15 @@ func (ts *ClaudeTokenStorage) SetMetadata(meta map[string]any) {
 //   - error: An error if the operation fails, nil otherwise
 func (ts *ClaudeTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "claude"
 
 	// Create directory structure if it doesn't exist
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
-	// Merge metadata using helper
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("failed to merge metadata: %w", errMerge)
+	payload, errMarshal := ts.MarshalTokenJSON()
+	if errMarshal != nil {
+		return errMarshal
 	}
 
 	// Create the token file
@@ -96,8 +113,7 @@ func (ts *ClaudeTokenStorage) SaveTokenToFile(authFilePath string) error {
 		}
 	}()
 
-	// Encode and write the token data as JSON
-	if err = json.NewEncoder(f).Encode(data); err != nil {
+	if _, err = f.Write(payload); err != nil {
 		return fmt.Errorf("failed to write token to file: %w", err)
 	}
 	return nil

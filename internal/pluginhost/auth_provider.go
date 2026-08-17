@@ -425,26 +425,31 @@ func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 }
 
 func (s *pluginTokenStorage) RawJSON() []byte {
-	if s == nil {
-		return nil
-	}
-	payload, errPayload := mergedStorageJSON(s.rawJSON, s.meta, s.provider)
+	payload, errPayload := s.MarshalTokenJSON()
 	if errPayload != nil {
 		return nil
 	}
 	return payload
 }
 
-func (s *pluginTokenStorage) SaveTokenToFile(path string) error {
+func (s *pluginTokenStorage) MarshalTokenJSON() ([]byte, error) {
 	if s == nil {
-		return fmt.Errorf("plugin token storage is nil")
+		return nil, fmt.Errorf("plugin token storage is nil")
 	}
 	payload, errPayload := mergedStorageJSON(s.rawJSON, s.meta, s.provider)
 	if errPayload != nil {
-		return errPayload
+		return nil, errPayload
 	}
 	if len(bytes.TrimSpace(payload)) == 0 {
-		return fmt.Errorf("plugin token storage payload is empty")
+		return nil, fmt.Errorf("plugin token storage payload is empty")
+	}
+	return payload, nil
+}
+
+func (s *pluginTokenStorage) SaveTokenToFile(path string) error {
+	payload, errPayload := s.MarshalTokenJSON()
+	if errPayload != nil {
+		return errPayload
 	}
 	if pluginTokenStorageFileCurrent(path, payload) {
 		return nil

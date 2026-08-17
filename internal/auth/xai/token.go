@@ -1,6 +1,7 @@
 package xai
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -37,18 +38,37 @@ func (ts *TokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// MarshalTokenJSON serializes the complete xAI auth-file payload without
+// opening a filesystem path.
+func (ts *TokenStorage) MarshalTokenJSON() ([]byte, error) {
+	if ts == nil {
+		return nil, fmt.Errorf("xai token storage is nil")
+	}
+	ts.Type = "xai"
+	ts.AuthKind = "oauth"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
+	}
+	var payload bytes.Buffer
+	encoder := json.NewEncoder(&payload)
+	encoder.SetIndent("", "  ")
+	if errEncode := encoder.Encode(data); errEncode != nil {
+		return nil, fmt.Errorf("xai token storage: encode payload: %w", errEncode)
+	}
+	return payload.Bytes(), nil
+}
+
 // SaveTokenToFile writes xAI credentials to a JSON auth file.
 func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "xai"
-	ts.AuthKind = "oauth"
 	if errMkdirAll := os.MkdirAll(filepath.Dir(authFilePath), 0o700); errMkdirAll != nil {
 		return fmt.Errorf("xai token storage: create directory: %w", errMkdirAll)
 	}
 
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
+	payload, errMarshal := ts.MarshalTokenJSON()
+	if errMarshal != nil {
+		return errMarshal
 	}
 
 	file, err := os.Create(authFilePath)
@@ -61,9 +81,7 @@ func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 		}
 	}()
 
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(data); err != nil {
+	if _, err = file.Write(payload); err != nil {
 		return fmt.Errorf("xai token storage: write token file: %w", err)
 	}
 	return nil

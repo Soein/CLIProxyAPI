@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	baseauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfilelock"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -53,7 +55,10 @@ func currentPluginAuthParser() PluginAuthParser {
 	return holder.parser
 }
 
-// FileTokenStore persists token records and auth metadata using the filesystem as backing storage.
+// FileTokenStore persists token records and auth metadata using the filesystem
+// as backing storage. TokenJSONMarshaler implementations are written through an
+// os.Root anchored at baseDir. Path-only TokenStorage implementations remain a
+// trusted legacy boundary responsible for their own filesystem containment.
 type FileTokenStore struct {
 	mu      sync.Mutex
 	dirLock sync.RWMutex
@@ -120,7 +125,26 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+		if marshaler, ok := auth.Storage.(baseauth.TokenJSONMarshaler); ok {
+			payload, errPayload := marshaler.MarshalTokenJSON()
+			if errPayload != nil {
+				return "", fmt.Errorf("auth filestore: marshal token payload: %w", errPayload)
+			}
+			if !json.Valid(payload) {
+				return "", fmt.Errorf("auth filestore: token payload is not valid JSON")
+			}
+			if existing, errRead := readAuthFile(baseDir, path); errRead == nil {
+				if jsonEqual(existing, payload) {
+					break
+				}
+			} else if !os.IsNotExist(errRead) {
+				return "", fmt.Errorf("auth filestore: read existing token payload: %w", errRead)
+			}
+			misc.LogSavingCredentials(path)
+			if errWrite := writeAuthFile(baseDir, path, payload, 0o600); errWrite != nil {
+				return "", fmt.Errorf("auth filestore: write token payload: %w", errWrite)
+			}
+		} else if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:

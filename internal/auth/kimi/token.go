@@ -4,6 +4,7 @@
 package kimi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -39,6 +40,26 @@ type KimiTokenStorage struct {
 // SetMetadata allows external callers to inject metadata into the storage before saving.
 func (ts *KimiTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
+}
+
+// MarshalTokenJSON serializes the complete Kimi auth-file payload without
+// opening a filesystem path.
+func (ts *KimiTokenStorage) MarshalTokenJSON() ([]byte, error) {
+	if ts == nil {
+		return nil, fmt.Errorf("kimi token storage is nil")
+	}
+	ts.Type = "kimi"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+	var payload bytes.Buffer
+	encoder := json.NewEncoder(&payload)
+	encoder.SetIndent("", "  ")
+	if errEncode := encoder.Encode(data); errEncode != nil {
+		return nil, fmt.Errorf("failed to encode token payload: %w", errEncode)
+	}
+	return payload.Bytes(), nil
 }
 
 // KimiTokenData holds the raw OAuth token response from Kimi.
@@ -82,16 +103,14 @@ type DeviceCodeResponse struct {
 // SaveTokenToFile serializes the Kimi token storage to a JSON file.
 func (ts *KimiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "kimi"
 
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
-	// Merge metadata using helper
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("failed to merge metadata: %w", errMerge)
+	payload, errMarshal := ts.MarshalTokenJSON()
+	if errMarshal != nil {
+		return errMarshal
 	}
 
 	f, err := os.Create(authFilePath)
@@ -104,9 +123,7 @@ func (ts *KimiTokenStorage) SaveTokenToFile(authFilePath string) error {
 		}
 	}()
 
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(data); err != nil {
+	if _, err = f.Write(payload); err != nil {
 		return fmt.Errorf("failed to write token to file: %w", err)
 	}
 	return nil

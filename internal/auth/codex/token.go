@@ -4,6 +4,7 @@
 package codex
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,6 +45,24 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// MarshalTokenJSON serializes the complete Codex auth-file payload without
+// opening a filesystem path.
+func (ts *CodexTokenStorage) MarshalTokenJSON() ([]byte, error) {
+	if ts == nil {
+		return nil, fmt.Errorf("codex token storage is nil")
+	}
+	ts.Type = "codex"
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return nil, fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+	var payload bytes.Buffer
+	if errEncode := json.NewEncoder(&payload).Encode(data); errEncode != nil {
+		return nil, fmt.Errorf("failed to encode token payload: %w", errEncode)
+	}
+	return payload.Bytes(), nil
+}
+
 // SaveTokenToFile serializes the Codex token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
@@ -56,15 +75,13 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 //   - error: An error if the operation fails, nil otherwise
 func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "codex"
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
-	// Merge metadata using helper
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("failed to merge metadata: %w", errMerge)
+	payload, errMarshal := ts.MarshalTokenJSON()
+	if errMarshal != nil {
+		return errMarshal
 	}
 
 	f, err := os.Create(authFilePath)
@@ -77,7 +94,7 @@ func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 		}
 	}()
 
-	if err = json.NewEncoder(f).Encode(data); err != nil {
+	if _, err = f.Write(payload); err != nil {
 		return fmt.Errorf("failed to write token to file: %w", err)
 	}
 	return nil

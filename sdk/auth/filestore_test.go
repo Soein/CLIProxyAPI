@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,48 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+type swappingPayloadStorage struct {
+	parent         string
+	outsideDir     string
+	legacySaveUsed bool
+}
+
+type legacyPathStorage struct {
+	called bool
+	path   string
+}
+
+func (s *legacyPathStorage) SaveTokenToFile(path string) error {
+	s.called = true
+	s.path = path
+	return os.WriteFile(path, []byte(`{"type":"legacy"}`), 0o600)
+}
+
+func (s *swappingPayloadStorage) swapParent() error {
+	if errRemove := os.Remove(s.parent); errRemove != nil {
+		return fmt.Errorf("remove target parent: %w", errRemove)
+	}
+	if errLink := os.Symlink(s.outsideDir, s.parent); errLink != nil {
+		return fmt.Errorf("replace target parent with symlink: %w", errLink)
+	}
+	return nil
+}
+
+func (s *swappingPayloadStorage) MarshalTokenJSON() ([]byte, error) {
+	if errSwap := s.swapParent(); errSwap != nil {
+		return nil, errSwap
+	}
+	return []byte(`{"type":"test","access_token":"secret"}`), nil
+}
+
+func (s *swappingPayloadStorage) SaveTokenToFile(path string) error {
+	s.legacySaveUsed = true
+	if errSwap := s.swapParent(); errSwap != nil {
+		return errSwap
+	}
+	return os.WriteFile(path, []byte(`{"type":"test","access_token":"secret"}`), 0o600)
+}
 
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
@@ -272,6 +315,63 @@ func TestFileTokenStoreRejectsSymlinkEscapes(t *testing.T) {
 	}
 	if len(auths) != 0 {
 		t.Fatalf("List() followed symlink outside base directory: %#v", auths)
+	}
+}
+
+func TestFileTokenStorePayloadWriteRejectsParentSymlinkSwap(t *testing.T) {
+	baseDir := t.TempDir()
+	outsideDir := t.TempDir()
+	targetParent := filepath.Join(baseDir, "nested")
+	if errMkdir := os.Mkdir(targetParent, 0o700); errMkdir != nil {
+		t.Fatalf("create target parent: %v", errMkdir)
+	}
+	storage := &swappingPayloadStorage{parent: targetParent, outsideDir: outsideDir}
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       filepath.Join("nested", "auth.json"),
+		FileName: filepath.Join("nested", "auth.json"),
+		Storage:  storage,
+		Metadata: map[string]any{"type": "test"},
+	}
+
+	if _, errSave := store.Save(context.Background(), auth); errSave == nil {
+		t.Fatal("Save() succeeded after the target parent was replaced by an outside symlink")
+	}
+	if storage.legacySaveUsed {
+		t.Fatal("Save() used the legacy path callback for a payload-capable storage")
+	}
+	if _, errStat := os.Stat(filepath.Join(outsideDir, "auth.json")); !os.IsNotExist(errStat) {
+		t.Fatalf("payload escaped AuthDir through swapped parent: %v", errStat)
+	}
+}
+
+func TestFileTokenStorePreservesLegacyPathStorageFallback(t *testing.T) {
+	baseDir := t.TempDir()
+	storage := &legacyPathStorage{}
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       "legacy.json",
+		FileName: "legacy.json",
+		Storage:  storage,
+	}
+
+	savedPath, errSave := store.Save(context.Background(), auth)
+	if errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+	expectedPath := filepath.Join(baseDir, "legacy.json")
+	if !storage.called || storage.path != expectedPath {
+		t.Fatalf("legacy SaveTokenToFile() called=%v path=%q, want path %q", storage.called, storage.path, expectedPath)
+	}
+	if savedPath != expectedPath {
+		t.Fatalf("Save() path = %q, want %q", savedPath, expectedPath)
+	}
+	if payload, errRead := os.ReadFile(expectedPath); errRead != nil {
+		t.Fatalf("read legacy payload: %v", errRead)
+	} else if string(payload) != `{"type":"legacy"}` {
+		t.Fatalf("legacy payload = %q", payload)
 	}
 }
 
