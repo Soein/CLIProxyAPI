@@ -709,6 +709,7 @@ func (m *Manager) markResult(ctx context.Context, result Result, affinityState r
 	if result.AuthID == "" {
 		return
 	}
+	selectorResult := resultForSessionAffinity(result, affinityState)
 	modelKey := canonicalModelKey(result.Model)
 
 	shouldResumeModel := false
@@ -951,8 +952,20 @@ func (m *Manager) markResult(ctx context.Context, result Result, affinityState r
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
 	if !affinityIntermediate {
-		m.updateSessionAffinity(result, affinityState)
+		m.updateSessionAffinity(selectorResult, affinityState)
 	}
+}
+
+func resultForSessionAffinity(result Result, affinityState resultSessionAffinity) Result {
+	result.Provider = affinityState.provider
+	result.Model = affinityState.model
+	result.Options = cloneSessionAffinityOptions(affinityState.options)
+	result.Error = cloneError(result.Error)
+	if result.RetryAfter != nil {
+		retryAfter := *result.RetryAfter
+		result.RetryAfter = &retryAfter
+	}
+	return result
 }
 
 func (m *Manager) updateSessionAffinity(result Result, affinityState resultSessionAffinity) {
@@ -965,11 +978,7 @@ func (m *Manager) updateSessionAffinity(result Result, affinityState resultSessi
 	if affinity, ok := lease.selector.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {
-		selectorResult := result
-		selectorResult.Provider = affinityState.provider
-		selectorResult.Model = affinityState.model
-		selectorResult.Options = cloneSessionAffinityOptions(affinityState.options)
-		affinity.OnResult(selectorResult)
+		affinity.OnResult(result)
 	}
 }
 
@@ -1016,6 +1025,7 @@ func (m *Manager) recordAvailabilityNeutralResultWithAffinity(ctx context.Contex
 	if result.AuthID == "" {
 		return
 	}
+	selectorResult := resultForSessionAffinity(result, affinityState)
 
 	var authSnapshot *Auth
 	m.mu.Lock()
@@ -1035,7 +1045,7 @@ func (m *Manager) recordAvailabilityNeutralResultWithAffinity(ctx context.Contex
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
 	if !affinityIntermediate {
-		m.updateSessionAffinity(result, affinityState)
+		m.updateSessionAffinity(selectorResult, affinityState)
 	}
 }
 

@@ -955,6 +955,8 @@ func cloneSessionAffinityMetadata(src map[string]any) map[string]any {
 const (
 	maxSessionAffinityMetadataCloneNodes = 4096
 	maxSessionAffinityMetadataCloneDepth = 64
+	maxSessionAffinityMetadataCloneItems = 4096
+	maxSessionAffinityMetadataCloneBytes = 1 << 20
 )
 
 type sessionAffinityMetadataVisit struct {
@@ -968,6 +970,8 @@ type sessionAffinityMetadataVisit struct {
 type sessionAffinityMetadataCloner struct {
 	visited map[sessionAffinityMetadataVisit]reflect.Value
 	nodes   int
+	items   int
+	bytes   uint64
 }
 
 func cloneSessionAffinityMetadataGraph(value reflect.Value) (cloned reflect.Value, ok bool) {
@@ -1010,6 +1014,9 @@ func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (r
 		if cloned, exists := c.visited[visit]; exists {
 			return cloned, true
 		}
+		if !c.reserveContainer(value.Len(), 2, value.Type().Key().Size()+value.Type().Elem().Size()) {
+			return reflect.Value{}, false
+		}
 		cloned := reflect.MakeMapWithSize(value.Type(), value.Len())
 		c.visited[visit] = cloned
 		iterator := value.MapRange()
@@ -1030,6 +1037,9 @@ func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (r
 		if cloned, exists := c.visited[visit]; exists {
 			return cloned, true
 		}
+		if !c.reserveContainer(value.Len(), 1, value.Type().Elem().Size()) {
+			return reflect.Value{}, false
+		}
 		cloned := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
 		c.visited[visit] = cloned
 		for index := 0; index < value.Len(); index++ {
@@ -1048,6 +1058,9 @@ func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (r
 		if cloned, exists := c.visited[visit]; exists {
 			return cloned, true
 		}
+		if !c.reserveBytes(value.Type().Elem().Size()) {
+			return reflect.Value{}, false
+		}
 		cloned := reflect.New(value.Type().Elem())
 		c.visited[visit] = cloned
 		clonedElement, ok := c.clone(value.Elem(), depth+1)
@@ -1057,6 +1070,9 @@ func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (r
 		cloned.Elem().Set(clonedElement)
 		return cloned, true
 	case reflect.Struct:
+		if !c.reserveBytes(value.Type().Size()) {
+			return reflect.Value{}, false
+		}
 		cloned := reflect.New(value.Type()).Elem()
 		for index := 0; index < value.NumField(); index++ {
 			if value.Type().Field(index).PkgPath != "" {
@@ -1070,6 +1086,9 @@ func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (r
 		}
 		return cloned, true
 	case reflect.Array:
+		if !c.reserveContainer(value.Len(), 1, value.Type().Elem().Size()) {
+			return reflect.Value{}, false
+		}
 		cloned := reflect.New(value.Type()).Elem()
 		for index := 0; index < value.Len(); index++ {
 			clonedElement, ok := c.clone(value.Index(index), depth+1)
@@ -1079,11 +1098,48 @@ func (c *sessionAffinityMetadataCloner) clone(value reflect.Value, depth int) (r
 			cloned.Index(index).Set(clonedElement)
 		}
 		return cloned, true
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return reflect.Value{}, false
 	default:
-		// Scalar values are immutable. Func, chan, and unsafe pointer values cannot
-		// be meaningfully cloned and are never inputs to affinity key calculation.
+		// Scalar values are immutable and safe to share.
 		return value, true
 	}
+}
+
+func (c *sessionAffinityMetadataCloner) reserveContainer(length, nodeMultiplier int, itemSize uintptr) bool {
+	if length < 0 || length > maxSessionAffinityMetadataCloneItems-c.items {
+		return false
+	}
+	if nodeMultiplier > 0 && length > (maxSessionAffinityMetadataCloneNodes-c.nodes)/nodeMultiplier {
+		return false
+	}
+	if !c.reserveBytesForItems(length, itemSize) {
+		return false
+	}
+	c.items += length
+	return true
+}
+
+func (c *sessionAffinityMetadataCloner) reserveBytesForItems(length int, itemSize uintptr) bool {
+	if length == 0 || itemSize == 0 {
+		return true
+	}
+	remaining := uint64(maxSessionAffinityMetadataCloneBytes) - c.bytes
+	width := uint64(itemSize)
+	if uint64(length) > remaining/width {
+		return false
+	}
+	c.bytes += uint64(length) * width
+	return true
+}
+
+func (c *sessionAffinityMetadataCloner) reserveBytes(size uintptr) bool {
+	remaining := uint64(maxSessionAffinityMetadataCloneBytes) - c.bytes
+	if uint64(size) > remaining {
+		return false
+	}
+	c.bytes += uint64(size)
+	return true
 }
 
 func sessionAffinityMetadataFallback(src map[string]any) map[string]any {

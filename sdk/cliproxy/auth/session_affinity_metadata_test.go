@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -301,6 +302,95 @@ func TestSessionAffinityWrapperReceivesIndependentPickSnapshot(t *testing.T) {
 	}
 }
 
+type errorTamperingHook struct {
+	NoopHook
+	code       string
+	httpStatus int
+}
+
+func (h *errorTamperingHook) OnResult(_ context.Context, result Result) {
+	if result.Error == nil {
+		return
+	}
+	result.Error.Code = h.code
+	result.Error.HTTPStatus = h.httpStatus
+}
+
+func TestSessionAffinityResultErrorIsPrivateFromHooks(t *testing.T) {
+	tests := []struct {
+		name           string
+		customSelector bool
+		original       *Error
+		hookCode       string
+		hookStatus     int
+		wantBinding    bool
+	}{
+		{
+			name:        "built-in selector deletes credential failure",
+			original:    &Error{Message: "failed", HTTPStatus: http.StatusInternalServerError},
+			hookCode:    ErrorCodeRequestScoped,
+			hookStatus:  http.StatusBadRequest,
+			wantBinding: false,
+		},
+		{
+			name:        "built-in selector preserves request failure",
+			original:    &Error{Code: ErrorCodeRequestScoped, Message: "invalid", HTTPStatus: http.StatusBadRequest},
+			hookStatus:  http.StatusInternalServerError,
+			wantBinding: true,
+		},
+		{
+			name:           "custom selector deletes credential failure",
+			customSelector: true,
+			original:       &Error{Message: "failed", HTTPStatus: http.StatusInternalServerError},
+			hookCode:       ErrorCodeRequestScoped,
+			hookStatus:     http.StatusBadRequest,
+			wantBinding:    false,
+		},
+		{
+			name:           "custom selector preserves request failure",
+			customSelector: true,
+			original:       &Error{Code: ErrorCodeRequestScoped, Message: "invalid", HTTPStatus: http.StatusBadRequest},
+			hookStatus:     http.StatusInternalServerError,
+			wantBinding:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{TTL: time.Hour})
+			defer affinity.Stop()
+			var selector Selector = affinity
+			var wrapper *affinitySnapshotInspectingWrapper
+			if tt.customSelector {
+				wrapper = &affinitySnapshotInspectingWrapper{SessionAffinitySelector: affinity}
+				selector = wrapper
+			}
+			manager := NewManager(nil, selector, &errorTamperingHook{code: tt.hookCode, httpStatus: tt.hookStatus})
+			opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": {"error-hook-session"}}}
+			state := sessionAffinityResultForRequest(context.Background(), "provider", "model", opts)
+			affinity.cache.Set(state.primaryKey, "auth")
+			originalCode, originalStatus := tt.original.Code, tt.original.HTTPStatus
+
+			manager.MarkResult(context.Background(), Result{
+				AuthID: "auth", Provider: "provider", Model: "model", Success: false, Error: tt.original, Options: opts,
+			})
+
+			_, bindingExists := affinity.cache.Get(state.primaryKey)
+			if bindingExists != tt.wantBinding {
+				t.Fatalf("binding exists = %v, want %v", bindingExists, tt.wantBinding)
+			}
+			if wrapper != nil {
+				if wrapper.result.Error == tt.original {
+					t.Fatal("custom selector received Hook-shared Error pointer")
+				}
+				if wrapper.result.Error == nil || wrapper.result.Error.Code != originalCode || wrapper.result.Error.HTTPStatus != originalStatus {
+					t.Fatalf("custom selector error = %#v, want code %q status %d", wrapper.result.Error, originalCode, originalStatus)
+				}
+			}
+		})
+	}
+}
+
 type affinityCloneContainer struct {
 	Values []int
 }
@@ -383,6 +473,138 @@ func TestCloneSessionAffinityMetadataBudgetFallsBackToAffinityStrings(t *testing
 	cloned = cloneSessionAffinityMetadata(original)
 	if len(cloned) != 5 {
 		t.Fatalf("large metadata fallback = %#v, want five affinity strings", cloned)
+	}
+}
+
+func TestCloneSessionAffinityMetadataLargeContainerDoesNotAllocateInputSize(t *testing.T) {
+	large := make([]int, 1<<17)
+	original := map[string]any{
+		cliproxyexecutor.ExecutionSessionMetadataKey: "execution",
+		"large": large,
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			cloned := cloneSessionAffinityMetadata(original)
+			if len(cloned) != 1 || cloned[cliproxyexecutor.ExecutionSessionMetadataKey] != "execution" {
+				b.Fatalf("large metadata fallback = %#v", cloned)
+			}
+		}
+	})
+	if allocated := result.AllocedBytesPerOp(); allocated >= int64(len(large))*int64(unsafe.Sizeof(large[0]))/4 {
+		t.Fatalf("clone allocated %d bytes/op for %d-byte input container", allocated, len(large)*int(unsafe.Sizeof(large[0])))
+	}
+}
+
+func TestCloneSessionAffinityMetadataUnsupportedReferencesFallBack(t *testing.T) {
+	marker := 1
+	tests := map[string]any{
+		"func":           func() {},
+		"chan":           make(chan int),
+		"unsafe-pointer": unsafe.Pointer(&marker),
+	}
+	for name, unsupported := range tests {
+		t.Run(name, func(t *testing.T) {
+			original := map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey: "execution",
+				"unsupported": unsupported,
+			}
+			cloned := cloneSessionAffinityMetadata(original)
+			if len(cloned) != 1 || cloned[cliproxyexecutor.ExecutionSessionMetadataKey] != "execution" {
+				t.Fatalf("unsupported reference clone = %#v, want affinity-only fallback", cloned)
+			}
+		})
+	}
+}
+
+type callbackTamperingAffinitySelector struct {
+	*SessionAffinitySelector
+	pickedOptions cliproxyexecutor.Options
+}
+
+func (s *callbackTamperingAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	s.pickedOptions = opts
+	return s.SessionAffinitySelector.Pick(ctx, provider, model, opts, auths)
+}
+
+func (s *callbackTamperingAffinitySelector) tamperPickedOptions() {
+	s.pickedOptions.Headers.Set("X-Session-Id", "tampered-session")
+	s.pickedOptions.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "tampered-provider"
+	s.pickedOptions.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = "tampered-model"
+}
+
+type callbackTamperFailureExecutor struct {
+	provider string
+}
+
+func (e *callbackTamperFailureExecutor) Identifier() string { return e.provider }
+func (*callbackTamperFailureExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{Message: "failed", HTTPStatus: http.StatusInternalServerError}
+}
+func (*callbackTamperFailureExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, &Error{Message: "failed", HTTPStatus: http.StatusInternalServerError}
+}
+func (*callbackTamperFailureExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+func (*callbackTamperFailureExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{Message: "failed", HTTPStatus: http.StatusInternalServerError}
+}
+func (*callbackTamperFailureExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestSelectedAuthCallbackCannotTamperPickedAffinityState(t *testing.T) {
+	operations := map[string]func(*Manager, string, cliproxyexecutor.Options) error{
+		"execute": func(manager *Manager, provider string, opts cliproxyexecutor.Options) error {
+			_, err := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: "model"}, opts)
+			return err
+		},
+		"count-tokens": func(manager *Manager, provider string, opts cliproxyexecutor.Options) error {
+			_, err := manager.ExecuteCount(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: "model"}, opts)
+			return err
+		},
+		"stream": func(manager *Manager, provider string, opts cliproxyexecutor.Options) error {
+			_, err := manager.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: "model"}, opts)
+			return err
+		},
+	}
+
+	for name, execute := range operations {
+		t.Run(name, func(t *testing.T) {
+			const provider = "callback-tamper-provider"
+			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{TTL: time.Hour})
+			defer affinity.Stop()
+			selector := &callbackTamperingAffinitySelector{SessionAffinitySelector: affinity}
+			manager := NewManager(nil, selector, nil)
+			manager.SetRetryConfig(0, 0, 1)
+			manager.RegisterExecutor(&callbackTamperFailureExecutor{provider: provider})
+			auth := &Auth{ID: "callback-tamper-auth", Provider: provider, Status: StatusActive, Metadata: map[string]any{"disable_cooling": true}}
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: "model"}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+			callbackCalls := 0
+			opts := cliproxyexecutor.Options{
+				Headers: http.Header{"X-Session-Id": {"picked-session"}},
+				Metadata: map[string]any{
+					cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(string) {
+						callbackCalls++
+						selector.tamperPickedOptions()
+					},
+				},
+			}
+
+			if errExecute := execute(manager, provider, opts); errExecute == nil {
+				t.Fatal("execution error = nil, want upstream failure")
+			}
+			if callbackCalls != 1 {
+				t.Fatalf("selected-auth callback calls = %d, want 1", callbackCalls)
+			}
+			if remaining := affinityCacheExpirations(affinity); len(remaining) != 0 {
+				t.Fatalf("callback mutation prevented picked affinity cleanup: %v", remaining)
+			}
+		})
 	}
 }
 

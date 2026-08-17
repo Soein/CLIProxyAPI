@@ -312,6 +312,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		affinityState := sessionAffinityResultForRequest(ctx, provider, routeModel, pickOpts)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
@@ -324,7 +325,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
-		affinityState := sessionAffinityResultForRequest(execCtx, provider, routeModel, pickOpts)
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
@@ -480,6 +480,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		affinityState := sessionAffinityResultForRequest(ctx, provider, routeModel, pickOpts)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
@@ -492,7 +493,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
-		affinityState := sessionAffinityResultForRequest(execCtx, provider, routeModel, pickOpts)
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
@@ -689,6 +689,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, repeatedHomeAuthError()
 			}
 		}
+		affinityState := sessionAffinityResultForRequest(ctx, provider, routeModel, pickOpts)
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
@@ -717,7 +718,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		// Enrich before auth preparation so prepare-stage usage records observe the client request.
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
-		affinityState := sessionAffinityResultForRequest(execCtx, provider, routeModel, pickOpts)
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias
@@ -784,7 +784,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, lease, unauthorizedRefreshTried)
+		streamResult, errStream := m.executeStreamWithModelPoolAndAffinity(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, lease, affinityState, unauthorizedRefreshTried)
 		if errStream != nil {
 			if selection != nil {
 				releaseAttempt()

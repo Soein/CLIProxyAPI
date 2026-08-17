@@ -207,6 +207,11 @@ func (m *Manager) replaceHomeExecutionLifecycleAuth(lifecycle cliproxyexecutor.E
 }
 
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool, lease *authLease, refreshAttempts ...map[string]struct{}) (*cliproxyexecutor.StreamResult, error) {
+	affinityState := sessionAffinityResultForRequest(ctx, provider, routeModel, opts)
+	return m.executeStreamWithModelPoolAndAffinity(ctx, executor, auth, provider, req, opts, routeModel, executionModel, execModels, pooled, aliasResult, routing, allowRetry, ephemeralResult, lease, affinityState, refreshAttempts...)
+}
+
+func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool, lease *authLease, affinityState resultSessionAffinity, refreshAttempts ...map[string]struct{}) (*cliproxyexecutor.StreamResult, error) {
 	ownedLease := lease
 	defer func() {
 		ownedLease.Release()
@@ -215,7 +220,6 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
-	affinityState := sessionAffinityResultForRequest(ctx, provider, routeModel, opts)
 	var unauthorizedRefreshTried map[string]struct{}
 	if len(refreshAttempts) > 0 {
 		unauthorizedRefreshTried = refreshAttempts[0]
