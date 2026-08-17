@@ -458,9 +458,9 @@ func (s *Service) shutdown(ctx context.Context) error {
 	if s.watcherCancel != nil {
 		s.watcherCancel()
 	}
-	if s.clusterRegistrar != nil {
+	if registrar := s.clusterRegistrarSnapshot(); registrar != nil {
 		drainCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if errDrain := s.clusterRegistrar.Drain(drainCtx); errDrain != nil {
+		if errDrain := registrar.Drain(drainCtx); errDrain != nil {
 			log.WithError(errDrain).Warn("cluster: drain notification failed; front-door will wait for staleness threshold")
 		}
 		cancel()

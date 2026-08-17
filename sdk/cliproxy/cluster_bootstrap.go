@@ -261,7 +261,9 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("cluster mode: instance registrar: %w", err)
 		}
+		s.lifecycleMu.Lock()
 		s.clusterRegistrar = registrar
+		s.lifecycleMu.Unlock()
 		if s.cfg.Cluster.AuthSharding {
 			if errPublish := registrar.Publish(ctx); errPublish != nil {
 				return fmt.Errorf("cluster mode: initial draining routing publication: %w", errPublish)
@@ -287,8 +289,8 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 
 	// Per-auth advisory lock — serializes token refresh cross-replica.
 	s.coreManager.SetAuthRefreshLocker(cluster.NewPgAuthRefreshLocker(db))
-	if s.clusterRegistrar != nil {
-		go s.clusterRegistrar.Run(clusterCtx)
+	if registrar := s.clusterRegistrarSnapshot(); registrar != nil {
+		go registrar.Run(clusterCtx)
 	}
 
 	// Phase 4 Sprint 2: auth ring + watcher. We ALWAYS create the ring and
@@ -309,7 +311,9 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	// immediately after enabling sharding so no request can escape through
 	// that bootstrap window. The watcher's OnChange restores the local shard.
 	ring := cluster.NewAuthRing(nodeID)
+	s.lifecycleMu.Lock()
 	s.clusterAuthRing = ring
+	s.lifecycleMu.Unlock()
 	s.coreManager.SetAuthRing(ring)
 	s.coreManager.SetAuthShardingEnabled(s.cfg.Cluster.AuthSharding)
 	s.coreManager.SetSpilloverEnabled(s.cfg.Cluster.Spillover)
@@ -413,29 +417,33 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	s.clusterActivate = func(runCtx context.Context) error {
+	activate := func(runCtx context.Context) error {
 		if !s.cfg.Cluster.AuthSharding {
 			return nil
 		}
 		startupTimeout := clusterStartupReconcileTimeout(ringPoll)
 		startupCtx, startupCancel := context.WithTimeout(runCtx, startupTimeout)
 		defer startupCancel()
-		if s.clusterRegistrar == nil {
+		registrar := s.clusterRegistrarSnapshot()
+		if registrar == nil {
 			return errors.New("cluster mode: auth-sharding registrar is unavailable")
 		}
-		if errJoin := s.clusterRegistrar.Join(startupCtx); errJoin != nil {
+		if errJoin := registrar.Join(startupCtx); errJoin != nil {
 			return fmt.Errorf("publish joining state: %w", errJoin)
 		}
 		dispatchAuthority.Wake()
 		if errReady := dispatchAuthority.WaitReady(startupCtx); errReady != nil {
 			return fmt.Errorf("wait for current-epoch dispatch authority reconciliation (timeout %s): %w", startupTimeout, errReady)
 		}
-		if errActivate := s.clusterRegistrar.Activate(startupCtx); errActivate != nil {
+		if errActivate := registrar.Activate(startupCtx); errActivate != nil {
 			return errActivate
 		}
 		s.startClusterNodeLeaseProbe(runCtx, clusterCtx, cancel, leaseProbeInterval, freshness, freshnessBudgets)
 		return nil
 	}
+	s.lifecycleMu.Lock()
+	s.clusterActivate = activate
+	s.lifecycleMu.Unlock()
 
 	// PG-backed usage statistics sink. Skipped when usage.backend=memory
 	// (the default). The sink registers as a coreusage.Plugin alongside
@@ -488,13 +496,19 @@ func (s *Service) bootstrapCluster(ctx context.Context) error {
 }
 
 func (s *Service) activateClusterServing(ctx context.Context) error {
-	if s == nil || s.clusterActivate == nil {
+	if s == nil {
+		return nil
+	}
+	s.lifecycleMu.Lock()
+	activate := s.clusterActivate
+	s.lifecycleMu.Unlock()
+	if activate == nil {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return s.clusterActivate(ctx)
+	return activate(ctx)
 }
 
 func clusterStartupReconcileTimeout(ringPoll time.Duration) time.Duration {
@@ -801,8 +815,11 @@ func (s *Service) failCloseClusterServing() {
 	if s == nil {
 		return
 	}
-	if s.clusterAuthRing != nil {
-		s.clusterAuthRing.FailClosed()
+	s.lifecycleMu.Lock()
+	ring := s.clusterAuthRing
+	s.lifecycleMu.Unlock()
+	if ring != nil {
+		ring.FailClosed()
 	}
 	if s.coreManager != nil {
 		s.coreManager.SyncScheduler()
@@ -882,9 +899,11 @@ func (s *Service) rollbackClusterBootstrap() {
 		}
 		cancel()
 	}
+	s.lifecycleMu.Lock()
 	s.clusterRegistrar = nil
 	s.clusterAuthRing = nil
 	s.clusterActivate = nil
+	s.lifecycleMu.Unlock()
 	if s.coreManager != nil {
 		s.coreManager.SetLeaderGate(nil)
 		s.coreManager.SetAuthRefreshLocker(nil)
@@ -893,6 +912,16 @@ func (s *Service) rollbackClusterBootstrap() {
 		s.coreManager.SetSpilloverEnabled(false)
 		s.coreManager.SyncScheduler()
 	}
+}
+
+func (s *Service) clusterRegistrarSnapshot() *cluster.InstanceRegistrar {
+	if s == nil {
+		return nil
+	}
+	s.lifecycleMu.Lock()
+	registrar := s.clusterRegistrar
+	s.lifecycleMu.Unlock()
+	return registrar
 }
 
 func (s *Service) validateStrictClusterMode() error {

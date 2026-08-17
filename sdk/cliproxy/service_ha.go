@@ -119,9 +119,9 @@ func (s *Service) finalizeClusterStop(ctx context.Context) error {
 		return nil
 	}
 	s.clusterStopOnce.Do(func() {
-		if s.clusterRegistrar != nil {
+		if registrar := s.clusterRegistrarSnapshot(); registrar != nil {
 			drainCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			if errDrain := s.clusterRegistrar.Drain(drainCtx); errDrain != nil {
+			if errDrain := registrar.Drain(drainCtx); errDrain != nil {
 				log.WithError(errDrain).Warn("cluster: final drain notification failed; front-door will wait for staleness threshold")
 			}
 			cancel()
