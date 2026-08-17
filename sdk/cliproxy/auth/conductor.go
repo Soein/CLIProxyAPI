@@ -68,6 +68,9 @@ type Result struct {
 type resultSessionAffinity struct {
 	primaryKey  string
 	fallbackKey string
+	provider    string
+	model       string
+	options     cliproxyexecutor.Options
 }
 
 // Selector chooses an auth candidate for execution.

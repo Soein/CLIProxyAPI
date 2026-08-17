@@ -187,6 +187,88 @@ func TestSessionAffinityResultKeysArePrivateFromHooks(t *testing.T) {
 	}
 }
 
+type affinitySnapshotTamperingHook struct {
+	NoopHook
+}
+
+func (*affinitySnapshotTamperingHook) OnResult(_ context.Context, result Result) {
+	result.Options.Headers.Set("X-Session-Id", "hook-session")
+	result.Options.Query.Set("tenant", "hook-tenant")
+	copy(result.Options.OriginalRequest, []byte(`{"session_id":"hook"}`))
+	result.Options.Metadata[cliproxyexecutor.CallerScopeMetadataKey] = "hook-caller"
+	result.Options.Metadata["nested"].(map[string]any)["values"].([]any)[0] = "hook-nested"
+}
+
+type affinitySnapshotInspectingWrapper struct {
+	*SessionAffinitySelector
+	result Result
+}
+
+func (s *affinitySnapshotInspectingWrapper) OnResult(result Result) {
+	s.result = result
+	s.SessionAffinitySelector.OnResult(result)
+}
+
+func TestSessionAffinityWrapperReceivesIndependentPickSnapshot(t *testing.T) {
+	const (
+		provider = "snapshot-provider"
+		model    = "snapshot-model"
+		authID   = "snapshot-auth"
+	)
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{TTL: time.Hour})
+	defer affinity.Stop()
+	wrapper := &affinitySnapshotInspectingWrapper{SessionAffinitySelector: affinity}
+	manager := NewManager(nil, wrapper, &affinitySnapshotTamperingHook{})
+	manager.RegisterExecutor(&failExecutor{provider: provider})
+	auth := &Auth{ID: authID, Provider: provider, Status: StatusActive, Metadata: map[string]any{"disable_cooling": true}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+	originalBody := []byte(`{"session_id":"picked-body","input":"original"}`)
+	opts := cliproxyexecutor.Options{
+		Headers:         http.Header{"X-Session-Id": {"picked-session"}, "X-Original": {"header"}},
+		Query:           map[string][]string{"tenant": {"picked-tenant"}},
+		OriginalRequest: append([]byte(nil), originalBody...),
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "picked-caller",
+			"nested":                                map[string]any{"values": []any{"picked-nested"}},
+		},
+		RequestAfterAuthInterceptor: func(context.Context, cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
+			return cliproxyexecutor.RequestAfterAuthInterceptResponse{
+				Headers: http.Header{"X-Session-Id": {"interceptor-session"}},
+				Body:    []byte(`{"session_id":"interceptor-body"}`),
+			}
+		},
+	}
+	_, errExecute := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model, Payload: originalBody}, opts)
+	if errExecute == nil {
+		t.Fatal("Execute() error = nil, want upstream failure")
+	}
+
+	got := wrapper.result.Options
+	if got.Headers.Get("X-Session-Id") != "picked-session" || got.Headers.Get("X-Original") != "header" {
+		t.Fatalf("selector headers = %v, want original pick headers", got.Headers)
+	}
+	if got.Query.Get("tenant") != "picked-tenant" {
+		t.Fatalf("selector query = %v, want picked-tenant", got.Query)
+	}
+	if string(got.OriginalRequest) != string(originalBody) {
+		t.Fatalf("selector OriginalRequest = %s, want %s", got.OriginalRequest, originalBody)
+	}
+	if got.Metadata[cliproxyexecutor.CallerScopeMetadataKey] != "picked-caller" {
+		t.Fatalf("selector caller scope = %v, want picked-caller", got.Metadata[cliproxyexecutor.CallerScopeMetadataKey])
+	}
+	if nested := got.Metadata["nested"].(map[string]any)["values"].([]any)[0]; nested != "picked-nested" {
+		t.Fatalf("selector nested metadata = %v, want picked-nested", nested)
+	}
+	if remaining := affinityCacheExpirations(affinity); len(remaining) != 0 {
+		t.Fatalf("wrapper fallback failed to remove picked binding: %v", remaining)
+	}
+}
+
 type sequentialSelector struct {
 	n int
 }

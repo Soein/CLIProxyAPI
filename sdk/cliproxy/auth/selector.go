@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -915,6 +916,67 @@ func sessionAffinityResultForRequest(ctx context.Context, provider, model string
 	return resultSessionAffinity{
 		primaryKey:  keys.primaryKey,
 		fallbackKey: keys.fallbackKey,
+		provider:    provider,
+		model:       model,
+		options:     cloneSessionAffinityOptions(opts),
+	}
+}
+
+func cloneSessionAffinityOptions(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	cloned := opts
+	cloned.Headers = cloneHTTPHeader(opts.Headers)
+	if opts.Query != nil {
+		cloned.Query = make(map[string][]string, len(opts.Query))
+		for key, values := range opts.Query {
+			cloned.Query[key] = append([]string(nil), values...)
+		}
+	}
+	cloned.OriginalRequest = bytes.Clone(opts.OriginalRequest)
+	cloned.Metadata = cloneSessionAffinityMetadata(opts.Metadata)
+	return cloned
+}
+
+func cloneSessionAffinityMetadata(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(src))
+	for key, value := range src {
+		cloned[key] = cloneSessionAffinityMetadataValue(value)
+	}
+	return cloned
+}
+
+func cloneSessionAffinityMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneSessionAffinityMetadata(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneSessionAffinityMetadataValue(item)
+		}
+		return cloned
+	case []byte:
+		return bytes.Clone(typed)
+	case []string:
+		return append([]string(nil), typed...)
+	case map[string]string:
+		cloned := make(map[string]string, len(typed))
+		for key, item := range typed {
+			cloned[key] = item
+		}
+		return cloned
+	case map[string][]string:
+		cloned := make(map[string][]string, len(typed))
+		for key, items := range typed {
+			cloned[key] = append([]string(nil), items...)
+		}
+		return cloned
+	case http.Header:
+		return cloneHTTPHeader(typed)
+	default:
+		return value
 	}
 }
 

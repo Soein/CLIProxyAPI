@@ -965,7 +965,11 @@ func (m *Manager) updateSessionAffinity(result Result, affinityState resultSessi
 	if affinity, ok := lease.selector.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {
-		affinity.OnResult(result)
+		selectorResult := result
+		selectorResult.Provider = affinityState.provider
+		selectorResult.Model = affinityState.model
+		selectorResult.Options = cloneSessionAffinityOptions(affinityState.options)
+		affinity.OnResult(selectorResult)
 	}
 }
 
