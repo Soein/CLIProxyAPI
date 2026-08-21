@@ -403,8 +403,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
-				intermediate := !okAction && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1
-				m.markResult(execCtx, result, affinityState, intermediate)
+				compactRequestFault := isResponsesCompactRequestFaultError(execOpts, errExec)
+				intermediate := !okAction && !compactRequestFault && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1
+				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) {
+					m.recordAvailabilityNeutralResultWithAffinity(execCtx, result, affinityState, intermediate)
+				} else {
+					m.markResult(execCtx, result, affinityState, intermediate)
+				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
 						return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
@@ -412,7 +417,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					authErr = errExec
 					break
 				}
-				if isRequestInvalidError(errExec) {
+				if compactRequestFault || isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -438,7 +443,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				continue
 			}
-			if isRequestInvalidError(authErr) {
+			if isResponsesCompactRequestFaultError(opts, authErr) || isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
