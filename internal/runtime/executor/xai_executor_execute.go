@@ -91,6 +91,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	var outputItemsFallback [][]byte
 	responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 	phaseMarker := xaiResponsePhaseMarker{reporter: reporter}
+	namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 	scanner := bufio.NewScanner(httpResp.Body)
 	scanner.Buffer(nil, 52_428_800)
 	for scanner.Scan() {
@@ -100,7 +101,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			continue
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
-		eventData = restoreXAINamespaceToolCalls(eventData, prepared.namespaceTools)
+		eventData = namespaceRestorer.restore(eventData)
 		eventData = responseFilter.apply(eventData)
 		if len(eventData) == 0 {
 			continue
@@ -178,6 +179,10 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	}
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "stream")
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "tools")
+	// Compact deletes tools after prepareResponsesRequestTo, which can now keep
+	// image_generation and rewrite its forced choice to "required" on grok-4.6+.
+	// Drop the leftover selection so compact does not send tool_choice without tools.
+	prepared.body = normalizeXAIToolChoiceForTools(prepared.body)
 	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
 		prepared.body, _ = sjson.DeleteBytes(prepared.body, field)
 	}

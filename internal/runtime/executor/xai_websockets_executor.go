@@ -755,6 +755,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		var outputItemsFallback [][]byte
 		responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 		phaseMarker := xaiResponsePhaseMarker{reporter: reporter}
+		namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 		recordedTranscript := false
 		for {
 			if ctx != nil && ctx.Err() != nil {
@@ -807,6 +808,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			}
 			reporter.MarkFirstResponseByte()
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 
 			if wsErr, ok := parseXAIWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
@@ -828,7 +830,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			}
 
 			for _, payload := range xaiNormalizeReasoningSummaryDataEvents(payload) {
-				payload = restoreXAINamespaceToolCalls(payload, prepared.namespaceTools)
+				payload = namespaceRestorer.restore(payload)
 				payload = responseFilter.apply(payload)
 				if len(payload) == 0 {
 					continue
@@ -1557,6 +1559,8 @@ func applyXAIWebsocketHeaders(headers http.Header, auth *cliproxyauth.Auth, toke
 	headers.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
 		headers.Set("Authorization", "Bearer "+token)
+	} else {
+		headers.Del("Authorization")
 	}
 	if sessionID != "" {
 		headers.Set("x-grok-conv-id", sessionID)

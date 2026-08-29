@@ -165,6 +165,7 @@ const (
 	xaiXSearchToolType         = "x_search"
 	xaiMaxToolsPerRequest      = 200
 	xaiWebSearchUpstreamCost   = 4
+	xaiMaxTools                = xaiMaxToolsPerRequest
 	// Codex Desktop injects codex_app.automation_update with a large oneOf+$ref
 	// schema. xAI's free/build Responses path accepts the HTTP request but never
 	// emits SSE when that schema is present, so Desktop hangs on "thinking".
@@ -228,6 +229,8 @@ func (e *XAIExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth)
 	token, _ := xaiCreds(auth)
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		req.Header.Del("Authorization")
 	}
 	var attrs map[string]string
 	if auth != nil {

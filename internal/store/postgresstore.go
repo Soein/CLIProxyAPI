@@ -885,6 +885,7 @@ func (s *PostgresStore) SaveVersioned(ctx context.Context, auth *cliproxyauth.Au
 	if auth == nil {
 		return "", 0, fmt.Errorf("postgres store: auth is nil")
 	}
+	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
 		return "", 0, fmt.Errorf("postgres store: %w", errWeight)
 	}
@@ -941,6 +942,7 @@ func (s *PostgresStore) Restore(ctx context.Context, auth *cliproxyauth.Auth, ex
 	if auth == nil {
 		return "", 0, fmt.Errorf("postgres store: auth is nil")
 	}
+	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
 		return "", 0, fmt.Errorf("postgres store: %w", errWeight)
 	}
@@ -1689,6 +1691,7 @@ func (s *PostgresStore) buildAuthFromRow(id, payload string, createdAt, updatedA
 		return nil, false
 	}
 	delete(metadata, postgresAuthGenerationPayloadKey)
+	cliproxyauth.NormalizeCredentialMetadata(metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(&cliproxyauth.Auth{Metadata: metadata}); errWeight != nil {
 		log.WithError(errWeight).Warnf("postgres store: skipping auth %s with invalid weight", id)
 		return nil, false

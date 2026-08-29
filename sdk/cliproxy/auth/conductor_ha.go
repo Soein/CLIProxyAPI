@@ -826,6 +826,7 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		NormalizeCredentialMetadata(auth.Metadata)
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}

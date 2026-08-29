@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -116,6 +117,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, opts cliproxyexecutor.Options, affinityState resultSessionAffinity, lease *authLease, dispatchRelease func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
+	streamStart := time.Now()
 	go func() {
 		defer close(out)
 		defer lease.Release()
@@ -131,6 +133,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
+				entry := logEntryWithRequestID(ctx)
+				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
 				rerr := resultErrorFromError(chunk.Err)
 				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
@@ -237,6 +241,7 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 				dispatchRelease = nil
 			}
 		}
+		ctx = newUpstreamAttemptContext(ctx)
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
@@ -255,7 +260,10 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 		if errCtx := ctx.Err(); errCtx != nil {
 			return nil, errCtx
 		}
+		entry := logEntryWithRequestID(ctx)
+		startStream := time.Now()
 		streamResult, dispatchRelease, errStream := m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
+		durationStream := time.Since(startStream)
 		if errors.Is(errStream, ErrDispatchAdmissionRejected) {
 			return nil, errStream
 		}
@@ -266,7 +274,8 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 			if allowRetry {
 				alreadyTried := didRefreshOnUnauthorized
 				willAttemptHomeRefresh := ephemeralResult && !alreadyTried && auth != nil && auth.AuthKind() == AuthKindOAuth && isUnauthorizedError(errStream)
-				refreshed, okRefresh, errRefresh := m.tryRefreshExecutionAuthAfterUnauthorized(ctx, executor, auth, errStream, alreadyTried, ephemeralResult)
+				refreshCtx := newUpstreamAttemptContext(ctx)
+				refreshed, okRefresh, errRefresh := m.tryRefreshExecutionAuthAfterUnauthorized(refreshCtx, executor, auth, errStream, alreadyTried, ephemeralResult)
 				if willAttemptHomeRefresh {
 					didRefreshOnUnauthorized = true
 					if unauthorizedRefreshTried != nil {
@@ -277,21 +286,30 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 					return nil, errRefresh
 				} else if errRefresh != nil {
 					errStream = errRefresh
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationStream, errStream)
 				} else if okRefresh {
 					auth = refreshed
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					ctx = newUpstreamAttemptContext(ctx)
+					startRetry := time.Now()
 					streamResult, dispatchRelease, errStream = m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
+					durationRetry := time.Since(startRetry)
 					if errors.Is(errStream, ErrDispatchAdmissionRejected) {
 						return nil, errStream
 					}
 					if errStream != nil {
+						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationRetry, errStream)
 						if errCtx := ctx.Err(); errCtx != nil {
 							return nil, errCtx
 						}
 					}
+				} else {
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationStream, errStream)
 				}
+			} else {
+				warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationStream, errStream)
 			}
 		}
 		if !ephemeralResult {
@@ -342,7 +360,8 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 			if allowRetry {
 				alreadyTried := didRefreshOnUnauthorized
 				willAttemptHomeRefresh := ephemeralResult && !alreadyTried && auth != nil && auth.AuthKind() == AuthKindOAuth && isUnauthorizedError(bootstrapErr)
-				refreshed, okRefresh, errRefresh := m.tryRefreshExecutionAuthAfterUnauthorized(ctx, executor, auth, bootstrapErr, alreadyTried, ephemeralResult)
+				refreshCtx := newUpstreamAttemptContext(ctx)
+				refreshed, okRefresh, errRefresh := m.tryRefreshExecutionAuthAfterUnauthorized(refreshCtx, executor, auth, bootstrapErr, alreadyTried, ephemeralResult)
 				if willAttemptHomeRefresh {
 					didRefreshOnUnauthorized = true
 					if unauthorizedRefreshTried != nil {
@@ -357,6 +376,7 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 					discardStreamChunks(streamResult.Chunks)
 					releaseDispatch()
 					bootstrapErr = errRefresh
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 					streamResult = &cliproxyexecutor.StreamResult{}
 				} else if okRefresh {
 					discardStreamChunks(streamResult.Chunks)
@@ -365,6 +385,8 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					ctx = newUpstreamAttemptContext(ctx)
+					startRetry := time.Now()
 					retryStream, retryRelease, retryErr := m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
 					if errors.Is(retryErr, ErrDispatchAdmissionRejected) {
 						return nil, retryErr
@@ -378,13 +400,21 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 							return nil, errCtx
 						}
 						bootstrapErr = retryErr
+						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startRetry), bootstrapErr)
 						streamResult = &cliproxyexecutor.StreamResult{}
 					} else {
 						streamResult = retryStream
 						dispatchRelease = retryRelease
 						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+						if bootstrapErr != nil {
+							warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startRetry), bootstrapErr)
+						}
 					}
+				} else {
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 				}
+			} else {
+				warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 			}
 		}
 		if !ephemeralResult {
@@ -452,6 +482,7 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 		if closed && len(buffered) == 0 {
 			releaseDispatch()
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+			warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), emptyErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
 			m.recordExecutionResultWithAffinity(ctx, result, auth, ephemeralResult, affinityState, idx < len(execModels)-1)
 			if idx < len(execModels)-1 {
