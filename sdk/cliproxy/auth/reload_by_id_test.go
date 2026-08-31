@@ -5,6 +5,9 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // fakeStore implements Store. When indexed=true it also implements
@@ -149,5 +152,66 @@ func TestReloadByID_SurfacesStoreError(t *testing.T) {
 	err := m.ReloadByID(context.Background(), "codex-1")
 	if !errors.Is(err, want) {
 		t.Fatalf("expected wrapped boom error, got %v", err)
+	}
+}
+
+func TestReloadByID_RecreatedAuthAdvancesLifecycleAndRemainsExecutable(t *testing.T) {
+	const (
+		authID   = "reload-recreated-auth"
+		provider = "reload-recreated-provider"
+		model    = "reload-recreated-model"
+	)
+	ctx := context.Background()
+	inner := &fakeStore{all: map[string]*Auth{}}
+	manager := newManagerWithStore(&fakeIndexedStore{fakeStore: inner})
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: provider})
+
+	registered, errRegister := manager.Register(WithSkipPersist(ctx), &Auth{
+		ID:       authID,
+		Provider: provider,
+		Status:   StatusActive,
+	})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+	manager.RefreshSchedulerEntry(authID)
+	if _, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("Execute() before recreation error = %v", errExecute)
+	}
+
+	inner.mu.Lock()
+	delete(inner.all, authID)
+	inner.mu.Unlock()
+	if errReload := manager.ReloadByID(ctx, authID); errReload != nil {
+		t.Fatalf("ReloadByID() after deletion error = %v", errReload)
+	}
+	reg.UnregisterClient(authID)
+
+	inner.mu.Lock()
+	inner.all[authID] = &Auth{ID: authID, Provider: provider, Status: StatusActive}
+	inner.mu.Unlock()
+	if errReload := manager.ReloadByID(ctx, authID); errReload != nil {
+		t.Fatalf("ReloadByID() after recreation error = %v", errReload)
+	}
+	reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	manager.ReconcileRegistryModelStates(ctx, authID)
+	manager.RefreshSchedulerEntry(authID)
+
+	recreated, ok := manager.GetByID(authID)
+	if !ok || recreated == nil {
+		t.Fatal("GetByID() did not return recreated auth")
+	}
+	if recreated.RegistrationEpoch <= registered.RegistrationEpoch {
+		t.Fatalf("recreated RegistrationEpoch = %d, want > %d", recreated.RegistrationEpoch, registered.RegistrationEpoch)
+	}
+	if recreated.Generation == 0 {
+		t.Fatal("recreated Generation = 0, want a current lifecycle generation")
+	}
+	if _, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("Execute() after recreation error = %v", errExecute)
 	}
 }

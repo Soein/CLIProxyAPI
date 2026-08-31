@@ -206,6 +206,9 @@ func TestManagerUpdateConflictFailsClosedWhileAuthoritativeReloadIsBlocked(t *te
 			if errSelect != nil || selected == nil || selected.ID != authID {
 				t.Fatalf("SelectAuth() after reload = %#v, %v; want %q", selected, errSelect, authID)
 			}
+			if _, errExecute := manager.Execute(context.Background(), []string{"test"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+				t.Fatalf("Execute() after authoritative reload error = %v", errExecute)
+			}
 		})
 	}
 }

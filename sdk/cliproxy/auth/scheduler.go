@@ -308,6 +308,12 @@ func (s *authScheduler) RecordRemovalTombstone(authID string, tombstoneEpoch uin
 }
 
 func (s *authScheduler) recordRemovalTombstoneLocked(authID string, tombstoneEpoch uint64) {
+	dirty := make(map[*modelScheduler]struct{})
+	s.recordRemovalTombstoneWithoutRebuildLocked(authID, tombstoneEpoch, dirty)
+	rebuildDirtyShardsLocked(dirty)
+}
+
+func (s *authScheduler) recordRemovalTombstoneWithoutRebuildLocked(authID string, tombstoneEpoch uint64, dirty map[*modelScheduler]struct{}) {
 	if authID == "" {
 		return
 	}
@@ -323,21 +329,26 @@ func (s *authScheduler) recordRemovalTombstoneLocked(authID string, tombstoneEpo
 		generation: 0,
 		updatedAt:  now,
 	}
-	dirty := make(map[*modelScheduler]struct{})
 	s.removeAuthFromProvidersWithoutRebuildLocked(authID, dirty)
-	rebuildDirtyShardsLocked(dirty)
 }
 
 // applyBatch publishes upserts and removals under one scheduler lock. Manager
 // uses it while holding its own admission lock so a batch cannot be observed
 // as a series of independently selectable credentials.
-func (s *authScheduler) applyBatch(auths []*Auth, removals map[string]uint64) {
-	if s == nil || (len(auths) == 0 && len(removals) == 0) {
+func (s *authScheduler) applyBatch(auths []*Auth, removals map[string]uint64, removalEpochs map[string]uint64) {
+	if s == nil || (len(auths) == 0 && len(removals) == 0 && len(removalEpochs) == 0) {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dirty := make(map[*modelScheduler]struct{})
+	for authID, epoch := range removalEpochs {
+		authID = strings.TrimSpace(authID)
+		if authID == "" {
+			continue
+		}
+		s.recordRemovalTombstoneWithoutRebuildLocked(authID, epoch, dirty)
+	}
 	for authID, revision := range removals {
 		authID = strings.TrimSpace(authID)
 		if authID == "" {

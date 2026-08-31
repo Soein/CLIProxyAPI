@@ -264,6 +264,25 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
 	}
 }
 
+func (m *Manager) publishClientModelProjections(auth *Auth, now time.Time) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	reg := registry.GetGlobalRegistry()
+	supportedModels, regEpoch := reg.GetModelsAndEpochForClient(auth.ID)
+	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
+	for _, supportedModel := range supportedModels {
+		if supportedModel == nil || strings.TrimSpace(supportedModel.ID) == "" {
+			continue
+		}
+		projections = append(projections, m.clientModelProjectionForAuth(auth, supportedModel.ID, now))
+	}
+	if len(projections) == 0 {
+		return
+	}
+	reg.ApplyClientModelProjections(auth.ID, regEpoch, auth.Generation, projections)
+}
+
 func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
 	if auth != nil && auth.Attributes != nil {
 		if homeModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); homeModel != "" {

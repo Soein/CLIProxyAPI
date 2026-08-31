@@ -195,6 +195,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 	}
 	for _, id := range normalizedIDs {
 		auth := m.auths[id]
+		lifecycleBaseline := auth.Clone()
 		if !disabled {
 			expectedDurableRevisions = append(expectedDurableRevisions, auth.durableRevision)
 			originals = append(originals, auth.Clone())
@@ -216,6 +217,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 		if clearCooldownStateForAuth(auth, now) {
 			cooldownStateChanged = true
 		}
+		m.advanceAuthGenerationLocked(auth, lifecycleBaseline)
 		if disabled {
 			auth.revision = m.nextAuthRevisionLocked()
 			auth.durableRevision = m.nextAuthDurableRevisionLocked()
@@ -231,7 +233,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 		updated = append(updated, auth.Clone())
 	}
 	if disabled && m.scheduler != nil {
-		m.scheduler.applyBatch(updated, nil)
+		m.scheduler.applyBatch(updated, nil, nil)
 	}
 	m.mu.Unlock()
 
@@ -296,19 +298,15 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 					return errCommit
 				}
 				committed = true
+				committedAt := time.Now()
 				for index, id := range normalizedIDs {
 					current := m.auths[id]
-					updated[index].Runtime = current.Runtime
-					updated[index].Success = current.Success
-					updated[index].Failed = current.Failed
-					updated[index].recentRequests = current.recentRequests
-					updated[index].revision = m.nextAuthRevisionLocked()
-					updated[index].durableRevision = m.nextAuthDurableRevisionLocked()
+					m.finalizeEnabledAuthLocked(updated[index], current, committedAt)
 					m.auths[id] = updated[index].Clone()
 					delete(m.pendingDisabledPersistence, id)
 				}
 				if m.scheduler != nil {
-					m.scheduler.applyBatch(updated, nil)
+					m.scheduler.applyBatch(updated, nil, nil)
 				}
 				m.endEnableTransitionLocked(normalizedIDs)
 				enableTransitionActive = false
@@ -369,19 +367,15 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 				conflictErr = ctx.Err()
 			}
 			if conflictErr == nil {
+				committedAt := time.Now()
 				for index, id := range normalizedIDs {
 					current := m.auths[id]
-					updated[index].Runtime = current.Runtime
-					updated[index].Success = current.Success
-					updated[index].Failed = current.Failed
-					updated[index].recentRequests = current.recentRequests
-					updated[index].revision = m.nextAuthRevisionLocked()
-					updated[index].durableRevision = m.nextAuthDurableRevisionLocked()
+					m.finalizeEnabledAuthLocked(updated[index], current, committedAt)
 					m.auths[id] = updated[index].Clone()
 					delete(m.pendingDisabledPersistence, id)
 				}
 				if m.scheduler != nil {
-					m.scheduler.applyBatch(updated, nil)
+					m.scheduler.applyBatch(updated, nil, nil)
 				}
 				m.endEnableTransitionLocked(normalizedIDs)
 				enableTransitionActive = false
@@ -398,6 +392,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 	}
 	for _, auth := range updated {
 		m.queueRefreshReschedule(auth.ID)
+		m.publishClientModelProjections(auth, time.Now())
 	}
 	releasePersistence()
 
@@ -426,6 +421,20 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 		return converged, nil
 	}
 	return updated, errPersist
+}
+
+func (m *Manager) finalizeEnabledAuthLocked(candidate, current *Auth, committedAt time.Time) {
+	if m == nil || candidate == nil || current == nil {
+		return
+	}
+	candidate.Runtime = current.Runtime
+	candidate.Success = current.Success
+	candidate.Failed = current.Failed
+	candidate.recentRequests = current.recentRequests
+	m.advanceAuthGenerationLocked(candidate, current)
+	candidate.UpdatedAt = committedAt
+	candidate.revision = m.nextAuthRevisionLocked()
+	candidate.durableRevision = m.nextAuthDurableRevisionLocked()
 }
 
 func (m *Manager) atomicBatchPersistence(ctx context.Context, auths []*Auth) (authAtomicBatchStore, []*Auth, bool) {
@@ -529,6 +538,7 @@ type removedAuthState struct {
 	id       string
 	provider string
 	revision uint64
+	epoch    uint64
 }
 
 func (m *Manager) DeleteAuths(ctx context.Context, ids []string, deletePersistent func(context.Context) error) error {
@@ -598,6 +608,7 @@ func (m *Manager) removeAuthsLocked(ids []string) []removedAuthState {
 			id:       id,
 			provider: strings.TrimSpace(existing.Provider),
 			revision: m.nextAuthRevisionLocked(),
+			epoch:    m.advanceAuthRemovalEpochLocked(id, existing),
 		})
 	}
 	return removed
@@ -613,6 +624,7 @@ func (m *Manager) cleanupRemovedAuths(ctx context.Context, removed []removedAuth
 	}
 	for _, state := range removed {
 		if m.scheduler != nil {
+			m.scheduler.RecordRemovalTombstone(state.id, state.epoch)
 			m.scheduler.removeAuthAtRevision(state.id, state.revision)
 		}
 		m.queueRefreshUnschedule(state.id)
@@ -1627,7 +1639,7 @@ func (m *Manager) failCloseAuthStoreConflicts(authIDs []string) ([]string, map[s
 	// Keep runtime publication and scheduler tombstones in the same admission
 	// critical section. applyBatch holds one scheduler lock for the whole set.
 	if m.scheduler != nil {
-		m.scheduler.applyBatch(nil, removals)
+		m.scheduler.applyBatch(nil, removals, nil)
 	}
 	m.mu.Unlock()
 	return normalized, baselines
@@ -1730,13 +1742,16 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 
 		published = make([]*Auth, 0, len(authIDs))
 		removals := make(map[string]uint64)
+		removalEpochs := make(map[string]uint64)
 		for _, authID := range authIDs {
 			current := m.auths[authID]
 			state, persistent := states[authID]
 			if persistent && (!state.Exists || state.Deleted) {
 				revision := m.nextAuthRevisionLocked()
 				removals[authID] = revision
-				removed = append(removed, removedAuthState{id: authID, provider: current.Provider, revision: revision})
+				epoch := m.advanceAuthRemovalEpochLocked(authID, current)
+				removalEpochs[authID] = epoch
+				removed = append(removed, removedAuthState{id: authID, provider: current.Provider, revision: revision, epoch: epoch})
 				m.clearPersistenceInFlightLocked(authID, 0)
 				delete(m.pendingDisabledPersistence, authID)
 				delete(m.enablingTransitions, authID)
@@ -1754,6 +1769,7 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 				next.Failed = current.Failed
 				next.recentRequests = current.recentRequests
 			}
+			m.advanceAuthGenerationLocked(next, current)
 			next.revision = m.nextAuthRevisionLocked()
 			next.durableRevision = m.nextAuthDurableRevisionLocked()
 			m.auths[authID] = next
@@ -1761,7 +1777,7 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 			published = append(published, next.Clone())
 		}
 		if m.scheduler != nil {
-			m.scheduler.applyBatch(published, removals)
+			m.scheduler.applyBatch(published, removals, removalEpochs)
 		}
 		finalized = true
 		return nil
@@ -1778,6 +1794,7 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 	m.wakeDispatchAuthority()
 
 	for _, auth := range published {
+		m.publishClientModelProjections(auth, time.Now())
 		m.queueRefreshReschedule(auth.ID)
 		m.hook.OnAuthUpdated(reloadCtx, auth.Clone())
 	}

@@ -417,6 +417,7 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 	var schedulerCopy *Auth
 	persistMergedDisabled := false
 	removalRevision := uint64(0)
+	removalEpoch := uint64(0)
 	existing := m.auths[id]
 	existed := existing != nil
 	removedProvider := ""
@@ -425,12 +426,14 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 			m.mu.Unlock()
 			return nil
 		}
+		m.advanceAuthGenerationLocked(merged, existing)
 		m.auths[id] = merged
 		schedulerCopy = merged.Clone()
 		_, pendingDisable := m.pendingDisabledPersistence[id]
 		persistMergedDisabled = pendingDisable && m.enablingTransitions[id] == 0
 	} else if fetched == nil {
 		removalRevision = m.nextAuthRevisionLocked()
+		removalEpoch = m.advanceAuthRemovalEpochLocked(id, existing)
 		m.clearPersistenceInFlightLocked(id, 0)
 		delete(m.pendingDisabledPersistence, id)
 		delete(m.enablingTransitions, id)
@@ -447,6 +450,11 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 		}
 	} else {
 		cloned := mergePersistedAuthRuntime(fetched, m.auths[id])
+		if existed {
+			m.advanceAuthGenerationLocked(cloned, existing)
+		} else {
+			m.beginAuthRegistrationLocked(cloned, nil)
+		}
 		cloned.revision = m.nextAuthRevisionLocked()
 		cloned.durableRevision = m.nextAuthDurableRevisionLocked()
 		m.auths[id] = cloned
@@ -458,11 +466,13 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 		if schedulerCopy != nil {
 			m.schedulerUpsert(schedulerCopy)
 		} else {
+			m.scheduler.RecordRemovalTombstone(id, removalEpoch)
 			m.scheduler.removeAuthAtRevision(id, removalRevision)
 		}
 	}
 	m.wakeDispatchAuthority()
 	if schedulerCopy != nil {
+		m.publishClientModelProjections(schedulerCopy, time.Now())
 		m.queueRefreshReschedule(id)
 		if existed {
 			m.hook.OnAuthUpdated(ctx, schedulerCopy.Clone())

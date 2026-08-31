@@ -63,6 +63,66 @@ func (m *Manager) UnregisterExecutor(provider string) {
 	m.mu.Unlock()
 }
 
+// beginAuthRegistrationLocked starts a new registration lifecycle for auth.
+// The caller must hold m.mu.
+func (m *Manager) beginAuthRegistrationLocked(auth, current *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
+	}
+	epoch := max(m.authEpochs[auth.ID], auth.RegistrationEpoch)
+	if current != nil {
+		epoch = max(epoch, current.RegistrationEpoch)
+	}
+	epoch++
+	m.authEpochs[auth.ID] = epoch
+	auth.RegistrationEpoch = epoch
+	auth.Generation = 1
+}
+
+// advanceAuthGenerationLocked publishes auth as a newer mutation in the
+// current registration lifecycle. The caller must hold m.mu.
+func (m *Manager) advanceAuthGenerationLocked(auth, current *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
+	}
+	epoch := max(m.authEpochs[auth.ID], auth.RegistrationEpoch)
+	generation := auth.Generation
+	if current != nil {
+		epoch = max(epoch, current.RegistrationEpoch)
+		generation = max(generation, current.Generation)
+	}
+	if epoch == 0 {
+		epoch = 1
+	}
+	m.authEpochs[auth.ID] = epoch
+	auth.RegistrationEpoch = epoch
+	auth.Generation = generation + 1
+}
+
+// advanceAuthRemovalEpochLocked records a tombstone for the lifecycle being
+// removed. The caller must hold m.mu.
+func (m *Manager) advanceAuthRemovalEpochLocked(id string, current *Auth) uint64 {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return 0
+	}
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
+	}
+	epoch := m.authEpochs[id]
+	if current != nil {
+		epoch = max(epoch, current.RegistrationEpoch)
+	}
+	epoch++
+	m.authEpochs[id] = epoch
+	return epoch
+}
+
 // Register inserts a new auth entry into the manager.
 func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {

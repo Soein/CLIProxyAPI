@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -204,5 +205,121 @@ func TestManagerSetDisabledDrainsRequestAdmittedBeforeDisable(t *testing.T) {
 	case executedAuthID := <-executor.executed:
 		t.Fatalf("executor received disabled auth %q for a new request", executedAuthID)
 	default:
+	}
+}
+
+func TestManagerSetDisabledAdvancesGenerationAndPublishesRegistryState(t *testing.T) {
+	const (
+		provider = "set-disabled-consistency"
+		model    = "set-disabled-consistency-model"
+		authID   = "set-disabled-consistency-auth"
+	)
+	ctx := context.Background()
+	registerSchedulerModels(t, provider, model, authID)
+	reg := registry.GetGlobalRegistry()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	registered, errRegister := manager.Register(ctx, &Auth{ID: authID, Provider: provider, Status: StatusActive})
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	manager.ReconcileRegistryModelStates(ctx, authID)
+	if reg.IsModelSuspendedForClient(authID, model) {
+		t.Fatal("registered active auth model is unexpectedly suspended")
+	}
+
+	disabled, errDisable := manager.SetDisabled(ctx, []string{authID}, true)
+	if errDisable != nil {
+		t.Fatalf("SetDisabled(true) error = %v", errDisable)
+	}
+	if len(disabled) != 1 || disabled[0] == nil {
+		t.Fatalf("SetDisabled(true) result = %#v, want one auth", disabled)
+	}
+	if disabled[0].Generation <= registered.Generation {
+		t.Fatalf("disabled Generation = %d, want > %d", disabled[0].Generation, registered.Generation)
+	}
+	if !reg.IsModelSuspendedForClient(authID, model) {
+		t.Fatal("disabled auth model was not suspended in registry")
+	}
+
+	enabled, errEnable := manager.SetDisabled(ctx, []string{authID}, false)
+	if errEnable != nil {
+		t.Fatalf("SetDisabled(false) error = %v", errEnable)
+	}
+	if len(enabled) != 1 || enabled[0] == nil {
+		t.Fatalf("SetDisabled(false) result = %#v, want one auth", enabled)
+	}
+	if enabled[0].Generation <= disabled[0].Generation {
+		t.Fatalf("enabled Generation = %d, want > %d", enabled[0].Generation, disabled[0].Generation)
+	}
+	if reg.IsModelSuspendedForClient(authID, model) {
+		t.Fatal("enabled auth model remained suspended in registry")
+	}
+	regEpoch := reg.ClientRegistrationEpoch(authID)
+	if reg.ApplyClientModelProjections(authID, regEpoch, disabled[0].Generation, []registry.ClientModelProjection{{ModelID: model, Suspended: true}}) {
+		t.Fatal("registry accepted a delayed projection from the older disabled generation")
+	}
+	if reg.IsModelSuspendedForClient(authID, model) {
+		t.Fatal("delayed disabled projection overwrote the enabled registry state")
+	}
+}
+
+func TestManagerSetDisabledEnableOutrunsConcurrentMarkResult(t *testing.T) {
+	const (
+		provider = "gemini"
+		model    = "enable-concurrent-result-model"
+		authID   = "enable-concurrent-result-auth"
+	)
+	ctx := context.Background()
+	registerSchedulerModels(t, provider, model, authID)
+	reg := registry.GetGlobalRegistry()
+	store := newBlockingOrderedStore()
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: provider})
+
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), &Auth{ID: authID, Provider: provider, Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	manager.RefreshSchedulerEntry(authID)
+	if _, errDisable := manager.SetDisabled(WithSkipPersist(ctx), []string{authID}, true); errDisable != nil {
+		t.Fatalf("SetDisabled(true) error = %v", errDisable)
+	}
+	disabled, ok := manager.GetByID(authID)
+	if !ok || disabled == nil {
+		t.Fatal("GetByID() did not return disabled auth")
+	}
+	store.mu.Lock()
+	store.current = disabled.Clone()
+	store.mu.Unlock()
+
+	enableDone := make(chan error, 1)
+	go func() {
+		_, errEnable := manager.SetDisabled(ctx, []string{authID}, false)
+		enableDone <- errEnable
+	}()
+	<-store.activeSaveEntered
+
+	manager.MarkResult(ctx, Result{AuthID: authID, Provider: provider, Model: model, Success: true})
+	marked, ok := manager.GetByID(authID)
+	if !ok || marked == nil || !marked.Disabled {
+		t.Fatalf("auth during blocked enable = %#v, want disabled", marked)
+	}
+	close(store.releaseActiveSave)
+	if errEnable := <-enableDone; errEnable != nil {
+		t.Fatalf("SetDisabled(false) error = %v", errEnable)
+	}
+
+	enabled, ok := manager.GetByID(authID)
+	if !ok || enabled == nil || enabled.Disabled || enabled.Status != StatusActive {
+		t.Fatalf("auth after enable = %#v, want active", enabled)
+	}
+	if enabled.Generation <= marked.Generation {
+		t.Fatalf("enabled Generation = %d, want > concurrent result generation %d", enabled.Generation, marked.Generation)
+	}
+	if reg.IsModelSuspendedForClient(authID, model) {
+		t.Fatal("registry model remained suspended after concurrent enable")
+	}
+	if _, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("Execute() after concurrent enable error = %v", errExecute)
 	}
 }
