@@ -133,6 +133,7 @@ type Manager struct {
 	selectorMu                   sync.RWMutex
 	configCooldownMu             sync.Mutex
 	auths                        map[string]*Auth
+	authEpochs                   map[string]uint64
 	authRevision                 uint64
 	authDurableRevision          uint64
 	persistenceInFlightRevisions map[string]uint64
@@ -541,6 +542,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:                     selector,
 		hook:                         hook,
 		auths:                        make(map[string]*Auth),
+		authEpochs:                   make(map[string]uint64),
 		persistenceInFlightRevisions: make(map[string]uint64),
 		persistenceInFlightDone:      make(map[string]chan struct{}),
 		pendingDisabledPersistence:   make(map[string]struct{}),

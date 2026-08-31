@@ -170,10 +170,15 @@ func markHomeRetryRoundExhausted(err error, retryAfter *time.Duration, retryNow 
 	if err == nil {
 		return nil
 	}
+	upstreamAttempt := hasUpstreamExecutionAttempt(err)
+	err = unwrapUpstreamExecutionAttempt(err)
 	marked := &homeRetryRoundExhaustedError{cause: err, retryNow: retryNow}
 	if retryAfter != nil {
 		marked.retryAfter = *retryAfter
 		marked.hasRetryAfter = true
+	}
+	if upstreamAttempt {
+		return markUpstreamExecutionAttempt(marked)
 	}
 	return marked
 }
@@ -1338,14 +1343,17 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			continue
 		}
 		for _, upstreamModel := range models {
+			attemptCtx := newUpstreamAttemptContext(creditsCtx)
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := m.executeWithDispatchAdmission(creditsCtx, c.executor, c.auth, execReq, creditsOpts)
+			resp, errExec := m.executeWithDispatchAdmission(attemptCtx, c.executor, c.auth, execReq, creditsOpts)
+			errExec = markUpstreamExecutionAttemptFromContext(attemptCtx, errExec)
 			if errors.Is(errExec, ErrDispatchAdmissionRejected) {
 				return cliproxyexecutor.Response{}, false, errExec
 			}
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil, Options: creditsOpts}
+			affinityState := sessionAffinityResultForRequest(attemptCtx, c.provider, resultModel, creditsOpts)
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -1354,13 +1362,13 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				if isCredentialScopedError(errExec) {
 					result.CredentialScope = true
 				}
-				m.MarkResult(creditsCtx, result)
+				m.markResult(attemptCtx, result, affinityState, false, routeModel, false)
 				if result.CredentialScope {
 					break
 				}
 				continue
 			}
-			m.MarkResult(creditsCtx, result)
+			m.markResult(attemptCtx, result, affinityState, false, routeModel, false)
 			attemptAliasResult := resolveAttemptAliasResult(routing, c.auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, true, nil

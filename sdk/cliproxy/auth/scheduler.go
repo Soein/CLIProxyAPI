@@ -32,6 +32,13 @@ const (
 	scheduledStateDisabled
 )
 
+// scheduledGenerationMeta records the latest generation and timestamp processed for an auth ID.
+type scheduledGenerationMeta struct {
+	epoch      uint64
+	generation uint64
+	updatedAt  time.Time
+}
+
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
 	mu                  sync.Mutex
@@ -39,6 +46,7 @@ type authScheduler struct {
 	providers           map[string]*providerScheduler
 	authProviders       map[string]string
 	authVersions        map[string]scheduledAuthVersion
+	authGenerations     map[string]scheduledGenerationMeta
 	mixedCursors        map[string]int
 	mixedWeightedStates map[string]*smoothWeightedState
 }
@@ -154,6 +162,7 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		providers:           make(map[string]*providerScheduler),
 		authProviders:       make(map[string]string),
 		authVersions:        make(map[string]scheduledAuthVersion),
+		authGenerations:     make(map[string]scheduledGenerationMeta),
 		mixedCursors:        make(map[string]int),
 		mixedWeightedStates: make(map[string]*smoothWeightedState),
 	}
@@ -188,9 +197,13 @@ func (s *authScheduler) setSelector(selector Selector) {
 // rebuild recreates scheduler state from a Manager snapshot. snapshotWatermark
 // is the latest Manager revision covered by auths, so incremental updates newer
 // than the snapshot survive even when their IDs are absent from it.
-func (s *authScheduler) rebuild(auths []*Auth, snapshotWatermark uint64) {
+func (s *authScheduler) rebuild(auths []*Auth, snapshotWatermarks ...uint64) {
 	if s == nil {
 		return
+	}
+	var snapshotWatermark uint64
+	if len(snapshotWatermarks) > 0 {
+		snapshotWatermark = snapshotWatermarks[0]
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -232,6 +245,9 @@ func (s *authScheduler) rebuild(auths []*Auth, snapshotWatermark uint64) {
 	}
 	s.providers = make(map[string]*providerScheduler)
 	s.authProviders = make(map[string]string)
+	if s.authGenerations == nil {
+		s.authGenerations = make(map[string]scheduledGenerationMeta)
+	}
 	s.mixedCursors = make(map[string]int)
 	s.mixedWeightedStates = make(map[string]*smoothWeightedState)
 	now := time.Now()
@@ -274,6 +290,41 @@ func (s *authScheduler) upsertBatch(auths []*Auth) {
 	for _, auth := range auths {
 		s.upsertAuthWithoutRebuildLocked(auth, now, dirty)
 	}
+	rebuildDirtyShardsLocked(dirty)
+}
+
+// RecordRemovalTombstone records a removal tombstone with the specified epoch and cleans up provider shards.
+func (s *authScheduler) RecordRemovalTombstone(authID string, tombstoneEpoch uint64) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordRemovalTombstoneLocked(authID, tombstoneEpoch)
+}
+
+func (s *authScheduler) recordRemovalTombstoneLocked(authID string, tombstoneEpoch uint64) {
+	if authID == "" {
+		return
+	}
+	if s.authGenerations == nil {
+		s.authGenerations = make(map[string]scheduledGenerationMeta)
+	}
+	now := time.Now()
+	if existing, exists := s.authGenerations[authID]; exists && tombstoneEpoch < existing.epoch {
+		return
+	}
+	s.authGenerations[authID] = scheduledGenerationMeta{
+		epoch:      tombstoneEpoch,
+		generation: 0,
+		updatedAt:  now,
+	}
+	dirty := make(map[*modelScheduler]struct{})
+	s.removeAuthFromProvidersWithoutRebuildLocked(authID, dirty)
 	rebuildDirtyShardsLocked(dirty)
 }
 
@@ -342,6 +393,26 @@ func (s *authScheduler) removeAuthAtRevision(authID string, revision uint64) {
 	}
 	s.authVersions[authID] = scheduledAuthVersion{revision: revision, disabled: true}
 	s.removeAuthLocked(authID)
+}
+
+// ResetAuthGeneration clears recorded generation/tombstone metadata for authID.
+func (s *authScheduler) ResetAuthGeneration(authID string) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resetAuthGenerationLocked(authID)
+}
+
+func (s *authScheduler) resetAuthGenerationLocked(authID string) {
+	if s.authGenerations != nil {
+		delete(s.authGenerations, authID)
+	}
 }
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
@@ -693,6 +764,26 @@ func containsProvider(providers []string, provider string) bool {
 	return false
 }
 
+func (s *authScheduler) isStaleScheduledAuth(authID string, incomingEpoch, incomingGen uint64, incomingUpdatedAt time.Time) bool {
+	if s.authGenerations == nil {
+		s.authGenerations = make(map[string]scheduledGenerationMeta)
+	}
+	if existing, ok := s.authGenerations[authID]; ok {
+		if existing.epoch > incomingEpoch {
+			return true
+		}
+		if existing.epoch == incomingEpoch {
+			if existing.generation > incomingGen {
+				return true
+			}
+			if existing.generation == incomingGen && existing.updatedAt.After(incomingUpdatedAt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // upsertAuthLocked updates one auth in-place while the scheduler mutex is held.
 func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 	dirty := make(map[*modelScheduler]struct{})
@@ -707,19 +798,34 @@ func (s *authScheduler) upsertAuthWithoutRebuildLocked(auth *Auth, now time.Time
 	}
 	authID := strings.TrimSpace(auth.ID)
 	effectiveDisabled := auth.Disabled || auth.Status == StatusDisabled
-	if authID == "" || !s.acceptVersionLocked(authID, auth.revision, effectiveDisabled) {
+	if authID == "" {
 		return
 	}
+
+	if s.isStaleScheduledAuth(authID, auth.RegistrationEpoch, auth.Generation, auth.UpdatedAt) {
+		return
+	}
+	if !s.acceptVersionLocked(authID, auth.revision, effectiveDisabled) {
+		return
+	}
+	s.authGenerations[authID] = scheduledGenerationMeta{
+		epoch:      auth.RegistrationEpoch,
+		generation: auth.Generation,
+		updatedAt:  auth.UpdatedAt,
+	}
+
 	providerKey := executorKeyFromAuth(auth)
 	if providerKey == "" || effectiveDisabled {
-		s.removeAuthWithoutRebuildLocked(authID, dirty)
+		s.removeAuthFromProvidersWithoutRebuildLocked(authID, dirty)
 		return
 	}
+
 	if previousProvider := s.authProviders[authID]; previousProvider != "" && previousProvider != providerKey {
 		if previousState := s.providers[previousProvider]; previousState != nil {
 			previousState.removeAuthWithoutRebuildLocked(authID, dirty)
 		}
 	}
+
 	meta := buildScheduledAuthMeta(auth)
 	s.authProviders[authID] = providerKey
 	s.ensureProviderLocked(providerKey).upsertAuthWithoutRebuildLocked(meta, now, dirty)
@@ -743,6 +849,15 @@ func (s *authScheduler) acceptVersionLocked(authID string, revision uint64, disa
 	return true
 }
 
+func (s *authScheduler) removeAuthFromProvidersWithoutRebuildLocked(authID string, dirty map[*modelScheduler]struct{}) {
+	if providerKey := s.authProviders[authID]; providerKey != "" {
+		if providerState := s.providers[providerKey]; providerState != nil {
+			providerState.removeAuthWithoutRebuildLocked(authID, dirty)
+		}
+		delete(s.authProviders, authID)
+	}
+}
+
 // removeAuthLocked removes one auth from the scheduler while the scheduler mutex is held.
 func (s *authScheduler) removeAuthLocked(authID string) {
 	dirty := make(map[*modelScheduler]struct{})
@@ -755,12 +870,7 @@ func (s *authScheduler) removeAuthWithoutRebuildLocked(authID string, dirty map[
 	if authID == "" {
 		return
 	}
-	if providerKey := s.authProviders[authID]; providerKey != "" {
-		if providerState := s.providers[providerKey]; providerState != nil {
-			providerState.removeAuthWithoutRebuildLocked(authID, dirty)
-		}
-		delete(s.authProviders, authID)
-	}
+	s.removeAuthFromProvidersWithoutRebuildLocked(authID, dirty)
 }
 
 func rebuildDirtyShardsLocked(dirty map[*modelScheduler]struct{}) {

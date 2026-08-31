@@ -346,6 +346,8 @@ func TestAPICallDispatchAdmissionRejectsAntigravityRefreshWithoutSideEffects(t *
 			"expired":       time.Now().Add(-time.Minute).Format(time.RFC3339),
 		},
 	})
+	registeredLastRefreshedAt := registered.LastRefreshedAt
+	registeredUpdatedAt := registered.UpdatedAt
 	authority := &apiCallDispatchAuthority{}
 	manager.SetDispatchAuthority(authority)
 	h := &Handler{cfg: &config.Config{}, authManager: manager}
@@ -377,7 +379,7 @@ func TestAPICallDispatchAdmissionRejectsAntigravityRefreshWithoutSideEffects(t *
 	if got := stringValue(current.Metadata, "refresh_token"); got != "unchanged-refresh-token" {
 		t.Fatalf("refresh_token = %q, want unchanged unchanged-refresh-token", got)
 	}
-	if !current.LastRefreshedAt.IsZero() || !current.UpdatedAt.IsZero() {
+	if !current.LastRefreshedAt.Equal(registeredLastRefreshedAt) || !current.UpdatedAt.Equal(registeredUpdatedAt) {
 		t.Fatalf("credential timestamps mutated after rejection: refreshed=%v updated=%v", current.LastRefreshedAt, current.UpdatedAt)
 	}
 	if admits, releases, active := authority.counts(); admits != 1 || releases != 0 || active != 0 {

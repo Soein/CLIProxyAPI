@@ -819,6 +819,9 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 	m.mu.Lock()
 	previous := m.auths
 	next := make(map[string]*Auth, len(items))
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64, len(items))
+	}
 	loadedSnapshots := make([]*Auth, 0, len(items))
 	registeredIDs := make(map[string]struct{}, len(items))
 	persistMergedDisabledIDs := make(map[string]struct{})
@@ -857,6 +860,11 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 			merged.revision = m.nextAuthRevisionLocked()
 			merged.durableRevision = m.nextAuthDurableRevisionLocked()
 		}
+		merged.EnsureIndex()
+		epoch := max(m.authEpochs[auth.ID], auth.RegistrationEpoch, merged.RegistrationEpoch) + 1
+		m.authEpochs[auth.ID] = epoch
+		merged.RegistrationEpoch = epoch
+		merged.Generation = 1
 		next[auth.ID] = merged
 		loadedSnapshots = append(loadedSnapshots, merged.Clone())
 		if previous[auth.ID] == nil {
@@ -886,10 +894,16 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 	}
 	removedIDs := make([]string, 0)
 	removedRevisions := make(map[string]uint64)
+	removedEpochs := make(map[string]uint64)
 	removedProviders := make(map[string]string)
 	for id := range previous {
 		if next[id] == nil {
 			removedRevisions[id] = m.nextAuthRevisionLocked()
+			if previous[id] != nil && previous[id].RegistrationEpoch > m.authEpochs[id] {
+				m.authEpochs[id] = previous[id].RegistrationEpoch
+			}
+			m.authEpochs[id]++
+			removedEpochs[id] = m.authEpochs[id]
 			m.clearPersistenceInFlightLocked(id, 0)
 			delete(m.pendingDisabledPersistence, id)
 			delete(m.enablingTransitions, id)
@@ -913,6 +927,11 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
+	if m.scheduler != nil {
+		for id, epoch := range removedEpochs {
+			m.scheduler.RecordRemovalTombstone(id, epoch)
+		}
+	}
 	m.syncScheduler()
 	if m.scheduler != nil {
 		for _, id := range removedIDs {

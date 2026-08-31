@@ -333,6 +333,8 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
+	auth.Generation++
+	auth.UpdatedAt = now
 	m.auths[id] = auth
 	m.mu.Unlock()
 
@@ -379,53 +381,9 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 	return resumed
 }
 
-// tryRefreshExecutionAuthAfterUnauthorized refreshes OAuth credentials once for
-// either a local auth or an ephemeral Home dispatch auth.
-func (m *Manager) tryRefreshExecutionAuthAfterUnauthorized(ctx context.Context, executor ProviderExecutor, auth *Auth, execErr error, alreadyTried bool, homeDispatch bool) (*Auth, bool, error) {
-	if !homeDispatch {
-		return m.tryRefreshAfterUnauthorized(ctx, auth, execErr, alreadyTried)
-	}
-	if m == nil || executor == nil || auth == nil || alreadyTried || execErr == nil {
-		return auth, false, nil
-	}
-	if !isUnauthorizedError(execErr) || auth.AuthKind() != AuthKindOAuth {
-		return auth, false, nil
-	}
-
-	log.Debugf("unauthorized Home response for %s (%s), refreshing credentials before redispatch", auth.Provider, auth.ID)
-	target := auth.Clone()
-	updated, errRefresh := executor.Refresh(ctx, target)
-	if errRefresh != nil {
-		log.Debugf("Home credential refresh before redispatch failed for %s (%s)", auth.Provider, auth.ID)
-		return auth, false, errRefresh
-	}
-	if updated == nil {
-		updated = target
-	}
-	if updated.ID == "" {
-		updated.ID = auth.ID
-	}
-	if updated.Index == "" {
-		updated.Index = auth.Index
-	}
-	if updated.Provider == "" {
-		updated.Provider = auth.Provider
-	}
-	if updated.Runtime == nil {
-		updated.Runtime = auth.Runtime
-	}
-	preserveHomeRoutingAttributes(updated, auth)
-	prepared, errPrepare := m.prepareHomeAuthSnapshot(ctx, executor, updated)
-	if errPrepare != nil {
-		return auth, false, errPrepare
-	}
-	preserveHomeRoutingAttributes(prepared, auth)
-	return prepared, true, nil
-}
-
-// RefreshHomeSelectionAfterUnauthorized refreshes the credential snapshot that
-// received a 401, or reuses a newer token already installed on the selection.
-func (m *Manager) RefreshHomeSelectionAfterUnauthorized(ctx context.Context, selection *HomeDispatchSelection, failedAuth *Auth) (*Auth, bool, error) {
+// RefreshHomeSelectionAfterUnauthorized only reuses a newer snapshot already
+// installed by Home. It never refreshes or mutates Home-owned credentials.
+func (m *Manager) RefreshHomeSelectionAfterUnauthorized(_ context.Context, selection *HomeDispatchSelection, failedAuth *Auth) (*Auth, bool, error) {
 	if m == nil || selection == nil {
 		return nil, false, nil
 	}
@@ -437,25 +395,10 @@ func (m *Manager) RefreshHomeSelectionAfterUnauthorized(ctx context.Context, sel
 		currentToken := authAccessToken(current)
 		failedToken := authAccessToken(failedAuth)
 		if currentToken != "" && failedToken != "" && currentToken != failedToken {
-			prepared, errPrepare := m.prepareHomeAuthSnapshot(ctx, selection.Executor, current)
-			if errPrepare != nil {
-				return current, false, errPrepare
-			}
-			preserveHomeRoutingAttributes(prepared, current)
-			m.replaceHomeSelectionAuth(selection, prepared)
-			return selection.CloneAuth(), true, nil
+			return current, true, nil
 		}
 	}
-	refreshed, okRefresh, errRefresh := m.tryRefreshExecutionAuthAfterUnauthorized(ctx, selection.Executor, failedAuth, &Error{HTTPStatus: http.StatusUnauthorized, Message: "upstream unauthorized"}, false, true)
-	if errRefresh != nil || !okRefresh {
-		return current, false, errRefresh
-	}
-	m.replaceHomeSelectionAuth(selection, refreshed)
-	updated := selection.CloneAuth()
-	if updated == nil {
-		return nil, false, &Error{Code: "auth_not_found", Message: "refreshed Home auth is unavailable", HTTPStatus: http.StatusServiceUnavailable}
-	}
-	return updated, true, nil
+	return current, false, nil
 }
 
 // tryRefreshAfterUnauthorized refreshes local OAuth credentials once after a
@@ -572,6 +515,9 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
+			current.Generation++
+			current.UpdatedAt = now
+			current.revision = m.nextAuthRevisionLocked()
 			current.LastError = refreshErrorFromError(err)
 			if unauthorized {
 				current.NextRefreshAfter = time.Time{}
@@ -584,7 +530,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.schedulerUpsert(current.Clone())
 			}
 		}
 		m.mu.Unlock()
@@ -610,13 +556,25 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 		updated.Status = StatusActive
 	}
 	updated.UpdatedAt = now
-	modelsToResume := clearUnauthorizedModelStates(updated, now)
+	_ = clearUnauthorizedModelStates(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
 	saved, errUpdate := m.Update(ctx, updated)
-	for _, model := range modelsToResume {
-		registry.GetGlobalRegistry().ResumeClientModel(id, model)
+	targetAuth := saved
+	if targetAuth == nil {
+		targetAuth = updated
+	}
+	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(id)
+	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
+	for _, sm := range supportedModels {
+		if sm == nil || strings.TrimSpace(sm.ID) == "" {
+			continue
+		}
+		projections = append(projections, m.clientModelProjectionForAuth(targetAuth, sm.ID, now))
+	}
+	if targetAuth != nil && len(projections) > 0 {
+		registry.GetGlobalRegistry().ApplyClientModelProjections(id, regEpoch, targetAuth.Generation, projections)
 	}
 	if errUpdate != nil {
 		log.Debugf("persist refreshed auth %s (%s) failed: %v", auth.Provider, auth.ID, errUpdate)

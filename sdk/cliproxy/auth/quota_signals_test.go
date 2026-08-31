@@ -227,7 +227,7 @@ func TestMarkResultCountTokensDoesNotReplaceObservation(t *testing.T) {
 		Success:  true,
 	}
 	affinityState := sessionAffinityResultForRequest(ctx, result.Provider, result.Model, result.Options)
-	manager.markResult(ctx, result, affinityState, false, true)
+	manager.markResult(ctx, result, affinityState, false, "", true)
 
 	updated, ok := manager.GetByID(auth.ID)
 	if !ok || updated == nil {

@@ -191,7 +191,7 @@ const (
 	xaiClientIdentifierValue      = "grok-shell"
 	xaiAuthenticateResponseHeader = "x-authenticateresponse"
 	xaiAuthenticateResponseValue  = "authenticate-response"
-	// xaiUsingAPIAttr enables the official API path for non-media HTTP chat.
+	// xaiUsingAPIAttr enables the official API path for HTTP chat and media.
 	xaiUsingAPIAttr = "using_api"
 	// Private executor metadata used to suppress local encrypted reasoning replay
 	// when an opaque upstream response already supplies the prior turn, or when
