@@ -44,6 +44,26 @@ func TestResponsesWebsocketNativeToolCacheUsesCallerScopedSessionKey(t *testing.
 	}
 }
 
+func TestResponsesWebsocketNativeToolCacheDoesNotFallBackToRawSessionKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, sessionKey := range []string{"", " \t "} {
+		t.Run(fmt.Sprintf("explicit-key-%q", sessionKey), func(t *testing.T) {
+			const rawSessionID = "native-session-without-explicit-scope"
+			key := forwardNativeToolCallForCacheTest(t, "api-key-a", rawSessionID, "connection-a", "call-1", "tool_a",
+				responsesWebsocketForwardOptions{downstreamSessionKey: sessionKey})
+			t.Cleanup(func() {
+				releaseResponsesWebsocketToolCaches(key)
+				defaultWebsocketToolOutputCache.deleteSession(rawSessionID)
+				defaultWebsocketToolCallCache.deleteSession(rawSessionID)
+			})
+			assertWebsocketToolCacheSessionAbsent(t, defaultWebsocketToolCallCache, rawSessionID)
+			if _, ok := defaultWebsocketToolCallCache.get(key, "call-1"); ok {
+				t.Fatal("tool call was cached without an explicit session key")
+			}
+		})
+	}
+}
+
 func forwardNativeToolCallForCacheTest(
 	t *testing.T,
 	apiKey string,
@@ -51,6 +71,7 @@ func forwardNativeToolCallForCacheTest(
 	connectionID string,
 	callID string,
 	toolName string,
+	options ...responsesWebsocketForwardOptions,
 ) string {
 	t.Helper()
 
@@ -81,6 +102,10 @@ func forwardNativeToolCallForCacheTest(
 		close(data)
 		close(errs)
 
+		forwardOptions := responsesWebsocketForwardOptions{downstreamSessionKey: sessionKey}
+		if len(options) > 0 {
+			forwardOptions = options[0]
+		}
 		_, _, _, errMsg, errForward := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
 			ginContext,
 			newResponsesWebsocketWriter(conn),
@@ -89,7 +114,7 @@ func forwardNativeToolCallForCacheTest(
 			errs,
 			newInMemoryWebsocketTimelineLog(),
 			connectionID,
-			responsesWebsocketForwardOptions{downstreamSessionKey: sessionKey},
+			forwardOptions,
 		)
 		if errMsg != nil {
 			serverErrCh <- fmt.Errorf("forward websocket error message: %v", errMsg.Error)

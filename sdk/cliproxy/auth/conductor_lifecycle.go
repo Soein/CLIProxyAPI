@@ -207,8 +207,32 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	return committed, nil
 }
 
+type updateAuthMode int
+
+const (
+	updateModeReplace updateAuthMode = iota
+	updateModeRefresh
+	updateModePrepare
+)
+
+// UpdatePreparedAuth atomically merges request preparation results into the latest runtime auth
+// under the manager lock, preserving concurrent modifications without modifying refresh lifecycle fields.
+func (m *Manager) UpdatePreparedAuth(ctx context.Context, base, updated *Auth) (*Auth, error) {
+	return m.updateInternal(ctx, base, updated, updateModePrepare)
+}
+
+// UpdateRefreshedAuth atomically merges refresh results into the latest runtime auth
+// under the manager lock, preserving concurrent modifications (proxy_url, notes, weights, etc.).
+func (m *Manager) UpdateRefreshedAuth(ctx context.Context, base, updated *Auth) (*Auth, error) {
+	return m.updateInternal(ctx, base, updated, updateModeRefresh)
+}
+
 // Update replaces an existing auth entry and notifies hooks.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
+	return m.updateInternal(ctx, nil, auth, updateModeReplace)
+}
+
+func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
@@ -228,6 +252,23 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	if existing.RegistrationEpoch > m.authEpochs[auth.ID] {
 		m.authEpochs[auth.ID] = existing.RegistrationEpoch
+	}
+	if (mode == updateModeRefresh || mode == updateModePrepare) && base != nil && existing.RegistrationEpoch != base.RegistrationEpoch {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+	}
+	if mode == updateModeRefresh {
+		merged := MergeRefreshedAuth(base, existing, auth)
+		if merged != nil {
+			auth = merged
+			NormalizeCredentialMetadata(auth.Metadata)
+		}
+	} else if mode == updateModePrepare {
+		merged := MergePreparedAuth(base, existing, auth)
+		if merged != nil {
+			auth = merged
+			NormalizeCredentialMetadata(auth.Metadata)
+		}
 	}
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
 		m.mu.Unlock()
@@ -275,7 +316,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.Generation++
 	}
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+		if mode == updateModeReplace && len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
 		if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {

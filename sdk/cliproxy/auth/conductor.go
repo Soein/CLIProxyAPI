@@ -192,7 +192,8 @@ type Manager struct {
 	spilloverEnabled    bool
 
 	requestPrepareLocks sync.Map
-	persistLocks        sync.Map
+	// persistLocks serializes lifecycle persistence, including CAS writes and deletion.
+	persistLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
