@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,7 +370,7 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 		if state == nil || state.LastError == nil {
 			continue
 		}
-		if state.LastError.StatusCode() != http.StatusUnauthorized && !strings.EqualFold(state.LastError.Code, "unauthorized") {
+		if !isUnauthorizedAuthError(state.LastError) {
 			continue
 		}
 		resetModelState(state, now)

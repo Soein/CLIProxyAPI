@@ -1585,12 +1585,16 @@ func isUnauthorizedError(err error) bool {
 	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
 }
 
+func isUnauthorizedAuthError(err *Error) bool {
+	return err != nil && (err.StatusCode() == http.StatusUnauthorized || strings.EqualFold(err.Code, "unauthorized"))
+}
+
 func hasUnauthorizedAuthFailure(auth *Auth) bool {
 	if auth == nil || auth.LastError == nil {
 		return false
 	}
 	if auth.Unavailable && auth.Status == StatusError && auth.NextRefreshAfter.IsZero() &&
-		(auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")) {
+		isUnauthorizedAuthError(auth.LastError) {
 		return true
 	}
 	return false

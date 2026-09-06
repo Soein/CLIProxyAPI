@@ -368,6 +368,7 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	}
 
 	// 3. ModelStates: three-way merge to preserve concurrent cooldown/quota
+	recoveredUnauthorizedModel := false
 	var baseModels map[string]*ModelState
 	if base != nil {
 		baseModels = base.ModelStates
@@ -385,6 +386,9 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 
 			if changedByExecutor && !changedByUser {
 				merged.ModelStates[model] = updState
+				if baseState != nil && isUnauthorizedAuthError(baseState.LastError) && modelStateIsClean(updState) {
+					recoveredUnauthorizedModel = true
+				}
 			}
 		}
 		if baseModels != nil {
@@ -393,11 +397,32 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 					if currentState, ok := current.ModelStates[model]; ok {
 						if reflect.DeepEqual(baseState, currentState) {
 							delete(merged.ModelStates, model)
+							if baseState != nil && isUnauthorizedAuthError(baseState.LastError) {
+								recoveredUnauthorizedModel = true
+							}
 						}
 					}
 				}
 			}
 		}
+	}
+
+	if recoveredUnauthorizedModel && !finalDisabled && base != nil && isUnauthorizedAuthError(current.LastError) &&
+		reflect.DeepEqual(base.LastError, current.LastError) &&
+		updated.LastError == nil && (updated.Status == StatusActive || updated.Status == "") {
+		for _, state := range merged.ModelStates {
+			if state != nil && isUnauthorizedAuthError(state.LastError) {
+				return merged
+			}
+		}
+		// A recovered model must not leave its old 401 in the auth aggregate:
+		// that combination disables automatic refresh once NextRefreshAfter clears.
+		// Recompute from merged models so unrelated quota cooldowns remain intact.
+		merged = merged.Clone()
+		updateAggregatedAvailability(merged, time.Now())
+		merged.LastError = nil
+		merged.StatusMessage = ""
+		merged.Status = StatusActive
 	}
 
 	return merged
