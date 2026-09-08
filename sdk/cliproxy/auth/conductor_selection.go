@@ -561,6 +561,19 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	return routeModel
 }
 
+func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
+	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
+	if !isBuiltInSelector(selector) {
+		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+			return ctx
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true)
+}
+
 func restoreModelCooldownErrorModel(err error, requestedModel string) error {
 	if err == nil || requestedModel == "" {
 		return err
@@ -1617,7 +1630,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 				m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errSelectorAvailable)
 				return nil, nil, errSelectorAvailable
 			}
-			selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 			selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 			if errPick != nil {
 				if isBuiltInSelector(selector) {

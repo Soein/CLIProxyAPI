@@ -179,12 +179,16 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.markPersistenceInFlightLocked(ctx, authClone)
+	var schedulerSnapshot *Auth
+	if m.scheduler != nil {
+		schedulerSnapshot = authClone.Clone()
+	}
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.schedulerUpsert(authClone)
+		m.schedulerUpsert(schedulerSnapshot)
 	}
 	if registeringNew {
 		m.wakeDispatchAuthority()
@@ -340,12 +344,16 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.markPersistenceInFlightLocked(ctx, authClone)
+	var schedulerSnapshot *Auth
+	if m.scheduler != nil {
+		schedulerSnapshot = authClone.Clone()
+	}
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.schedulerUpsert(authClone)
+		m.schedulerUpsert(schedulerSnapshot)
 	}
 	m.queueRefreshReschedule(auth.ID)
 	if errPersist := m.persistPublishedIfCurrent(ctx, authClone); errPersist != nil {

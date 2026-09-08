@@ -1096,7 +1096,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 	}
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -1141,7 +1141,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 				continue
 			}
-			if disallowFreeAuth && isFreeCodexAuth(candidate) {
+			if !eligibility.allows(candidate) {
 				continue
 			}
 			providerKey := executorKeyFromAuth(candidate)
@@ -1202,8 +1202,9 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 					selectorProvider = "xai"
 				}
 			}
+			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 			if sessionAffinity, okSession := selector.(*SessionAffinitySelector); okSession && inflight != nil && selectorProvider == "xai" {
-				selected, errPick = sessionAffinity.pickForExecution(ctx, selectorProvider, model, opts, selectorAuths, inflight, preferredAuthID)
+				selected, errPick = sessionAffinity.pickForExecution(selectorCtx, selectorProvider, model, opts, selectorAuths, inflight, preferredAuthID)
 			} else {
 				selectionAuths := selectorAuths
 				if inflight != nil && selectorProvider == "xai" && isBuiltInSelector(selector) {
@@ -1214,7 +1215,6 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 						selectionAuths = leastInflightAuths(selectionAuths, inflight)
 					}
 				}
-				selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
 				selected, errPick = selector.Pick(selectorCtx, selectorProvider, selectionArgForSelector(selector, model), opts, selectionAuths)
 			}
 			if errPick != nil {
