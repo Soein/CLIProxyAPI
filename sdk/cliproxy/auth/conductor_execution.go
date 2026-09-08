@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -345,6 +346,11 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		Body:           bytes.Clone(req.Payload),
 		Metadata:       opts.Metadata,
 	})
+	previousHeaders := opts.Headers
+	previousPayload := opts.OriginalRequest
+	if len(previousPayload) == 0 {
+		previousPayload = req.Payload
+	}
 	opts.Headers = mergeRequestHeaders(opts.Headers, resp.Headers, resp.ClearHeaders)
 	if len(resp.Body) > 0 {
 		req.Payload = bytes.Clone(resp.Body)
@@ -357,36 +363,42 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 			Body:       bytes.Clone(resp.ResponseBody),
 		}
 	}
-	if len(resp.ClearHeaders) > 0 || len(resp.Body) > 0 {
+	if len(resp.Headers) > 0 || len(resp.ClearHeaders) > 0 || len(resp.Body) > 0 {
 		evalPayload := opts.OriginalRequest
 		if len(evalPayload) == 0 {
 			evalPayload = req.Payload
 		}
-		info, ok := cliproxysession.ExtractSessionInfo(opts.Headers, evalPayload, opts.Metadata)
-		if ok && info.SessionID != "" {
+		// Compare request identities without metadata fallbacks so removed explicit
+		// IDs cannot be resurrected by a stale LCP binding. Unrelated hook changes
+		// must preserve the selector's resolved aliases and caller-scoped hierarchy.
+		previousID, previousParent := extractExplicitSessionIDs(previousHeaders, previousPayload, nil)
+		sessionID, parentID := extractExplicitSessionIDs(opts.Headers, evalPayload, nil)
+		if !isHierarchyParent(previousID, previousParent) {
+			previousParent = ""
+		}
+		if !isHierarchyParent(sessionID, parentID) {
+			parentID = ""
+		}
+		if sessionID == previousID && parentID == previousParent {
+			return req, opts, nil
+		}
+		opts.Metadata = maps.Clone(opts.Metadata)
+		delete(opts.Metadata, cliproxyexecutor.LCPAffinitySessionIDMetadataKey)
+		if sessionID != "" {
 			if opts.Metadata == nil {
 				opts.Metadata = make(map[string]any, 2)
 			}
-			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(info.SessionID)
-			if info.ParentSessionID != "" && info.ParentSessionID != info.SessionID {
-				opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(info.ParentSessionID)
+			// Scope raw composite IDs before bounding, matching selector cache keys.
+			sessionID, parentID = scopeAffinitySessionIDs(opts.Metadata, sessionID, parentID)
+			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(sessionID)
+			if parentID != "" && parentID != sessionID {
+				opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(parentID)
 			} else {
 				delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
 			}
 		} else {
 			delete(opts.Metadata, cliproxyexecutor.CanonicalSessionIDMetadataKey)
 			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
-			delete(opts.Metadata, cliproxyexecutor.LCPAffinitySessionIDMetadataKey)
-		}
-	} else if len(resp.Headers) > 0 {
-		if info, ok := cliproxysession.ExtractSessionInfo(opts.Headers, nil, opts.Metadata); ok && info.SessionID != "" {
-			if opts.Metadata == nil {
-				opts.Metadata = make(map[string]any, 2)
-			}
-			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(info.SessionID)
-			if info.ParentSessionID != "" && info.ParentSessionID != info.SessionID {
-				opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(info.ParentSessionID)
-			}
 		}
 	}
 	return req, opts, nil
