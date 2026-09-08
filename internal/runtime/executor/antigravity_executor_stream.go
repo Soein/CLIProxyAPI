@@ -16,7 +16,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -279,11 +278,15 @@ func (e *AntigravityExecutor) executeCompactionStream(ctx context.Context, auth 
 	summaryOpts.Stream = false
 	summaryOpts.OriginalRequest = nil
 	summaryOpts.SourceFormat = sdktranslator.FormatOpenAIResponse
-	summaryOpts.ResponseFormat = sdktranslator.FormatOpenAIResponse
+	// Keep the upstream finish reason: Responses translation can mark truncated output completed.
+	summaryOpts.ResponseFormat = sdktranslator.FormatAntigravity
 
 	summaryResp, errSummary := e.Execute(ctx, auth, summaryReq, summaryOpts)
 	if errSummary != nil {
 		return nil, errSummary
+	}
+	if errComplete := helps.ValidateAntigravityCompactionSummary(summaryResp.Payload); errComplete != nil {
+		return nil, fmt.Errorf("generate compaction summary: %w", errComplete)
 	}
 
 	summaryText, errExtract := helps.ExtractAntigravitySummaryText(summaryResp.Payload)
@@ -295,15 +298,10 @@ func (e *AntigravityExecutor) executeCompactionStream(ctx context.Context, auth 
 		return nil, fmt.Errorf("seal compaction capsule: %w", errSeal)
 	}
 
-	inputTokens := int(gjson.GetBytes(summaryResp.Payload, "usage.input_tokens").Int())
-	outputTokens := int(gjson.GetBytes(summaryResp.Payload, "usage.output_tokens").Int())
-	totalTokens := int(gjson.GetBytes(summaryResp.Payload, "usage.total_tokens").Int())
-	if totalTokens == 0 && inputTokens == 0 {
-		usage := helps.ParseOpenAIUsage(summaryResp.Payload)
-		inputTokens = int(usage.InputTokens)
-		outputTokens = int(usage.OutputTokens)
-		totalTokens = int(usage.TotalTokens)
-	}
+	usage := helps.ParseAntigravityUsage(summaryResp.Payload)
+	inputTokens := int(usage.InputTokens)
+	outputTokens := int(usage.OutputTokens)
+	totalTokens := int(usage.TotalTokens)
 
 	chunks := helps.BuildAntigravityCompactionStreamChunks(baseModel, capsule, inputTokens, outputTokens, totalTokens)
 	out := make(chan cliproxyexecutor.StreamChunk, len(chunks))

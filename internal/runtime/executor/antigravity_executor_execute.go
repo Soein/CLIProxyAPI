@@ -216,11 +216,15 @@ func (e *AntigravityExecutor) executeCompaction(ctx context.Context, auth *clipr
 	summaryOpts.Stream = false
 	summaryOpts.OriginalRequest = nil
 	summaryOpts.SourceFormat = sdktranslator.FormatOpenAIResponse
-	summaryOpts.ResponseFormat = sdktranslator.FormatOpenAIResponse
+	// Keep the upstream finish reason: Responses translation can mark truncated output completed.
+	summaryOpts.ResponseFormat = sdktranslator.FormatAntigravity
 
 	summaryResp, errSummary := e.Execute(ctx, auth, summaryReq, summaryOpts)
 	if errSummary != nil {
 		return resp, errSummary
+	}
+	if errComplete := helps.ValidateAntigravityCompactionSummary(summaryResp.Payload); errComplete != nil {
+		return resp, fmt.Errorf("generate compaction summary: %w", errComplete)
 	}
 
 	summaryText, errExtract := helps.ExtractAntigravitySummaryText(summaryResp.Payload)
@@ -232,15 +236,10 @@ func (e *AntigravityExecutor) executeCompaction(ctx context.Context, auth *clipr
 		return resp, fmt.Errorf("seal compaction capsule: %w", errSeal)
 	}
 
-	inputTokens := int(gjson.GetBytes(summaryResp.Payload, "usage.input_tokens").Int())
-	outputTokens := int(gjson.GetBytes(summaryResp.Payload, "usage.output_tokens").Int())
-	totalTokens := int(gjson.GetBytes(summaryResp.Payload, "usage.total_tokens").Int())
-	if totalTokens == 0 && inputTokens == 0 {
-		usage := helps.ParseOpenAIUsage(summaryResp.Payload)
-		inputTokens = int(usage.InputTokens)
-		outputTokens = int(usage.OutputTokens)
-		totalTokens = int(usage.TotalTokens)
-	}
+	usage := helps.ParseAntigravityUsage(summaryResp.Payload)
+	inputTokens := int(usage.InputTokens)
+	outputTokens := int(usage.OutputTokens)
+	totalTokens := int(usage.TotalTokens)
 
 	respBytes := helps.BuildAntigravityCompactionResponse(baseModel, capsule, inputTokens, outputTokens, totalTokens)
 	return cliproxyexecutor.Response{

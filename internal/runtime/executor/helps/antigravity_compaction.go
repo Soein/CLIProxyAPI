@@ -19,7 +19,8 @@ import (
 
 const (
 	antigravityCompactionCapsulePrefix = "cpa-ag-compact-v1:"
-	fixedCompactionKeySecret           = "CLIProxyAPI"
+	// The v1 wire format uses a public compatibility key, not a deployment secret.
+	antigravityCompactionPublicKeySeed = "CLIProxyAPI"
 )
 
 type antigravityCompactionCapsuleData struct {
@@ -54,6 +55,33 @@ func HasResponsesCompactionItem(payload []byte) bool {
 		}
 	}
 	return false
+}
+
+// ValidateAntigravityCompactionSummary requires an explicitly completed native response
+// before its summary can replace the client's original conversation history.
+func ValidateAntigravityCompactionSummary(payload []byte) error {
+	root := gjson.ParseBytes(payload)
+	if response := root.Get("response"); response.Exists() {
+		root = response
+	}
+	if reason := root.Get("promptFeedback.blockReason").String(); reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+		return fmt.Errorf("summary prompt was blocked: %s", reason)
+	}
+	candidate := root.Get("candidates.0")
+	if reason := candidate.Get("finishReason").String(); reason != "STOP" {
+		return fmt.Errorf("summary did not complete successfully (finishReason=%q)", reason)
+	}
+	for _, rating := range candidate.Get("safetyRatings").Array() {
+		if rating.Get("blocked").Bool() {
+			return fmt.Errorf("summary candidate was blocked")
+		}
+	}
+	for _, part := range candidate.Get("content.parts").Array() {
+		if part.Get("functionCall").Exists() {
+			return fmt.Errorf("summary requested a tool call")
+		}
+	}
+	return nil
 }
 
 // PrepareAntigravityCompactionSummaryPayload prepares a payload for non-stream Antigravity summary generation.
@@ -102,13 +130,14 @@ func PrepareAntigravityCompactionSummaryPayload(payload []byte, modelName string
 	return out
 }
 
-// deriveAntigravityCompactionKey derives an AES-256 key from the fixed CLIProxyAPI secret.
+// deriveAntigravityCompactionKey preserves the public key used by the v1 wire format.
 func deriveAntigravityCompactionKey() []byte {
-	h := sha256.Sum256([]byte(fixedCompactionKeySecret))
+	h := sha256.Sum256([]byte(antigravityCompactionPublicKeySeed))
 	return h[:]
 }
 
 // SealAntigravityCompaction encrypts summary data into an opaque capsule using AES-GCM.
+// The public v1 key provides neither confidentiality nor source authentication.
 func SealAntigravityCompaction(summary, modelName string) (string, error) {
 	data := antigravityCompactionCapsuleData{
 		Summary:   summary,
@@ -141,6 +170,7 @@ func SealAntigravityCompaction(summary, modelName string) (string, error) {
 }
 
 // UnsealAntigravityCompaction decrypts and validates an opaque capsule.
+// Successful decoding does not make its content trusted: anyone can use the public v1 key.
 func UnsealAntigravityCompaction(encryptedContent string) (string, error) {
 	if !strings.HasPrefix(encryptedContent, antigravityCompactionCapsulePrefix) {
 		return "", fmt.Errorf("unrecognized compaction capsule format")

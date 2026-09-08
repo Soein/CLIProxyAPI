@@ -190,6 +190,13 @@ func TestExpandAntigravityCompactionCapsules(t *testing.T) {
 	}
 }
 
+func TestValidateAntigravityCompactionSummaryRejectsToolCall(t *testing.T) {
+	payload := []byte(`{"response":{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"Summary so far"},{"functionCall":{"name":"continue_summary","args":{}}}]}}]}}`)
+	if err := ValidateAntigravityCompactionSummary(payload); err == nil {
+		t.Fatal("expected an unfinished tool call to prevent compaction")
+	}
+}
+
 func TestExtractAntigravitySummaryText_ReasoningBeforeMessage(t *testing.T) {
 	// Responses format where output.0 is reasoning and output.1 is the actual message
 	resp := []byte(`{

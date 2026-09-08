@@ -18,6 +18,90 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestAntigravityCompactionRequiresCompleteSummary(t *testing.T) {
+	for _, model := range []string{"gemini-3.7-flash", "claude-sonnet-4-6"} {
+		for _, stream := range []bool{false, true} {
+			for _, tc := range []struct {
+				name      string
+				candidate string
+				feedback  string
+				wantOK    bool
+			}{
+				{name: "complete", candidate: `"finishReason":"STOP"`, wantOK: true},
+				{name: "truncated", candidate: `"finishReason":"MAX_TOKENS"`},
+				{name: "unsafe", candidate: `"finishReason":"SAFETY"`},
+				{name: "recitation", candidate: `"finishReason":"RECITATION"`},
+				{name: "missing_finish", candidate: `"index":0`},
+				{name: "blocked_prompt", candidate: `"finishReason":"STOP"`, feedback: `,"promptFeedback":{"blockReason":"SAFETY"}`},
+				{name: "blocked_candidate", candidate: `"finishReason":"STOP","safetyRatings":[{"blocked":true}]`},
+			} {
+				t.Run(fmt.Sprintf("%s/stream=%t/%s", model, stream, tc.name), func(t *testing.T) {
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						response := fmt.Sprintf(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Summary of"}]},%s}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}%s}}`, tc.candidate, tc.feedback)
+						if strings.Contains(model, "claude") {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = fmt.Fprintf(w, "data: %s\n\n", response)
+						} else {
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = io.WriteString(w, response)
+						}
+					}))
+					defer server.Close()
+					executor := NewAntigravityExecutor(&config.Config{})
+					auth := &cliproxyauth.Auth{
+						ID:         "antigravity-compaction-completion-test",
+						Provider:   "antigravity",
+						Metadata:   map[string]any{"access_token": "test-token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "test-proj"},
+						Attributes: map[string]string{"base_url": server.URL},
+					}
+					req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":[{"role":"user","content":"Preserve all original history on failure"},{"type":"compaction_trigger"}]}`)}
+					opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, Stream: stream}
+					var result []byte
+					var err error
+					if stream {
+						var response *cliproxyexecutor.StreamResult
+						response, err = executor.ExecuteStream(context.Background(), auth, req, opts)
+						if response != nil {
+							for chunk := range response.Chunks {
+								if chunk.Err != nil {
+									t.Fatalf("unexpected stream error: %v", chunk.Err)
+								}
+								result = append(result, chunk.Payload...)
+							}
+						}
+					} else {
+						opts.Alt = "responses/compact"
+						var response cliproxyexecutor.Response
+						response, err = executor.Execute(context.Background(), auth, req, opts)
+						result = response.Payload
+					}
+					if !tc.wantOK {
+						if err == nil {
+							t.Fatalf("expected compaction to reject incomplete or blocked summary, got: %s", result)
+						}
+						if tc.name == "truncated" && !strings.Contains(err.Error(), "MAX_TOKENS") {
+							t.Fatalf("truncation error must identify the finish reason: %v", err)
+						}
+						if len(result) != 0 {
+							t.Fatalf("failed compaction must not emit a capsule: %s", result)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("complete summary rejected: %v", err)
+					}
+					if !bytes.Contains(result, []byte("cpa-ag-compact-v1:")) {
+						t.Fatalf("missing successful compaction capsule: %s", result)
+					}
+					if !stream && gjson.GetBytes(result, "usage.total_tokens").Int() != 15 {
+						t.Fatalf("usage was lost: %s", result)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestAntigravityCompactionTriggerStreamGemini(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -33,7 +117,7 @@ func TestAntigravityCompactionTriggerStreamGemini(t *testing.T) {
 
 		// When summary is requested with user turn at the end:
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Summary of previous conversation"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`))
+		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Summary of previous conversation"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`))
 	}))
 	defer server.Close()
 
@@ -112,7 +196,7 @@ func TestAntigravityCompactionTriggerStreamClaude(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Claude summary of previous conversation\"}],\"role\":\"model\"}}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10,\"totalTokenCount\":30}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Claude summary of previous conversation\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10,\"totalTokenCount\":30}}}\n\n"))
 	}))
 	defer server.Close()
 
@@ -186,7 +270,7 @@ func TestAntigravityCompactionAltResponsesCompact(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Summary of previous conversation"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`))
+		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Summary of previous conversation"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`))
 	}))
 	defer server.Close()
 
@@ -247,7 +331,7 @@ func TestAntigravityCompactionReplayNextTurn(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Turn completed"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`))
+		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Turn completed"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`))
 	}))
 	defer server.Close()
 
@@ -367,7 +451,7 @@ func TestAntigravityCompactionSequentialCompactionPreservesContext(t *testing.T)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Updated summary including earlier context"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":8,"totalTokenCount":23}}}`))
+		_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"Updated summary including earlier context"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":8,"totalTokenCount":23}}}`))
 	}))
 	defer server.Close()
 
