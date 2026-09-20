@@ -28,6 +28,11 @@ func (e *codexDuplexConnectionError) Error() string         { return e.cause.Err
 func (e *codexDuplexConnectionError) Unwrap() error         { return e.cause }
 func (e *codexDuplexConnectionError) IsRequestScoped() bool { return true }
 
+type codexUnacknowledgedSteer struct {
+	parent string
+	lease  *helps.CodexDuplexLease
+}
+
 // streamCodexDuplex owns the already authenticated socket until downstream
 // disconnect. A response terminal event is not a connection terminal event:
 // accepted steering may produce a successor or wait for client tool results.
@@ -48,9 +53,15 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 	// inherit the preceding response settings, just as they do upstream.
 	var metadataMu sync.Mutex
 	pending := []*codexWebsocketPrepared{initial}
+	// Initial create is already admitted by conductor; executor borrows it (nil lease).
+	pendingLeases := []*helps.CodexDuplexLease{nil}
+	var activeLease *helps.CodexDuplexLease
+	var unacknowledgedSteers []*codexUnacknowledgedSteer
+	acceptedSteerLeases := make(map[string]*helps.CodexDuplexLease)
+	pendingReleaseSteers := make(map[string]bool)
+	responseActive := false
 	// Serialize explicit creates against steering continuations. A response.created
 	// alone does not identify whether upstream created it automatically.
-	var unacknowledgedSteers []string
 	acceptedSteers := make(map[string]string)
 	current := initial
 	responseID := ""
@@ -58,8 +69,8 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 	steeringSettings := make(map[string]*codexWebsocketPrepared)
 	var responseOrder []string
 	releaseSteeringSettings := func(parent string) {
-		for _, target := range unacknowledgedSteers {
-			if target == parent {
+		for _, sub := range unacknowledgedSteers {
+			if sub.parent == parent {
 				return
 			}
 		}
@@ -70,6 +81,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		}
 		delete(steeringSettings, parent)
 	}
+
 	waitingParent := ""
 	automaticActive := false
 	stateChanged := make(chan struct{}, 1)
@@ -201,18 +213,44 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				return false
 			}
 			payload = buildCodexWebsocketRequestBody(prepared.upstreamBody)
+			release, ok := cliproxyexecutor.AdmitDispatch(streamCtx, auth.ID)
+			if !ok {
+				_ = reject("dispatch authority rejected admission")
+				fail(errors.New("dispatch authority rejected admission"))
+				return false
+			}
+			stateLease := helps.NewCodexDuplexLease(release)
+			txLease := stateLease.Retain()
 			metadataMu.Lock()
 			if len(pending) >= 16 {
 				metadataMu.Unlock()
+				stateLease.Release()
+				txLease.Release()
 				fail(fmt.Errorf("too many outstanding response.create requests"))
 				return false
 			}
 			pending = append(pending, prepared)
+			pendingLeases = append(pendingLeases, stateLease)
 			metadataMu.Unlock()
 			if prepared.optimizeMultiAgentV2 || prepared.multiAgentV2Conflict {
 				sess.setMultiAgentV2Optimized(conn, prepared.optimizeMultiAgentV2 && !prepared.multiAgentV2Conflict)
 			}
 			if !cliproxyexecutor.WebsocketAuthEnabled(streamCtx, auth.ID) {
+				var toRelease *helps.CodexDuplexLease
+				metadataMu.Lock()
+				for i := len(pending) - 1; i >= 0; i-- {
+					if pending[i] == prepared {
+						toRelease = pendingLeases[i]
+						pending = append(pending[:i], pending[i+1:]...)
+						pendingLeases = append(pendingLeases[:i], pendingLeases[i+1:]...)
+						break
+					}
+				}
+				metadataMu.Unlock()
+				if toRelease != nil {
+					toRelease.Release()
+				}
+				txLease.Release()
 				fail(fmt.Errorf("websocket credential is no longer enabled"))
 				return false
 			}
@@ -220,9 +258,25 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				URL: initial.wsURL, Method: "WEBSOCKET", Body: payload, Provider: e.Identifier(), AuthID: auth.ID,
 			})
 			if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
+				var toRelease *helps.CodexDuplexLease
+				metadataMu.Lock()
+				for i := len(pending) - 1; i >= 0; i-- {
+					if pending[i] == prepared {
+						toRelease = pendingLeases[i]
+						pending = append(pending[:i], pending[i+1:]...)
+						pendingLeases = append(pendingLeases[:i], pendingLeases[i+1:]...)
+						break
+					}
+				}
+				metadataMu.Unlock()
+				if toRelease != nil {
+					toRelease.Release()
+				}
+				txLease.Release()
 				fail(mapCodexWebsocketWriteError(sess, conn, errWrite))
 				return false
 			}
+			txLease.Release()
 			log.Infof("codex websockets: request forwarded session=%s auth=%s url=%s event=%s", sess.sessionID, auth.ID, initial.wsURL, gjson.GetBytes(payload, "type").String())
 			return true
 		}
@@ -289,15 +343,68 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						settings = responseSettings[parent]
 						metadataMu.Unlock()
 					}
+
+					var stateLease *helps.CodexDuplexLease
+					var txLease *helps.CodexDuplexLease
+					var sub *codexUnacknowledgedSteer
+
 					metadataMu.Lock()
-					unacknowledgedSteers = append(unacknowledgedSteers, parent)
-					if settings != nil {
-						steeringSettings[parent] = settings
+					isParentActive := responseActive && responseID != "" && (parent == responseID || parent == "") && waitingParent != responseID
+					if isParentActive {
+						if activeLease != nil {
+							stateLease = activeLease.Retain()
+							txLease = stateLease.Retain()
+						}
+						sub = &codexUnacknowledgedSteer{
+							parent: parent,
+							lease:  stateLease,
+						}
+						unacknowledgedSteers = append(unacknowledgedSteers, sub)
+						if settings != nil {
+							steeringSettings[parent] = settings
+						}
+						metadataMu.Unlock()
+					} else {
+						metadataMu.Unlock()
+						release, ok := cliproxyexecutor.AdmitDispatch(streamCtx, auth.ID)
+						if !ok {
+							_ = reject("dispatch authority rejected admission")
+							fail(errors.New("dispatch authority rejected admission"))
+							return
+						}
+						stateLease = helps.NewCodexDuplexLease(release)
+						txLease = stateLease.Retain()
+						metadataMu.Lock()
+						sub = &codexUnacknowledgedSteer{
+							parent: parent,
+							lease:  stateLease,
+						}
+						unacknowledgedSteers = append(unacknowledgedSteers, sub)
+						if settings != nil {
+							steeringSettings[parent] = settings
+						}
+						metadataMu.Unlock()
 					}
-					metadataMu.Unlock()
 					// Control frames bypass ALL response.create translations and defaults.
 					// Unknown fields and unsupported input are left to upstream validation.
 					if !cliproxyexecutor.WebsocketAuthEnabled(streamCtx, auth.ID) {
+						var toRelease *helps.CodexDuplexLease
+						metadataMu.Lock()
+						for i := len(unacknowledgedSteers) - 1; i >= 0; i-- {
+							if unacknowledgedSteers[i] == sub {
+								toRelease = unacknowledgedSteers[i].lease
+								unacknowledgedSteers = append(unacknowledgedSteers[:i], unacknowledgedSteers[i+1:]...)
+								break
+							}
+						}
+						releaseSteeringSettings(parent)
+						metadataMu.Unlock()
+						if toRelease != nil {
+							toRelease.Release()
+						}
+						if txLease != nil {
+							txLease.Release()
+						}
 						fail(fmt.Errorf("websocket credential is no longer enabled"))
 						return
 					}
@@ -305,8 +412,28 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						URL: initial.wsURL, Method: "WEBSOCKET", Body: payload, Provider: e.Identifier(), AuthID: auth.ID,
 					})
 					if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
+						var toRelease *helps.CodexDuplexLease
+						metadataMu.Lock()
+						for i := len(unacknowledgedSteers) - 1; i >= 0; i-- {
+							if unacknowledgedSteers[i] == sub {
+								toRelease = unacknowledgedSteers[i].lease
+								unacknowledgedSteers = append(unacknowledgedSteers[:i], unacknowledgedSteers[i+1:]...)
+								break
+							}
+						}
+						releaseSteeringSettings(parent)
+						metadataMu.Unlock()
+						if toRelease != nil {
+							toRelease.Release()
+						}
+						if txLease != nil {
+							txLease.Release()
+						}
 						fail(mapCodexWebsocketWriteError(sess, conn, errWrite))
 						return
+					}
+					if txLease != nil {
+						txLease.Release()
 					}
 					log.Infof("codex websockets: request forwarded session=%s auth=%s url=%s event=response.steer", sess.sessionID, auth.ID, initial.wsURL)
 					continue
@@ -344,6 +471,34 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			<-writerDone
 			sess.clearActive(conn, readCh)
 			unlock()
+
+			var toRelease []*helps.CodexDuplexLease
+			metadataMu.Lock()
+			if activeLease != nil {
+				toRelease = append(toRelease, activeLease)
+				activeLease = nil
+			}
+			for _, l := range pendingLeases {
+				if l != nil {
+					toRelease = append(toRelease, l)
+				}
+			}
+			pendingLeases = nil
+			for _, sub := range unacknowledgedSteers {
+				if sub != nil && sub.lease != nil {
+					toRelease = append(toRelease, sub.lease)
+				}
+			}
+			unacknowledgedSteers = nil
+			for _, l := range acceptedSteerLeases {
+				if l != nil {
+					toRelease = append(toRelease, l)
+				}
+			}
+			acceptedSteerLeases = nil
+			metadataMu.Unlock()
+
+			helps.ReleaseCodexDuplexLeases(toRelease)
 		}()
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
 			select {
@@ -355,7 +510,6 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		}
 		reporter := initialReporter
 		firstResponse := true
-		responseActive := false
 		outputItems := make(map[int64][]byte)
 		var outputFallback [][]byte
 		for {
@@ -380,12 +534,14 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			eventType := gjson.GetBytes(payload, "type").String()
 			establishing := firstResponse && eventType == "response.created"
 			if eventType == "response.created" {
+				var toRelease []*helps.CodexDuplexLease
 				metadataMu.Lock()
 				parent := gjson.GetBytes(payload, "response.previous_response_id").String()
 				if parent == "" {
 					parent = responseID
 				}
-				if !firstResponse && len(pending) == 0 {
+				automaticActive = !firstResponse && len(pending) == 0
+				if automaticActive {
 					settings := steeringSettings[parent]
 					if settings == nil {
 						settings = responseSettings[parent]
@@ -398,18 +554,37 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						return
 					}
 					current = settings
-				}
-				for id, target := range acceptedSteers {
-					if target == parent {
-						delete(acceptedSteers, id)
+
+					// Automatic successor inherits admission of already submitted steer
+					var inheritedLeases []*helps.CodexDuplexLease
+					for id, target := range acceptedSteers {
+						if target == parent {
+							if l, ok := acceptedSteerLeases[id]; ok && l != nil {
+								inheritedLeases = append(inheritedLeases, l)
+								delete(acceptedSteerLeases, id)
+							}
+							delete(acceptedSteers, id)
+						}
 					}
+					activeLease = helps.NewCodexDuplexLeaseGroup(inheritedLeases...)
+				}
+				if len(pending) > 0 {
+					for id, target := range acceptedSteers {
+						if target == parent {
+							delete(acceptedSteers, id)
+							if l, ok := acceptedSteerLeases[id]; ok {
+								toRelease = append(toRelease, l)
+								delete(acceptedSteerLeases, id)
+							}
+						}
+					}
+					current, pending = pending[0], pending[1:]
+					activeLease = pendingLeases[0]
+					pendingLeases = pendingLeases[1:]
 				}
 				waitingParent = ""
-				automaticActive = !firstResponse && len(pending) == 0
-				if len(pending) > 0 {
-					current, pending = pending[0], pending[1:]
-				}
 				responseID = gjson.GetBytes(payload, "response.id").String()
+				responseActive = true
 				// Retain response settings, not request history or authorization headers.
 				// In-flight steering pins its parent's settings independently of this window.
 				snapshot := *current
@@ -429,6 +604,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				releaseSteeringSettings(parent)
 				metadataMu.Unlock()
+				helps.ReleaseCodexDuplexLeases(toRelease)
 				wakeWriter()
 				if !firstResponse {
 					reporter = helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
@@ -436,7 +612,6 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					reporter.StartResponseTTFT()
 				}
 				firstResponse = false
-				responseActive = true
 				outputItems = make(map[int64][]byte)
 				outputFallback = nil
 			}
@@ -451,32 +626,64 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				if parent == "" {
 					parent = responseID
 				}
+				var toRelease []*helps.CodexDuplexLease
 				metadataMu.Lock()
-				consumeSubmission := func() {
-					for i, target := range unacknowledgedSteers {
-						if target == parent || target == "" {
+				consumeSubmission := func() *helps.CodexDuplexLease {
+					for i, sub := range unacknowledgedSteers {
+						if sub.parent == parent || sub.parent == "" {
 							unacknowledgedSteers = append(unacknowledgedSteers[:i], unacknowledgedSteers[i+1:]...)
-							break
+							return sub.lease
 						}
 					}
+					return nil
 				}
 				switch eventType {
 				case "response.steer.accepted":
-					consumeSubmission()
+					l := consumeSubmission()
 					acceptedSteers[id] = parent
+					if pendingReleaseSteers[id] {
+						delete(pendingReleaseSteers, id)
+						if l != nil {
+							toRelease = append(toRelease, l)
+						}
+					} else {
+						if l != nil {
+							acceptedSteerLeases[id] = l
+						}
+					}
 				case "response.steer.failed":
+					delete(pendingReleaseSteers, id)
 					if _, accepted := acceptedSteers[id]; accepted {
 						delete(acceptedSteers, id)
+						if l, ok := acceptedSteerLeases[id]; ok {
+							toRelease = append(toRelease, l)
+							delete(acceptedSteerLeases, id)
+						}
 					} else {
-						consumeSubmission()
+						if l := consumeSubmission(); l != nil {
+							toRelease = append(toRelease, l)
+						}
 					}
 					releaseSteeringSettings(parent)
 				case "response.steer.pending":
 					// Tool results may already be waiting in the writer. No automatic
 					// successor can start until an explicit continuation supplies them.
 					waitingParent = parent
+					if id != "" {
+						if _, ok := acceptedSteers[id]; ok {
+							if l, hasLease := acceptedSteerLeases[id]; hasLease {
+								delete(acceptedSteerLeases, id)
+								if l != nil {
+									toRelease = append(toRelease, l)
+								}
+							}
+						} else {
+							pendingReleaseSteers[id] = true
+						}
+					}
 				}
 				metadataMu.Unlock()
+				helps.ReleaseCodexDuplexLeases(toRelease)
 				wakeWriter()
 				if !send(cliproxyexecutor.StreamChunk{Payload: payload}) {
 					return
@@ -508,6 +715,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				if failedID == "" {
 					failedID = gjson.GetBytes(payload, "response_id").String()
 				}
+				var toRelease []*helps.CodexDuplexLease
 				metadataMu.Lock()
 				// A failure for the running response must not consume a queued create.
 				// A rejection before response.created instead owns the oldest pending
@@ -516,13 +724,24 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				ambiguous := failedID == "" && ((len(pending) > 0 && responseActive) || len(unacknowledgedSteers) > 0)
 				if len(pending) > 0 && !currentFailure && !ambiguous {
 					eventPrepared, pending = pending[0], pending[1:]
+					if len(pendingLeases) > 0 {
+						if l := pendingLeases[0]; l != nil {
+							toRelease = append(toRelease, l)
+						}
+						pendingLeases = pendingLeases[1:]
+					}
 					eventReporter = helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
 					eventReporter.SetTranslatedReasoningEffort(eventPrepared.clientBody, eventPrepared.to.String())
 				} else if !ambiguous {
 					responseActive = false
 					automaticActive = false
+					if activeLease != nil {
+						toRelease = append(toRelease, activeLease)
+						activeLease = nil
+					}
 				}
 				metadataMu.Unlock()
+				helps.ReleaseCodexDuplexLeases(toRelease)
 				wakeWriter()
 				if ambiguous {
 					// Without a response ID, assigning this failure could corrupt
@@ -568,10 +787,16 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				collectCodexOutputItemDone(payload, outputItems, &outputFallback)
 			}
 			if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
-				responseActive = false
+				var toRelease []*helps.CodexDuplexLease
 				metadataMu.Lock()
+				responseActive = false
 				automaticActive = false
+				if activeLease != nil {
+					toRelease = append(toRelease, activeLease)
+					activeLease = nil
+				}
 				metadataMu.Unlock()
+				helps.ReleaseCodexDuplexLeases(toRelease)
 				wakeWriter()
 				payload = normalizeCodexWebsocketCompletion(payload)
 				if !current.preserveNativeOutput {
