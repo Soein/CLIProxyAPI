@@ -476,8 +476,15 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 				}
 			}
 		}
+		if preSaveAuth != nil && preSaveAuth.ModelStates != nil {
+			for mName := range preSaveAuth.ModelStates {
+				if _, ok := current.ModelStates[mName]; !ok {
+					delete(candidate.ModelStates, mName)
+				}
+			}
+		}
 
-		// Quota: preserve active quota if new or extended
+		// Quota: preserve active quota if new or extended, or clear if cleared concurrently
 		if current.Quota.Exceeded && current.Quota.NextRecoverAt.After(time.Now()) {
 			if preSaveAuth == nil || !preSaveAuth.Quota.Exceeded || current.Quota.NextRecoverAt.After(preSaveAuth.Quota.NextRecoverAt) {
 				candidate.Quota = current.Quota.Clone()
@@ -487,25 +494,55 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 					candidate.Status = current.Status
 				}
 			}
+		} else if preSaveAuth != nil && preSaveAuth.Quota.Exceeded && !current.Quota.Exceeded {
+			candidate.Quota = current.Quota.Clone()
+			candidate.Unavailable = current.Unavailable
+			candidate.NextRetryAfter = current.NextRetryAfter
+			if candidate.Status != StatusDisabled && !candidate.Disabled {
+				candidate.Status = current.Status
+			}
 		}
 
 		// LastError and Unavailable: unchanged old 401 must stay cleared.
-		// Reconcile only if current has an independently newer error or cooldown relative to preSaveAuth.
+		// Reconcile runtime field deltas relative to preSaveAuth in both directions:
+		// newer concurrent errors/cooldowns are preserved, and concurrent success
+		// clears are reconciled without resurrecting unchanged pre-save errors.
 		var preErr *Error
 		if preSaveAuth != nil {
 			preErr = preSaveAuth.LastError
 		}
-		if !reflect.DeepEqual(current.LastError, preErr) && current.LastError != nil {
-			candidate.Unavailable = current.Unavailable
-			candidate.LastError = current.LastError
-			candidate.StatusMessage = current.StatusMessage
-			candidate.Status = current.Status
-			candidate.NextRetryAfter = current.NextRetryAfter
+		if !reflect.DeepEqual(current.LastError, preErr) {
+			if current.LastError != nil {
+				// Concurrent newer error occurred during blocked save.
+				candidate.Unavailable = current.Unavailable
+				candidate.LastError = cloneError(current.LastError)
+				candidate.StatusMessage = current.StatusMessage
+				candidate.Status = current.Status
+				candidate.NextRetryAfter = current.NextRetryAfter
+			} else {
+				// Concurrent success cleared LastError during blocked save.
+				candidate.LastError = nil
+				candidate.StatusMessage = current.StatusMessage
+				candidate.Unavailable = current.Unavailable
+				candidate.NextRetryAfter = current.NextRetryAfter
+				if candidate.Status != StatusDisabled && !candidate.Disabled {
+					candidate.Status = current.Status
+				}
+			}
 		} else if preSaveAuth != nil && !preSaveAuth.Unavailable && current.Unavailable {
+			// Concurrent cooldown or quota marked auth unavailable without changing LastError.
 			candidate.Unavailable = current.Unavailable
 			candidate.Status = current.Status
 			candidate.StatusMessage = current.StatusMessage
 			candidate.NextRetryAfter = current.NextRetryAfter
+		} else if preSaveAuth != nil && preSaveAuth.Unavailable && !current.Unavailable {
+			// Concurrent recovery cleared unavailable state without changing LastError.
+			candidate.Unavailable = false
+			candidate.NextRetryAfter = current.NextRetryAfter
+			if candidate.Status != StatusDisabled && !candidate.Disabled {
+				candidate.Status = current.Status
+				candidate.StatusMessage = current.StatusMessage
+			}
 		}
 
 		// Disabled: preserve operator disable
