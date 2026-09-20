@@ -430,8 +430,12 @@ func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexe
 		return sdktranslator.FormatGemini
 	case "kimi":
 		return sdktranslator.FormatOpenAI
+	case "meta":
+		return sdktranslator.FormatCodex
 	case "antigravity":
 		return sdktranslator.FormatAntigravity
+	case "devin":
+		return sdktranslator.FormatInteractions
 	default:
 		return sdktranslator.FormatOpenAI
 	}
@@ -575,6 +579,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					execOpts.Metadata = meta
 				}
 			}
+			payload := execOpts.OriginalRequest
+			if len(payload) == 0 {
+				payload = execReq.Payload
+			}
+			execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
@@ -796,6 +805,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					execOpts.Metadata = meta
 				}
 			}
+			payload := execOpts.OriginalRequest
+			if len(payload) == 0 {
+				payload = execReq.Payload
+			}
+			execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
@@ -1185,6 +1199,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				execOpts.Metadata = meta
 			}
 		}
+		payload := execOpts.OriginalRequest
+		if len(payload) == 0 {
+			payload = execReq.Payload
+		}
+		execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 		execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 		if homeMode && len(models) > 1 {
 			models = models[:1]
@@ -1546,7 +1565,17 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return auth, nil
 	}
 	preparer, ok := executor.(RequestAuthPreparer)
-	if !ok || preparer == nil || !preparer.ShouldPrepareRequestAuth(auth) {
+	if !ok {
+		return auth, nil
+	}
+
+	return m.PrepareRequestAuth(ctx, preparer, auth)
+}
+
+// PrepareRequestAuth prepares a registered credential using the same serialization
+// and lifecycle checks as normal request execution. Management tools use this path too.
+func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPreparer, auth *Auth) (*Auth, error) {
+	if m == nil || preparer == nil || auth == nil || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
 	}
 
@@ -1555,21 +1584,36 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, auth.Clone())
 	}
 
-	lockValue, _ := m.requestPrepareLocks.LoadOrStore(id, &requestAuthPrepareLock{})
-	lock, ok := lockValue.(*requestAuthPrepareLock)
-	if !ok || lock == nil {
-		return m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, auth.Clone())
+	var prepareMu *sync.Mutex
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		// Meta also mints on 401 recovery. Serialize both paths per credential.
+		lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
+		lock, _ := lockValue.(*authRefreshLock)
+		if lock == nil {
+			return m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, auth.Clone())
+		}
+		prepareMu = &lock.mu
+	} else {
+		lockValue, _ := m.requestPrepareLocks.LoadOrStore(id, &requestAuthPrepareLock{})
+		lock, _ := lockValue.(*requestAuthPrepareLock)
+		if lock == nil {
+			return m.prepareRequestAuthWithDispatchAdmission(ctx, preparer, auth.Clone())
+		}
+		prepareMu = &lock.mu
 	}
-
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
+	prepareMu.Lock()
+	defer prepareMu.Unlock()
 
 	target := auth.Clone()
 	m.mu.RLock()
-	if current := m.auths[id]; current != nil {
+	current := m.auths[id]
+	if current != nil {
 		target = current.Clone()
 	}
 	m.mu.RUnlock()
+	if current == nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		return nil, fmt.Errorf("prepare meta auth: credential no longer registered")
+	}
 
 	if !preparer.ShouldPrepareRequestAuth(target) {
 		return target, nil
@@ -1590,6 +1634,9 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	}
 	if saved != nil {
 		return saved, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
 	}
 	return nil, fmt.Errorf("auth %s not found after request preparation", id)
 }
@@ -2070,6 +2117,24 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	return m.httpRequestWithDispatchAdmission(ctx, exec, auth, req)
 }
 
+func ensureCanonicalSessionMetadata(metadata map[string]any, headers http.Header, payload []byte) map[string]any {
+	if metadata != nil {
+		if canonicalID, ok := metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string); ok && strings.TrimSpace(canonicalID) != "" {
+			return metadata
+		}
+	}
+	canonicalID := CanonicalSessionID(headers, payload, metadata)
+	if canonicalID == "" {
+		return metadata
+	}
+	out := make(map[string]any, len(metadata)+1)
+	for k, v := range metadata {
+		out[k] = v
+	}
+	out[cliproxyexecutor.CanonicalSessionIDMetadataKey] = canonicalID
+	return out
+}
+
 func syncMetadataSessionToContext(ctx context.Context, metadata map[string]any) context.Context {
 	if ctx == nil {
 		return nil
@@ -2107,9 +2172,9 @@ func syncMetadataSessionToContext(ctx context.Context, metadata map[string]any) 
 		if clientMeta.SessionID != "" || clientMeta.ParentSessionID != "" {
 			clientMeta.SessionID = ""
 			clientMeta.ParentSessionID = ""
-			return logging.WithClientRequestMetadata(ctx, clientMeta)
+			ctx = logging.WithClientRequestMetadata(ctx, clientMeta)
 		}
-		return ctx
+		return util.WithSessionID(ctx, "")
 	}
 	clientMeta := logging.GetClientRequestMetadata(ctx)
 	clientMeta.SessionID = cliproxysession.BoundSessionIdentity(canonicalID)
@@ -2121,5 +2186,6 @@ func syncMetadataSessionToContext(ctx context.Context, metadata map[string]any) 
 	if clientMeta.SessionID == clientMeta.ParentSessionID {
 		clientMeta.ParentSessionID = ""
 	}
-	return logging.WithClientRequestMetadata(ctx, clientMeta)
+	ctx = logging.WithClientRequestMetadata(ctx, clientMeta)
+	return util.WithSessionID(ctx, clientMeta.SessionID)
 }

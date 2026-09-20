@@ -2,6 +2,7 @@ package auth
 
 import (
 	"container/list"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -326,9 +327,68 @@ func compactSessionAliasesWith(aliases []string, isPromptCacheAlias func(string)
 	return compacted
 }
 
+func parseSessionAffinityCacheKey(key string) (provider, sessionID, model string, ok bool) {
+	const prefix = "affinity:v2:"
+	if !strings.HasPrefix(key, prefix) {
+		return "", "", "", false
+	}
+	rem := key[len(prefix):]
+	// Parse provider length
+	colon1 := strings.IndexByte(rem, ':')
+	if colon1 <= 0 {
+		return "", "", "", false
+	}
+	lenProv, err := strconv.Atoi(rem[:colon1])
+	if err != nil || lenProv < 0 {
+		return "", "", "", false
+	}
+	rem = rem[colon1+1:]
+	if len(rem) < lenProv+1 || rem[lenProv] != ':' {
+		return "", "", "", false
+	}
+	provider = rem[:lenProv]
+	rem = rem[lenProv+1:]
+
+	// Parse sessionID length
+	colon2 := strings.IndexByte(rem, ':')
+	if colon2 <= 0 {
+		return "", "", "", false
+	}
+	lenSess, err := strconv.Atoi(rem[:colon2])
+	if err != nil || lenSess < 0 {
+		return "", "", "", false
+	}
+	rem = rem[colon2+1:]
+	if len(rem) < lenSess+1 || rem[lenSess] != ':' {
+		return "", "", "", false
+	}
+	sessionID = rem[:lenSess]
+	rem = rem[lenSess+1:]
+
+	// Parse model length
+	colon3 := strings.IndexByte(rem, ':')
+	if colon3 <= 0 {
+		return "", "", "", false
+	}
+	lenModel, err := strconv.Atoi(rem[:colon3])
+	if err != nil || lenModel < 0 {
+		return "", "", "", false
+	}
+	rem = rem[colon3+1:]
+	if len(rem) != lenModel {
+		return "", "", "", false
+	}
+	model = rem
+	return provider, sessionID, model, true
+}
+
 func isLocalPromptCacheSessionAlias(alias string) bool {
 	if strings.HasPrefix(alias, "pck:") {
 		return true
+	}
+	if strings.HasPrefix(alias, "affinity:v2:") {
+		_, sessionID, _, ok := parseSessionAffinityCacheKey(alias)
+		return ok && strings.HasPrefix(sessionID, "pck:")
 	}
 	_, sessionAndModel, ok := strings.Cut(alias, "::")
 	return ok && strings.HasPrefix(sessionAndModel, "pck:")

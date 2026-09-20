@@ -21,6 +21,7 @@ import (
 )
 
 func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	opts = xaiOptionsWithSelectedAuth(opts, auth)
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
@@ -102,10 +103,14 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
 		eventData = namespaceRestorer.restore(eventData)
+		if prepared.webSearchAlias != "" {
+			eventData = restoreXAIClientWebSearchName(eventData, prepared.webSearchAlias)
+		}
 		eventData = responseFilter.apply(eventData)
 		if len(eventData) == 0 {
 			continue
 		}
+		reporter.ObserveResponseModel(eventData)
 		upstreamEventType := gjson.GetBytes(eventData, "type").String()
 		phaseMarker.mark(upstreamEventType, eventData, false)
 		if terminalKind := xaiTerminalKind(upstreamEventType); terminalKind != "" {
@@ -116,7 +121,8 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			helps.RecordAPIResponseError(ctx, e.cfg, terminalErr)
 			return resp, terminalErr
 		}
-		switch gjson.GetBytes(eventData, "type").String() {
+		eventType := gjson.GetBytes(eventData, "type").String()
+		switch eventType {
 		case "response.output_item.done":
 			xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed", "response.incomplete":
@@ -232,6 +238,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 		return nil, nil, nil, err
 	}
 
+	reporter.ObserveResponseModel(data)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
 	clearXAIReasoningReplayAfterCompaction(ctx, prepared.replayScope)

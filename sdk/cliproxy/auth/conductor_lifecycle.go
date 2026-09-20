@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -39,10 +40,20 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	}
 
 	var replaced ProviderExecutor
+	var toReschedule []string
 	m.mu.Lock()
 	replaced = m.executors[provider]
 	m.executors[provider] = executor
+	for id, auth := range m.auths {
+		if auth != nil && strings.EqualFold(executorKeyFromAuth(auth), provider) {
+			toReschedule = append(toReschedule, id)
+		}
+	}
 	m.mu.Unlock()
+
+	for _, id := range toReschedule {
+		m.queueRefreshReschedule(id)
+	}
 
 	if replaced == nil || replaced == executor {
 		return
@@ -233,6 +244,10 @@ func (m *Manager) UpdateRefreshedAuth(ctx context.Context, base, updated *Auth) 
 
 // Update replaces an existing auth entry and notifies hooks.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
+	if auth == nil || auth.ID == "" {
+		return nil, nil
+	}
+	auth = auth.Clone()
 	return m.updateInternal(ctx, nil, auth, updateModeReplace)
 }
 
@@ -245,11 +260,35 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		return nil, fmt.Errorf("update auth: %w", errWeight)
 	}
 	auth.discardStoreGenerationMetadata()
+
+	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) &&
+		(strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") || (base != nil && strings.EqualFold(strings.TrimSpace(base.Provider), "meta")))
+	var unlockPersistence func()
+	defer func() {
+		if unlockPersistence != nil {
+			unlockPersistence()
+		}
+	}()
+	if persistMetaMint {
+		unlockPersistence = m.lockAuthPersistence([]string{auth.ID})
+	}
+
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
 		return nil, nil
+	}
+	if !persistMetaMint && (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(existing.Provider), "meta") {
+		persistMetaMint = true
+		m.mu.Unlock()
+		unlockPersistence = m.lockAuthPersistence([]string{auth.ID})
+		m.mu.Lock()
+		existing, ok = m.auths[auth.ID]
+		if !ok || existing == nil {
+			m.mu.Unlock()
+			return nil, nil
+		}
 	}
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64)
@@ -319,9 +358,23 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	} else {
 		auth.Generation++
 	}
+	cooldownStateChanged := false
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if mode == updateModeReplace && len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
+		}
+		credChanged := CredentialsChanged(existing, auth)
+		if credChanged && mode != updateModeRefresh {
+			if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
+				auth.Unavailable = false
+				auth.LastError = nil
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			}
+			resumed := clearUnauthorizedModelStates(auth, time.Now())
+			if len(resumed) > 0 {
+				cooldownStateChanged = true
+			}
 		}
 		if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
 			auth.Unavailable = existing.Unavailable
@@ -334,13 +387,168 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	now := time.Now()
 	auth.UpdatedAt = now
-	cooldownStateChanged := normalizeModelStates(auth)
+	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	auth.revision = m.nextAuthRevisionLocked()
 	auth.durableRevision = m.nextAuthDurableRevisionLocked()
+
+	if persistMetaMint {
+		preSaveAuth := existing.Clone()
+		preSaveDurableRevision := auth.durableRevision
+		candidate := auth.Clone()
+		m.markPersistenceInFlightLocked(ctx, candidate)
+		// Keep existing in m.auths while persisting private candidate
+		m.mu.Unlock()
+
+		if errPersist := m.persistCandidate(ctx, candidate); errPersist != nil {
+			m.clearPersistenceInFlight(candidate.ID, preSaveDurableRevision)
+			if unlockPersistence != nil {
+				unlockPersistence()
+				unlockPersistence = nil
+			}
+			m.reloadAfterAuthStoreConflict(ctx, candidate.ID, errPersist)
+			return nil, fmt.Errorf("persist meta auth: %w", errPersist)
+		}
+
+		m.mu.Lock()
+		current := m.auths[candidate.ID]
+		if current == nil {
+			m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
+		}
+		if current.RegistrationEpoch != candidate.RegistrationEpoch {
+			m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
+		}
+		if current.durableRevision > candidate.durableRevision {
+			if CredentialsChanged(preSaveAuth, current) {
+				// Operator updated credentials concurrently; candidate is obsolete.
+				m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
+				m.mu.Unlock()
+				if unlockPersistence != nil {
+					unlockPersistence()
+					unlockPersistence = nil
+				}
+				m.reloadAfterAuthStoreConflict(ctx, candidate.ID, ErrAuthStoreConflict)
+				return nil, fmt.Errorf("prepare meta auth: concurrent credential change: %w", ErrAuthStoreConflict)
+			}
+
+			// Notes or operator metadata was updated. Preserve concurrent operator changes
+			// without rolling back fresh minted credentials.
+			var reconciled *Auth
+			if mode == updateModeRefresh {
+				reconciled = MergeRefreshedAuth(preSaveAuth, current, candidate)
+			} else {
+				reconciled = MergePreparedAuth(preSaveAuth, current, candidate)
+			}
+			if reconciled == nil {
+				reconciled = current.Clone()
+			}
+			reconciled.durableRevision = current.durableRevision
+			reconciled.SetStoreGeneration(candidate.StoreGeneration())
+			candidate = reconciled
+		}
+
+		// Reconcile runtime-only result state relative to pre-save snapshot
+		candidate.Success = current.Success
+		candidate.Failed = current.Failed
+		candidate.recentRequests = current.recentRequests
+
+		// ModelStates: reconcile concurrent changes relative to pre-save snapshot
+		if candidate.ModelStates == nil && len(current.ModelStates) > 0 {
+			candidate.ModelStates = make(map[string]*ModelState, len(current.ModelStates))
+		}
+		for mName, curMS := range current.ModelStates {
+			var preMS *ModelState
+			if preSaveAuth != nil && preSaveAuth.ModelStates != nil {
+				preMS = preSaveAuth.ModelStates[mName]
+			}
+			if !reflect.DeepEqual(curMS, preMS) {
+				if curMS != nil {
+					candidate.ModelStates[mName] = curMS.Clone()
+				} else {
+					delete(candidate.ModelStates, mName)
+				}
+			}
+		}
+
+		// Quota: preserve active quota if new or extended
+		if current.Quota.Exceeded && current.Quota.NextRecoverAt.After(time.Now()) {
+			if preSaveAuth == nil || !preSaveAuth.Quota.Exceeded || current.Quota.NextRecoverAt.After(preSaveAuth.Quota.NextRecoverAt) {
+				candidate.Quota = current.Quota.Clone()
+				candidate.Unavailable = current.Unavailable
+				candidate.NextRetryAfter = current.NextRetryAfter
+				if candidate.Status == StatusActive {
+					candidate.Status = current.Status
+				}
+			}
+		}
+
+		// LastError and Unavailable: unchanged old 401 must stay cleared.
+		// Reconcile only if current has an independently newer error or cooldown relative to preSaveAuth.
+		var preErr *Error
+		if preSaveAuth != nil {
+			preErr = preSaveAuth.LastError
+		}
+		if !reflect.DeepEqual(current.LastError, preErr) && current.LastError != nil {
+			candidate.Unavailable = current.Unavailable
+			candidate.LastError = current.LastError
+			candidate.StatusMessage = current.StatusMessage
+			candidate.Status = current.Status
+			candidate.NextRetryAfter = current.NextRetryAfter
+		} else if preSaveAuth != nil && !preSaveAuth.Unavailable && current.Unavailable {
+			candidate.Unavailable = current.Unavailable
+			candidate.Status = current.Status
+			candidate.StatusMessage = current.StatusMessage
+			candidate.NextRetryAfter = current.NextRetryAfter
+		}
+
+		// Disabled: preserve operator disable
+		if current.Disabled || current.Status == StatusDisabled {
+			candidate.Disabled = current.Disabled
+			candidate.Status = current.Status
+			if candidate.Metadata != nil {
+				candidate.Metadata["disabled"] = current.Disabled
+			}
+		}
+
+		// Generation must remain monotonic
+		if candidate.Generation <= current.Generation {
+			candidate.Generation = current.Generation + 1
+		}
+
+		candidate.Runtime = current.Runtime
+		candidate.revision = m.nextAuthRevisionLocked()
+
+		committed := candidate.Clone()
+		m.auths[candidate.ID] = committed.Clone()
+		m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
+		m.mu.Unlock()
+
+		if unlockPersistence != nil {
+			unlockPersistence()
+			unlockPersistence = nil
+		}
+
+		if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+			m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		}
+		if m.scheduler != nil {
+			m.schedulerUpsert(committed)
+		}
+		m.queueRefreshReschedule(candidate.ID)
+		m.hook.OnAuthUpdated(ctx, committed.Clone())
+		if cooldownStateChanged {
+			m.persistCooldownStates(context.Background())
+		}
+		return committed, nil
+	}
+
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.markPersistenceInFlightLocked(ctx, authClone)
@@ -352,7 +560,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
-	if m.scheduler != nil {
+	if schedulerSnapshot != nil {
 		m.schedulerUpsert(schedulerSnapshot)
 	}
 	m.queueRefreshReschedule(auth.ID)
@@ -448,6 +656,32 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 
 func (m *Manager) Load(ctx context.Context) error {
 	return m.load(ctx, false)
+}
+
+func (m *Manager) persistCandidate(ctx context.Context, candidate *Auth) error {
+	if m == nil || candidate == nil {
+		return nil
+	}
+	if errWeight := ValidateAuthWeight(candidate); errWeight != nil {
+		return fmt.Errorf("persist auth: %w", errWeight)
+	}
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if store == nil || shouldSkipPersist(ctx) || isExplicitlyNonPersistentAuth(candidate) || candidate.Metadata == nil {
+		return nil
+	}
+	if versioned, ok := store.(VersionedAuthStore); ok {
+		expectedGeneration := candidate.StoreGeneration()
+		_, generation, errSave := versioned.SaveVersioned(ctx, candidate, expectedGeneration)
+		if errSave != nil {
+			return errSave
+		}
+		candidate.SetStoreGeneration(generation)
+		return nil
+	}
+	_, err := store.Save(ctx, candidate)
+	return err
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {

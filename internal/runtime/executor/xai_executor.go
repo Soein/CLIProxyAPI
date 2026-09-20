@@ -162,6 +162,7 @@ const (
 	xaiNamespaceToolType       = "namespace"
 	xaiToolSearchType          = "tool_search"
 	xaiWebSearchToolType       = "web_search"
+	xaiClientWebSearchAlias    = "clientfn_web_search"
 	xaiXSearchToolType         = "x_search"
 	xaiMaxToolsPerRequest      = 200
 	xaiWebSearchUpstreamCost   = 4

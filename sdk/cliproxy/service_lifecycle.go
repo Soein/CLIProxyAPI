@@ -98,6 +98,10 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
 		}
+		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
+			includeBaseline: true,
+			auths:           s.coreManager.List(),
+		})
 	}
 
 	// Cluster mode must fail closed: silently falling back to single-instance
@@ -263,6 +267,7 @@ func (s *Service) Run(ctx context.Context) error {
 	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
 
 	s.applyPprofConfig(s.cfg)
+	s.applyDiscoveryConfig(s.cfg)
 
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
@@ -310,7 +315,6 @@ func (s *Service) Run(ctx context.Context) error {
 		return errCluster
 	default:
 	}
-
 	select {
 	case <-ctx.Done():
 		log.Debug("service context cancelled, shutting down...")
@@ -494,6 +498,13 @@ func (s *Service) shutdown(ctx context.Context) error {
 		log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
 		if shutdownErr == nil {
 			shutdownErr = errShutdownPprof
+		}
+	}
+
+	if errShutdownDiscovery := s.shutdownDiscovery(); errShutdownDiscovery != nil {
+		log.Errorf("failed to stop discovery advertiser: %v", errShutdownDiscovery)
+		if shutdownErr == nil {
+			shutdownErr = errShutdownDiscovery
 		}
 	}
 

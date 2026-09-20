@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
@@ -78,6 +80,14 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
 		return
 	}
+
+	h.authStatusMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			h.authStatusMu.Unlock()
+		}
+	}()
 
 	ctx := c.Request.Context()
 	auths := h.authManager.List()
@@ -312,6 +322,13 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		})
 		return
 	}
+	locked = false
+	h.authStatusMu.Unlock()
+	if errHook := h.invokePostAuthPersistHooks(ctx, updated); errHook != nil {
+		log.Errorf("post-auth persist hook failed for status update: %v", errHook)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to synchronize auth runtime: %v", errHook)})
+		return
+	}
 
 	response := gin.H{"status": "ok", "disabled": *req.Disabled}
 	if len(names) > 1 {
@@ -346,6 +363,65 @@ func authsAtDisabledState(manager *coreauth.Manager, ids []string, disabled bool
 		resolved = append(resolved, auth)
 	}
 	return resolved, true
+}
+
+// patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all
+// runtime auths expanded from it. Virtual project children cannot be toggled independently.
+func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool) ([]*coreauth.Auth, error) {
+	if h == nil || h.authManager == nil || targetAuth == nil {
+		return nil, fmt.Errorf("core auth manager unavailable")
+	}
+	sourcePath := strings.TrimSpace(authAttribute(targetAuth, coreauth.AttributeVirtualSource))
+	if sourcePath == "" {
+		sourcePath = strings.TrimSpace(authAttribute(targetAuth, "path"))
+	}
+	if sourcePath == "" {
+		return nil, errPluginVirtualAuth
+	}
+	if errWrite := setSourceAuthFileDisabled(sourcePath, disabled); errWrite != nil {
+		if os.IsNotExist(errWrite) {
+			return nil, errAuthFileNotFound
+		}
+		return nil, fmt.Errorf("failed to update source auth file: %w", errWrite)
+	}
+	now := time.Now()
+	hookAuths := make([]*coreauth.Auth, 0)
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if !sameAuthFilePath(authAttribute(auth, "path"), sourcePath) &&
+			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), sourcePath) {
+			continue
+		}
+		applyAuthDisabledState(auth, disabled)
+		auth.UpdatedAt = now
+		updated, errUpdate := h.authManager.Update(ctx, auth)
+		if errUpdate != nil {
+			return nil, fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
+		}
+		hookAuth := updated
+		if hookAuth == nil {
+			hookAuth = auth
+		}
+		hookAuths = append(hookAuths, hookAuth)
+	}
+	return hookAuths, nil
+}
+
+func (h *Handler) invokePostAuthPersistHooks(ctx context.Context, auths []*coreauth.Auth) error {
+	if h == nil || h.postAuthPersistHook == nil {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if errHook := h.postAuthPersistHook(ctx, auth); errHook != nil {
+			return errHook
+		}
+	}
+	return nil
 }
 
 type preparedSourceAuthFile struct {
@@ -607,9 +683,20 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+	updatedAuth, err := h.authManager.Update(ctx, targetAuth)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
+	}
+	if h.postAuthPersistHook != nil {
+		hookAuth := updatedAuth
+		if hookAuth == nil {
+			hookAuth = targetAuth
+		}
+		if errHook := h.postAuthPersistHook(ctx, hookAuth); errHook != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("post-auth persist hook failed: %v", errHook)})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -831,6 +918,40 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	}
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
+	}
+	if _, ok := touchedRoots["plan_type"]; ok {
+		syncAuthFilePlanTypeAttribute(auth)
+	} else if _, ok := touchedRoots["id_token"]; ok {
+		syncAuthFilePlanTypeAttribute(auth)
+	}
+}
+
+func syncAuthFilePlanTypeAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	newPlanType := ""
+	if auth.Metadata != nil {
+		if ptRaw, ok := auth.Metadata["plan_type"].(string); ok && strings.TrimSpace(ptRaw) != "" {
+			newPlanType = strings.TrimSpace(ptRaw)
+		} else if idTokenRaw, ok := auth.Metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
+					newPlanType = pt
+				}
+			}
+		}
+	}
+	if newPlanType != "" {
+		auth.Attributes["plan_type"] = newPlanType
+	} else {
+		delete(auth.Attributes, "plan_type")
 	}
 }
 
@@ -1195,14 +1316,33 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
+	legacyClaudeCredential, errLegacy := claudeauth.FindMatchingLegacyCredential(ctx, store, record)
+	if errLegacy != nil {
+		return "", errLegacy
+	}
+	if legacyClaudeCredential != nil {
+		coreauth.MergeExistingAuthMetadata(record, legacyClaudeCredential.Metadata)
+	}
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	savedPath, errSave := coreauth.PersistExplicitAuth(ctx, store, record)
+	savedPath, errSave := coreauth.PersistExplicitAuth(coreauth.WithAuthCreationIntent(ctx), store, record)
 	if errSave != nil {
 		return savedPath, errSave
+	}
+	if legacyClaudeCredential != nil {
+		if strings.TrimSpace(savedPath) == "" {
+			return "", fmt.Errorf("canonical Claude credential was not persisted; legacy credential retained")
+		}
+		legacyID := strings.TrimSpace(legacyClaudeCredential.ID)
+		if legacyID == "" {
+			legacyID = strings.TrimSpace(legacyClaudeCredential.FileName)
+		}
+		if errDelete := store.Delete(ctx, legacyID); errDelete != nil {
+			return savedPath, fmt.Errorf("canonical Claude credential saved but legacy credential cleanup failed: %w", errDelete)
+		}
 	}
 	if h.postAuthPersistHook != nil {
 		persistedRecord := record

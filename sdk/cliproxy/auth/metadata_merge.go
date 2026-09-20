@@ -34,6 +34,11 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 		target.Metadata = make(map[string]any)
 	}
 	storageKeys := storageOwnedMetadataKeys(target.Storage)
+	if _, explicitlySet := target.Metadata["disabled"]; !explicitlySet {
+		if disabled, ok := existingMap["disabled"].(bool); ok {
+			target.Disabled = disabled
+		}
+	}
 	for k, v := range existingMap {
 		normalizedKey := strings.ToLower(strings.TrimSpace(k))
 		if IsAuthTokenPayloadKey(normalizedKey) {
@@ -41,6 +46,12 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 		}
 		if _, storageOwned := storageKeys[normalizedKey]; storageOwned {
 			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(target.Provider), "meta") {
+			switch CanonicalCredentialMetadataKey(k) {
+			case "api_key", "dca_token", "dca_expired", "dca_expires_at":
+				continue
+			}
 		}
 		if _, exists := target.Metadata[k]; !exists {
 			target.Metadata[k] = v

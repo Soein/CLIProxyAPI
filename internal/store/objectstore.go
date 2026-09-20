@@ -176,7 +176,10 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
 
-	if auth.Disabled {
+	// Runtime updates must not recreate a disabled credential whose source file
+	// was deliberately removed. Login and migration callers explicitly mark the
+	// save when creating a missing disabled credential is intentional.
+	if auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
 		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}

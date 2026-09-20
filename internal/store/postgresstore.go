@@ -897,6 +897,15 @@ func (s *PostgresStore) SaveVersioned(ctx context.Context, auth *cliproxyauth.Au
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
 
+	// Runtime updates must not recreate a disabled credential whose source file
+	// was deliberately removed. Login and migration callers explicitly mark the
+	// save when creating a missing disabled credential is intentional.
+	if auth.Disabled && auth.Storage != nil && !cliproxyauth.HasAuthCreationIntent(ctx) {
+		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+			return "", 0, nil
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

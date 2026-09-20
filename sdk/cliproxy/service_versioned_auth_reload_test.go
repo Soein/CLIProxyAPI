@@ -2,9 +2,6 @@ package cliproxy
 
 import (
 	"context"
-	"io"
-	"net/http"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,20 +13,32 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
-type blockingModelRegistrationTransport struct {
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
+type blockingExecutor struct {
+	serviceTestPluginExecutor
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
 }
 
-func (t *blockingModelRegistrationTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	t.once.Do(func() { close(t.started) })
-	<-t.release
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(`{"webSearchModelIds":[]}`)),
-	}, nil
+func newBlockingExecutor() *blockingExecutor {
+	return &blockingExecutor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (e *blockingExecutor) Identifier() string {
+	return "antigravity"
+}
+
+func (e *blockingExecutor) CloseExecutionSession(string) {
+	e.startedOnce.Do(func() { close(e.started) })
+	<-e.release
+}
+
+func (e *blockingExecutor) safeRelease() {
+	e.releaseOnce.Do(func() { close(e.release) })
 }
 
 type serviceAuthReloadStore struct {
@@ -284,34 +293,37 @@ func TestServiceReconcileAuthRuntimeDoesNotRestoreModelsAfterConcurrentDelete(t 
 		ID:       authID,
 		Provider: "antigravity",
 		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "test-token"},
 	}
 	auth.SetStoreGeneration(1)
 	store.setAuth(auth)
 	manager := coreauth.NewManager(store, nil, nil)
 	service := &Service{cfg: &config.Config{}, coreManager: manager}
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
-
-	transport := &blockingModelRegistrationTransport{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	previousTransport := http.DefaultTransport
-	http.DefaultTransport = transport
-	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+	antigravityCapabilityMu.Lock()
+	antigravityCapabilityCache = make(map[string]antigravityCapabilityCacheEntry)
+	antigravityCapabilityMu.Unlock()
+	blocker := newBlockingExecutor()
+	t.Cleanup(func() {
+		blocker.safeRelease()
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+		antigravityCapabilityMu.Lock()
+		antigravityCapabilityCache = make(map[string]antigravityCapabilityCacheEntry)
+		antigravityCapabilityMu.Unlock()
+	})
+	manager.RegisterExecutor(blocker)
 
 	reconcileErr := make(chan error, 1)
 	go func() { reconcileErr <- service.reconcileAuthRuntime(context.Background()) }()
 	select {
-	case <-transport.started:
-	case <-time.After(time.Second):
+	case <-blocker.started:
+	case <-time.After(2 * time.Second):
 		t.Fatal("reconcile did not reach model registration")
 	}
 	manager.Remove(coreauth.WithSkipPersist(context.Background()), authID)
-	close(transport.release)
+	blocker.safeRelease()
 	if errReconcile := <-reconcileErr; errReconcile != nil {
 		t.Fatalf("reconcileAuthRuntime() error = %v", errReconcile)
 	}
+	service.WaitAntigravityProbes()
 	if _, exists := manager.GetByID(authID); exists {
 		t.Fatal("concurrent delete did not remove Manager auth")
 	}
@@ -327,27 +339,29 @@ func TestServiceReconcileAuthRuntimeRefreshesConcurrentProviderReplacement(t *te
 		ID:       authID,
 		Provider: "antigravity",
 		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "test-token"},
 	}
 	auth.SetStoreGeneration(1)
 	store.setAuth(auth)
 	manager := coreauth.NewManager(store, nil, nil)
 	service := &Service{cfg: &config.Config{}, coreManager: manager}
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
-
-	transport := &blockingModelRegistrationTransport{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	previousTransport := http.DefaultTransport
-	http.DefaultTransport = transport
-	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+	antigravityCapabilityMu.Lock()
+	antigravityCapabilityCache = make(map[string]antigravityCapabilityCacheEntry)
+	antigravityCapabilityMu.Unlock()
+	blocker := newBlockingExecutor()
+	t.Cleanup(func() {
+		blocker.safeRelease()
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+		antigravityCapabilityMu.Lock()
+		antigravityCapabilityCache = make(map[string]antigravityCapabilityCacheEntry)
+		antigravityCapabilityMu.Unlock()
+	})
+	manager.RegisterExecutor(blocker)
 
 	reconcileErr := make(chan error, 1)
 	go func() { reconcileErr <- service.reconcileAuthRuntime(context.Background()) }()
 	select {
-	case <-transport.started:
-	case <-time.After(time.Second):
+	case <-blocker.started:
+	case <-time.After(2 * time.Second):
 		t.Fatal("reconcile did not reach stale-provider model registration")
 	}
 	replacement, exists := manager.GetByID(authID)
@@ -359,10 +373,11 @@ func TestServiceReconcileAuthRuntimeRefreshesConcurrentProviderReplacement(t *te
 	if _, errUpdate := manager.Update(coreauth.WithSkipPersist(context.Background()), replacement); errUpdate != nil {
 		t.Fatalf("concurrent provider Update() error = %v", errUpdate)
 	}
-	close(transport.release)
+	blocker.safeRelease()
 	if errReconcile := <-reconcileErr; errReconcile != nil {
 		t.Fatalf("reconcileAuthRuntime() error = %v", errReconcile)
 	}
+	service.WaitAntigravityProbes()
 	latest, exists := manager.GetByID(authID)
 	if !exists || latest.Provider != "claude" {
 		t.Fatalf("latest auth = %#v, want claude provider", latest)

@@ -136,6 +136,56 @@ func TestUploadAuthFile_PreservesPriorityAttributes(t *testing.T) {
 	}
 }
 
+func TestUploadAuthFile_InvokesPostAuthPersistHook(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	var hookedAuth *coreauth.Auth
+	h.SetPostAuthPersistHook(func(_ context.Context, auth *coreauth.Auth) error {
+		if auth != nil {
+			hookedAuth = auth.Clone()
+		}
+		return nil
+	})
+
+	content := `{"type":"codex","email":"user@example.com","access_token":"token-123"}`
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "codex-user@example.com.json")
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write([]byte(content)); err != nil {
+		t.Fatalf("failed to write multipart content: %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if hookedAuth == nil {
+		t.Fatal("expected postAuthPersistHook to be invoked on auth file upload")
+	}
+	if hookedAuth.ID != "codex-user@example.com.json" {
+		t.Fatalf("hooked auth ID = %q, want codex-user@example.com.json", hookedAuth.ID)
+	}
+}
+
 func TestUploadAuthFile_HonorsSharedPathLock(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -159,6 +209,7 @@ func TestUploadAuthFile_HonorsSharedPathLock(t *testing.T) {
 	if errClose := writer.Close(); errClose != nil {
 		t.Fatalf("close multipart writer: %v", errClose)
 	}
+
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)

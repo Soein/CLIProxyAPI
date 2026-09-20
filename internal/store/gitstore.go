@@ -405,7 +405,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 }
 
 // Save persists token storage and metadata to the resolved auth file path.
-func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string, error) {
+func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
@@ -427,7 +427,10 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
 
-	if auth.Disabled {
+	// Runtime updates must not recreate a disabled credential whose source file
+	// was deliberately removed. Login and migration callers explicitly mark the
+	// save when creating a missing disabled credential is intentional.
+	if auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			return "", nil
 		}

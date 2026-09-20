@@ -1172,16 +1172,22 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		candidateSnapshots := cloneAuthSlice(candidates)
 		m.mu.RUnlock()
 
-		available, errAvailable := m.availableAuthsForRouteModel(candidateSnapshots, "mixed", model, time.Now())
+		var priorityAuths []*Auth
+		var errAvailable error
+		if m.PluginSchedulerWantsAcrossPriorities() {
+			priorityAuths, errAvailable = m.availableAuthsForRouteModelAcrossPriorities(candidateSnapshots, "mixed", model, time.Now())
+		} else {
+			priorityAuths, errAvailable = m.availableAuthsForRouteModel(candidateSnapshots, "mixed", model, time.Now())
+		}
 		if errAvailable != nil {
 			if spillover() {
 				continue
 			}
 			return nil, nil, "", errAvailable
 		}
-		available = cloneAuthSlice(available)
+		priorityAuths = cloneAuthSlice(priorityAuths)
 
-		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
+		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, priorityAuths)
 		if errPick != nil {
 			return nil, nil, "", errPick
 		}

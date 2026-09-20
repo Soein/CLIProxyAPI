@@ -9,22 +9,22 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-type executorKeyRefreshExecutor struct {
+type countingRefreshExecutor struct {
 	id           string
 	refreshCalls atomic.Int32
 }
 
-func (e *executorKeyRefreshExecutor) Identifier() string { return e.id }
+func (e *countingRefreshExecutor) Identifier() string { return e.id }
 
-func (e *executorKeyRefreshExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *countingRefreshExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, nil
 }
 
-func (e *executorKeyRefreshExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (e *countingRefreshExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	return nil, nil
 }
 
-func (e *executorKeyRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+func (e *countingRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
 	e.refreshCalls.Add(1)
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -33,18 +33,18 @@ func (e *executorKeyRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*Au
 	return auth, nil
 }
 
-func (e *executorKeyRefreshExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *countingRefreshExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, nil
 }
 
-func (e *executorKeyRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+func (e *countingRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
 }
 
 func TestRefreshAuthForRequest_UsesExecutorKeyFromAuth(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	executor := &executorKeyRefreshExecutor{id: "openai-compatible-custom"}
+	executor := &countingRefreshExecutor{id: "openai-compatible-custom"}
 	manager.RegisterExecutor(executor)
 
 	auth := &Auth{
