@@ -981,9 +981,9 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 func (m *Manager) pickWithShardFilterAndInflight(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, inflight func(string) int, preferredAuthID string) (*Auth, error) {
 	ownership, spilloverEnabled := m.authOwnershipPredicate()
 	pick := func(filter func(string) bool) (*Auth, error) {
+		beforeVer := m.syncedVersion.Load()
 		selected, errPick := m.scheduler.pickSingleWithFilterAndInflight(ctx, provider, model, opts, tried, inflight, preferredAuthID, filter)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+		if errPick != nil && model != "" && m.shouldRetrySchedulerPick(errPick, beforeVer) {
 			selected, errPick = m.scheduler.pickSingleWithFilterAndInflight(ctx, provider, model, opts, tried, inflight, preferredAuthID, filter)
 		}
 		return selected, errPick
@@ -1061,7 +1061,7 @@ func (m *Manager) lockAuthAdmissionOwnership(authID string) (bool, func()) {
 }
 
 func (m *Manager) authAdmissibleLocked(current *Auth, provider, model string) bool {
-	if current == nil || executorKeyFromAuth(current) != provider || current.Disabled || current.Status == StatusDisabled {
+	if current == nil || canonicalSchedulingProvider(executorKeyFromAuth(current)) != canonicalSchedulingProvider(provider) || current.Disabled || current.Status == StatusDisabled {
 		return false
 	}
 	checkModel := model

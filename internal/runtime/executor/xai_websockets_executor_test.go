@@ -1907,12 +1907,14 @@ func TestApplyXAIWebsocketRequestContinuityResetsOpaqueStateAfterSwitchedRequest
 	transcriptMessage := []byte(`{"type":"message","id":"assistant-old","role":"assistant","content":[{"type":"output_text","text":"kept assistant"}]}`)
 
 	for _, tt := range []struct {
-		name      string
-		newAuthID string
-		newWSURL  string
+		name        string
+		newAuthID   string
+		newWSURL    string
+		newProxyURL string
 	}{
 		{name: "auth switch", newAuthID: "auth-b", newWSURL: "wss://gateway.example/responses?tenant=a"},
 		{name: "base URL switch", newAuthID: "auth-a", newWSURL: "wss://gateway.example/responses?tenant=b"},
+		{name: "proxy switch", newAuthID: "auth-a", newWSURL: "wss://gateway.example/responses?tenant=a", newProxyURL: "http://proxy-b.example:8082"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			state := &xaiWebsocketIDState{
@@ -1926,7 +1928,7 @@ func TestApplyXAIWebsocketRequestContinuityResetsOpaqueStateAfterSwitchedRequest
 			}
 			prepared := &xaiPreparedRequest{body: []byte(`{"previous_response_id":"resp-old","input":[{"type":"message","id":"user-new","role":"user","content":"next"}]}`)}
 			sess := &codexWebsocketSession{authID: "auth-a", wsURL: "wss://gateway.example/responses?tenant=a"}
-			applyXAIWebsocketRequestContinuity(prepared, mapper, websocketSessionTargetChanged(sess, tt.newAuthID, tt.newWSURL))
+			applyXAIWebsocketRequestContinuity(prepared, mapper, websocketSessionTargetChanged(sess, tt.newAuthID, tt.newWSURL, tt.newProxyURL))
 
 			if gjson.GetBytes(prepared.body, "previous_response_id").Exists() || xaiInputHasEncryptedValue(prepared.body, encrypted) || xaiInputHasItemType(prepared.body, "compaction") {
 				t.Fatalf("target switch leaked opaque state: %s", prepared.body)

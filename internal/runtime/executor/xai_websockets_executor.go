@@ -551,7 +551,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		}
 	}
 	idMapper := newXAIWebsocketRequestIDMapper(e.idStore, stateSessionID, req.Payload)
-	targetChanged := websocketSessionTargetChanged(sess, authID, wsURL)
+	targetChanged := websocketSessionTargetChanged(sess, authID, wsURL, executionProxyURL(ctx, e.cfg, auth))
 	applyXAIWebsocketRequestContinuity(prepared, idMapper, targetChanged)
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
 	defer func() {
@@ -589,7 +589,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	var transportReused bool
 	var errDial error
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL)
+		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, e.cfg, auth))
 		if conn == nil {
 			unlockStreamSession()
 			return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
@@ -1185,7 +1185,7 @@ func (e *XAIWebsocketsExecutor) prepareResponsesWebsocketRequest(ctx context.Con
 }
 
 func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer := newProxyAwareWebsocketDialer(ctx, e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
@@ -1247,7 +1247,8 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConnWithReuse(ctx context.Context,
 		return conn, closer, resp, false, errDial
 	}
 
-	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedWebsocketSessionConn(sess, authID, wsURL); staleConn != nil {
+	proxyURL := executionProxyURL(ctx, e.cfg, auth)
+	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedWebsocketSessionConn(sess, authID, wsURL, proxyURL); staleConn != nil {
 		staleLastEvent := sess.getLastEventType(staleConn)
 		logXAIWebsocketDisconnectedWithLastEvent(sess, sess.sessionID, staleAuthID, staleWSURL, "target_changed", staleLastEvent, nil)
 		if staleCloser != nil {
@@ -1297,6 +1298,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConnWithReuse(ctx context.Context,
 	sess.connCloser = closer
 	sess.wsURL = wsURL
 	sess.authID = authID
+	sess.proxyURL = proxyURL
 	sess.readerConn = conn
 	sess.connMu.Unlock()
 

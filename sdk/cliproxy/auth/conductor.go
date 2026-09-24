@@ -166,6 +166,9 @@ type Manager struct {
 	persistenceInFlightDone      map[string]chan struct{}
 	pendingDisabledPersistence   map[string]struct{}
 	enablingTransitions          map[string]int
+	syncSchedulerMu              sync.Mutex
+	structuralEpoch              atomic.Uint64
+	syncedVersion                atomic.Uint64
 	scheduler                    *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
@@ -541,9 +544,9 @@ func cloneTriedMap(src map[string]struct{}) map[string]struct{} {
 func (m *Manager) pickMixedWithShardFilter(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
 	ownership, spilloverEnabled := m.authOwnershipPredicate()
 	pick := func(filter func(string) bool) (*Auth, string, error) {
+		beforeVer := m.syncedVersion.Load()
 		selected, providerKey, errPick := m.scheduler.pickMixedWithFilter(ctx, providers, model, opts, tried, filter)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+		if errPick != nil && model != "" && m.shouldRetrySchedulerPick(errPick, beforeVer) {
 			selected, providerKey, errPick = m.scheduler.pickMixedWithFilter(ctx, providers, model, opts, tried, filter)
 		}
 		return selected, providerKey, errPick

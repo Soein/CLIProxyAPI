@@ -13,6 +13,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -520,6 +521,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}
+	ctx = cliproxyexecutor.WithoutRequestProxyURL(ctx)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -553,7 +555,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	if auth != nil {
 		// Use the same effective provider key as request execution so OpenAI-compat
 		// auths registered under namespaced keys still resolve for refresh.
-		exec = m.executors[executorKeyFromAuth(auth)]
+		exec, _ = m.executorLocked(executorKeyFromAuth(auth))
 		// Lifecycle mutations can update the stored auth in place under m.mu.
 		auth = auth.Clone()
 	}

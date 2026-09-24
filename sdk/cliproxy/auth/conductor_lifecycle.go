@@ -204,6 +204,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if registeringNew {
 		m.wakeDispatchAuthority()
 	}
+	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
 	errPersist := m.persistRegisteredIfCurrent(ctx, authClone, registeringNew)
 	if errPersist != nil {
@@ -600,6 +601,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if schedulerSnapshot != nil {
 		m.schedulerUpsert(schedulerSnapshot)
 	}
+	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
 	if errPersist := m.persistPublishedIfCurrent(ctx, authClone); errPersist != nil {
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
@@ -667,6 +669,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		m.scheduler.RecordRemovalTombstone(id, tombstoneEpoch)
 	}
 	m.wakeDispatchAuthority()
+	m.structuralEpoch.Add(1)
 	m.queueRefreshUnschedule(id)
 	m.invalidateSessionAffinity(id)
 

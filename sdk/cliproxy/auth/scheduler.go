@@ -197,6 +197,86 @@ func (s *authScheduler) setSelector(selector Selector) {
 	clear(s.mixedWeightedStates)
 }
 
+// isSchedulableAuth determines whether an auth can be scheduled by a provider scheduler,
+// returning its normalized ID and providerKey.
+func isSchedulableAuth(auth *Auth) (string, string, bool) {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		return "", "", false
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return "", "", false
+	}
+	providerKey := executorKeyFromAuth(auth)
+	if providerKey == "" {
+		return "", "", false
+	}
+	return authID, providerKey, true
+}
+
+// needsSyncFromMap reports whether the scheduler state is missing auths or has outdated metadata/epochs,
+// reading directly from an in-memory auth map without cloning auth instances.
+func (s *authScheduler) needsSyncFromMap(auths map[string]*Auth) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.needsSyncFromMapLocked(auths)
+}
+
+func (s *authScheduler) needsSyncFromMapLocked(auths map[string]*Auth) bool {
+	activeCount := 0
+	for _, auth := range auths {
+		if _, _, ok := isSchedulableAuth(auth); ok {
+			activeCount++
+		}
+	}
+	if activeCount != len(s.authProviders) {
+		return true
+	}
+
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		authID, providerKey, schedulable := isSchedulableAuth(auth)
+		if !schedulable {
+			rawID := strings.TrimSpace(auth.ID)
+			if rawID != "" {
+				if _, exists := s.authProviders[rawID]; exists {
+					return true
+				}
+			}
+			continue
+		}
+
+		if s.authProviders[authID] != providerKey {
+			return true
+		}
+
+		pState := s.providers[providerKey]
+		if pState == nil {
+			return true
+		}
+		meta := pState.auths[authID]
+		if meta == nil {
+			return true
+		}
+
+		genMeta, okGen := s.authGenerations[authID]
+		if !okGen || genMeta.epoch != auth.RegistrationEpoch {
+			return true
+		}
+
+		currentRegEpoch := registry.GetGlobalRegistry().ClientRegistrationEpoch(authID)
+		if meta.registryEpoch != currentRegEpoch {
+			return true
+		}
+	}
+	return false
+}
+
 // rebuild recreates scheduler state from a Manager snapshot. snapshotWatermark
 // is the latest Manager revision covered by auths, so incremental updates newer
 // than the snapshot survive even when their IDs are absent from it.
@@ -259,7 +339,7 @@ func (s *authScheduler) rebuild(auths []*Auth, snapshotWatermarks ...uint64) {
 		selected := auth
 		if auth != nil {
 			authID := strings.TrimSpace(auth.ID)
-			if current := currentAuths[authID]; current != nil && current.revision > auth.revision {
+			if current := currentAuths[authID]; current != nil && (current.revision > auth.revision || (current.RegistrationEpoch == auth.RegistrationEpoch && current.Generation > auth.Generation)) {
 				selected = current
 			}
 		}
@@ -462,7 +542,7 @@ func (s *authScheduler) pickSingleWithStrategyAndInflight(ctx context.Context, p
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	providerKey := canonicalSchedulingProvider(provider)
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -813,7 +893,7 @@ func normalizeProviderKeys(providers []string) []string {
 	seen := make(map[string]struct{}, len(providers))
 	out := make([]string, 0, len(providers))
 	for _, provider := range providers {
-		providerKey := strings.ToLower(strings.TrimSpace(provider))
+		providerKey := canonicalSchedulingProvider(provider)
 		if providerKey == "" {
 			continue
 		}

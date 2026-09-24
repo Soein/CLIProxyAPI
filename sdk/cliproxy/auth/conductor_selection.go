@@ -140,12 +140,22 @@ func (m *Manager) nextAuthDurableRevisionLocked() uint64 {
 	return m.authDurableRevision
 }
 
+func (m *Manager) currentVersion() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.structuralEpoch.Load() + registry.GetGlobalRegistry().RegistrationEpoch()
+}
+
 func (m *Manager) syncScheduler() {
 	if m == nil || m.scheduler == nil {
 		return
 	}
-	auths, snapshotWatermark := m.snapshotAuths()
-	m.syncSchedulerFromSnapshot(auths, snapshotWatermark)
+	currentVer := m.currentVersion()
+	if currentVer == m.syncedVersion.Load() && !m.schedulerNeedsSync() {
+		return
+	}
+	m.checkAndSyncScheduler()
 }
 
 func (m *Manager) snapshotAuths() ([]*Auth, uint64) {
@@ -175,6 +185,7 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	}
 	snapshot := auth.Clone()
 	m.mu.RUnlock()
+	m.structuralEpoch.Add(1)
 	m.scheduler.upsertAuth(snapshot)
 }
 
@@ -954,16 +965,15 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	var selected *Auth
 	var errPick error
+	beforeVer := m.syncedVersion.Load()
 	if providerKey == "mixed" {
 		selected, _, errPick = m.scheduler.pickMixedWithStrategyAndFilter(ctx, providers, model, opts, tried, strategy, eligible)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+		if errPick != nil && model != "" && m.shouldRetrySchedulerPick(errPick, beforeVer) {
 			selected, _, errPick = m.scheduler.pickMixedWithStrategyAndFilter(ctx, providers, model, opts, tried, strategy, eligible)
 		}
 	} else {
 		selected, errPick = m.scheduler.pickSingleWithStrategyAndInflight(ctx, providerKey, model, opts, tried, strategy, nil, "", eligible)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+		if errPick != nil && model != "" && m.shouldRetrySchedulerPick(errPick, beforeVer) {
 			selected, errPick = m.scheduler.pickSingleWithStrategyAndInflight(ctx, providerKey, model, opts, tried, strategy, nil, "", eligible)
 		}
 	}
@@ -1064,15 +1074,14 @@ func (m *Manager) AvailableProviders() []string {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		provider := canonicalSchedulingProvider(auth.Provider)
 		if provider == "" {
 			continue
 		}
-		if _, ok := seen[provider]; ok {
-			continue
+		if _, ok := seen[provider]; !ok {
+			seen[provider] = struct{}{}
+			out = append(out, provider)
 		}
-		seen[provider] = struct{}{}
-		out = append(out, provider)
 	}
 	sort.Strings(out)
 	return out
@@ -1085,8 +1094,8 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 	if m == nil {
 		return false
 	}
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider == "" {
+	targetKey := canonicalSchedulingProvider(provider)
+	if targetKey == "" {
 		return false
 	}
 	m.mu.RLock()
@@ -1095,7 +1104,7 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}
-		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider {
+		if canonicalSchedulingProvider(auth.Provider) == targetKey {
 			return true
 		}
 	}
@@ -1575,17 +1584,24 @@ func (m *Manager) GetExecutionSessionAuthByID(sessionID string, authID string) (
 	return auth.Clone(), true
 }
 
-// Executor returns the registered provider executor for a provider key.
-func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
-	if m == nil {
-		return nil, false
+func canonicalSchedulingProvider(key string) string {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	switch lower {
+	case "kimi.com":
+		return "kimi"
+	case "kimi.ai":
+		return "kimi-ai"
+	default:
+		return lower
 	}
+}
+
+func (m *Manager) executorLocked(provider string) (ProviderExecutor, bool) {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
 		return nil, false
 	}
 
-	m.mu.RLock()
 	executor, okExecutor := m.executors[provider]
 	if !okExecutor {
 		lowerProvider := strings.ToLower(provider)
@@ -1593,12 +1609,26 @@ func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 			executor, okExecutor = m.executors[lowerProvider]
 		}
 	}
-	m.mu.RUnlock()
-
+	if !okExecutor {
+		switch strings.ToLower(provider) {
+		case "kimi-ai", "kimi.ai", "kimi.com":
+			executor, okExecutor = m.executors["kimi"]
+		}
+	}
 	if !okExecutor || executor == nil {
 		return nil, false
 	}
 	return executor, true
+}
+
+// Executor returns the registered provider executor for a provider key.
+func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.executorLocked(provider)
 }
 
 // CloseExecutionSession asks all registered executors to release the supplied execution session.
@@ -1657,15 +1687,71 @@ func shouldRetrySchedulerPick(err error) bool {
 	if err == nil {
 		return false
 	}
-	var cooldownErr *modelCooldownError
-	if errors.As(err, &cooldownErr) {
-		return true
-	}
 	var authErr *Error
 	if !errors.As(err, &authErr) || authErr == nil {
 		return false
 	}
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
+}
+
+func (m *Manager) shouldRetrySchedulerPick(err error, beforeVersion uint64) bool {
+	if m == nil || m.scheduler == nil || err == nil {
+		return false
+	}
+	syncedVer := m.syncedVersion.Load()
+	if syncedVer > beforeVersion {
+		// A concurrent sync completed while this pick was in-flight; allow one bounded retry.
+		return true
+	}
+	currentVer := m.currentVersion()
+	if currentVer == syncedVer {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) {
+		return m.checkAndSyncScheduler()
+	}
+	if !shouldRetrySchedulerPick(err) {
+		return false
+	}
+	return m.checkAndSyncScheduler()
+}
+
+func (m *Manager) checkAndSyncScheduler() bool {
+	m.syncSchedulerMu.Lock()
+	defer m.syncSchedulerMu.Unlock()
+	currentVer := m.currentVersion()
+	needsSync := m.schedulerNeedsSync()
+	if currentVer == m.syncedVersion.Load() && !needsSync {
+		return true
+	}
+	if !needsSync {
+		m.advanceSyncedVersion(currentVer)
+		return true
+	}
+	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+	if !m.schedulerNeedsSync() {
+		m.advanceSyncedVersion(currentVer)
+	}
+	return true
+}
+
+func (m *Manager) schedulerNeedsSync() bool {
+	if m == nil || m.scheduler == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.scheduler.needsSyncFromMap(m.auths)
+}
+
+func (m *Manager) advanceSyncedVersion(version uint64) {
+	for {
+		cur := m.syncedVersion.Load()
+		if cur >= version || m.syncedVersion.CompareAndSwap(cur, version) {
+			break
+		}
+	}
 }
 
 func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
@@ -1710,14 +1796,15 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	for {
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
-		executor, okExecutor := m.executors[provider]
+		executor, okExecutor := m.executorLocked(provider)
 		if !okExecutor {
 			m.mu.RUnlock()
 			return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		candidates := make([]*Auth, 0, len(m.auths))
+		targetKey := canonicalSchedulingProvider(provider)
 		for _, candidate := range m.auths {
-			if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+			if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey || candidate.Disabled {
 				continue
 			}
 			if ownership != nil && !ownership(candidate.ID) {
@@ -1988,8 +2075,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	if strings.TrimSpace(model) != "" {
 		m.mu.RLock()
+		targetKey := canonicalSchedulingProvider(provider)
 		for _, candidate := range m.auths {
-			if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+			if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey || candidate.Disabled {
 				continue
 			}
 			if !eligibility.allows(candidate) {
@@ -2116,7 +2204,7 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, p := range providers {
-		if norm := strings.TrimSpace(strings.ToLower(p)); norm != "" && norm != "mixed" {
+		if norm := canonicalSchedulingProvider(p); norm != "" && norm != "mixed" {
 			providerSet[norm] = struct{}{}
 		}
 	}
@@ -2134,7 +2222,7 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
 				continue
 			}
 		}
-		if _, ok := m.executors[providerKey]; !ok {
+		if _, ok := m.executorLocked(providerKey); !ok {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {

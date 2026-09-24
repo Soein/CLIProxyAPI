@@ -29,8 +29,12 @@ type KimiTokenStorage struct {
 	DeviceID string `json:"device_id,omitempty"`
 	// Expired is the RFC3339 timestamp when the access token expires.
 	Expired string `json:"expired,omitempty"`
-	// Type indicates the authentication provider type, always "kimi" for this storage.
+	// Type indicates the authentication provider type ("kimi" or "kimi-ai").
 	Type string `json:"type"`
+	// Domain indicates the Kimi domain (e.g. "kimi.com" or "kimi.ai").
+	Domain string `json:"domain,omitempty"`
+	// BaseURL is the base URL for API requests.
+	BaseURL string `json:"base_url,omitempty"`
 
 	// Metadata holds arbitrary key-value pairs injected via hooks.
 	// It is not exported to JSON directly to allow flattening during serialization.
@@ -48,7 +52,23 @@ func (ts *KimiTokenStorage) MarshalTokenJSON() ([]byte, error) {
 	if ts == nil {
 		return nil, fmt.Errorf("kimi token storage is nil")
 	}
-	ts.Type = "kimi"
+	if ts.Type == "" {
+		if IsKimiAIDomain(ts.Domain) {
+			ts.Type = "kimi-ai"
+		} else {
+			ts.Type = "kimi"
+		}
+	}
+	if ts.Domain == "" {
+		if IsKimiAIDomain(ts.Type) {
+			ts.Domain = KimiAIDomain
+		} else {
+			ts.Domain = KimiDefaultDomain
+		}
+	}
+	if ts.BaseURL == "" {
+		ts.BaseURL = ResolveKimiAPIBaseURL(ts.Domain)
+	}
 	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
 	if errMerge != nil {
 		return nil, fmt.Errorf("failed to merge metadata: %w", errMerge)

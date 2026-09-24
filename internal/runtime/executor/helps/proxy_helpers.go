@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
@@ -131,9 +132,10 @@ func (c *proxyTransportCache) closeAll(transports []*http.Transport) {
 }
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
-// 1. Reuse the RoundTripper from context when available
-// 2. Use auth.ProxyURL if configured
-// 3. Use cfg.ProxyURL if auth proxy is not configured
+// 1. Use the execution-scoped request proxy if configured (highest priority)
+// 2. Reuse the RoundTripper selected by the auth conductor when available
+// 3. Use auth.ProxyURL if configured
+// 4. Use cfg.ProxyURL if auth proxy is not configured
 //
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
@@ -149,22 +151,14 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Timeout = timeout
 	}
 
-	// Priority 1: Reuse the RoundTripper selected and cached by the auth conductor.
-	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
-		return httpClient
+	if cliproxyexecutor.RequestProxyURL(ctx) == "" && ctx != nil {
+		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+			httpClient.Transport = rt
+			return httpClient
+		}
 	}
 
-	// Priority 2: Use auth.ProxyURL if configured
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-
-	// Priority 3: Use cfg.ProxyURL if auth proxy is not configured
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
@@ -185,8 +179,9 @@ var devinTransportCache = NewTransportCache[string](DefaultTransportCacheCapacit
 // NewDevinHTTPClient creates an HTTP client customized for Devin Connect-RPC upstream.
 // Suppresses automatic Accept-Encoding: gzip while preserving connection reuse across requests.
 func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	// Respect explicitly injected context RoundTripper (e.g. from Conductor, Home, or integration test fixtures)
-	if ctx != nil {
+	// A request proxy replaces both the injected round tripper and credential/global proxy.
+	// Respect explicitly injected context RoundTripper only when no request override is set.
+	if cliproxyexecutor.RequestProxyURL(ctx) == "" && ctx != nil {
 		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 			if tr, ok := rt.(*http.Transport); ok {
 				key := fmt.Sprintf("rt:%p", tr)
@@ -209,12 +204,7 @@ func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxya
 		}
 	}
 
-	proxyURL := ""
-	if auth != nil && strings.TrimSpace(auth.ProxyURL) != "" {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	} else if cfg != nil && strings.TrimSpace(cfg.ProxyURL) != "" {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 
 	tr, err := devinTransportCache.Get(proxyURL, func() (*http.Transport, error) {
 		var base *http.Transport
@@ -250,6 +240,21 @@ func (rt devinNoGzipRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 	return rt.base.RoundTrip(req)
+}
+
+func effectiveProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if proxyURL := cliproxyexecutor.RequestProxyURL(ctx); proxyURL != "" {
+		return proxyURL
+	}
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.
