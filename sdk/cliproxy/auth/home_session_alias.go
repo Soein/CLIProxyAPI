@@ -297,6 +297,7 @@ func (m *Manager) homeDispatchSessionIDs(opts cliproxyexecutor.Options) (string,
 							if opts.Metadata != nil {
 								opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
 								opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
+								opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = match.AccessNumber
 								if match.IsFork {
 									opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
 									delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
@@ -314,6 +315,7 @@ func (m *Manager) homeDispatchSessionIDs(opts cliproxyexecutor.Options) (string,
 								if opts.Metadata != nil {
 									opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID
 									opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = bindRes.SessionID
+									opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = bindRes.AccessNumber
 								}
 							}
 						}
