@@ -1100,7 +1100,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
-		p := strings.TrimSpace(strings.ToLower(provider))
+		p := canonicalSchedulingProvider(provider)
 		if p == "" {
 			continue
 		}
@@ -1144,7 +1144,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if !eligibility.allows(candidate) {
 				continue
 			}
-			providerKey := executorKeyFromAuth(candidate)
+			providerKey := canonicalSchedulingProvider(executorKeyFromAuth(candidate))
 			if providerKey == "" {
 				continue
 			}
@@ -1154,7 +1154,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
-			if _, ok := m.executors[providerKey]; !ok {
+			if _, ok := m.executorLocked(providerKey); !ok {
 				continue
 			}
 			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
@@ -1267,7 +1267,7 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 	eligibleProviders := make([]string, 0, len(providers))
 	seenProviders := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
-		providerKey := strings.TrimSpace(strings.ToLower(provider))
+		providerKey := canonicalSchedulingProvider(provider)
 		if providerKey == "" {
 			continue
 		}
@@ -1294,7 +1294,7 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {
+			if _, ok := providerSet[canonicalSchedulingProvider(executorKeyFromAuth(candidate))]; !ok {
 				continue
 			}
 			if _, used := tried[candidate.ID]; used {
