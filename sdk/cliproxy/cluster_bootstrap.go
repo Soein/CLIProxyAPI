@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cluster"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/cluster"
 	log "github.com/sirupsen/logrus"
 )
 

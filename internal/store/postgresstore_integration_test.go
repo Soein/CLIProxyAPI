@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 const postgresIntegrationDSNEnv = "CLIPROXY_POSTGRES_TEST_DSN"

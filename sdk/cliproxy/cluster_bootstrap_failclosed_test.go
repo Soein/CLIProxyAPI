@@ -18,12 +18,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
-	internalapi "github.com/router-for-me/CLIProxyAPI/v7/internal/api"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cluster"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	internalapi "github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/cluster"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 func TestServiceRunNodeLeaseProbeFailureFailsClosed(t *testing.T) {

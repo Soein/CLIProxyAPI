@@ -317,6 +317,7 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	if !updated.NextRefreshAfter.IsZero() || (base != nil && !base.NextRefreshAfter.IsZero()) {
 		merged.NextRefreshAfter = updated.NextRefreshAfter
 	}
+	merged.RefreshFailures = updated.RefreshFailures
 
 	// 2. Error and Status recovery
 	baseErrMsg := ""

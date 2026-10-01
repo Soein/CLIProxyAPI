@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestManager_RefreshRecoveryKeepsAutoRefreshScheduled(t *testing.T) {
@@ -58,8 +58,8 @@ func TestManager_RefreshRecoveryKeepsAutoRefreshScheduled(t *testing.T) {
 	executor.mu.Lock()
 	executor.refreshFail = false
 	executor.mu.Unlock()
-	// The background worker enters refreshAuthOnce without a failed request token.
-	if _, errRefresh := manager.refreshAuthOnce(ctx, primary.ID, ""); errRefresh != nil {
+	// The background worker refreshes the current epoch without a failed request token.
+	if _, errRefresh := manager.refreshAuthForRequestAtEpoch(ctx, primary.ID, "", failed.RegistrationEpoch); errRefresh != nil {
 		t.Fatalf("background refresh: %v", errRefresh)
 	}
 	if executor.RefreshCalls() != 2 {
@@ -117,15 +117,15 @@ func TestManager_RefreshRecoveryKeepsAutoRefreshScheduled(t *testing.T) {
 	// Advance only the scheduler's explicit clock; no worker or wall-clock wait.
 	loop.handleDueAuth(ctx, item.next.Add(-time.Nanosecond), primary.ID)
 	select {
-	case id := <-loop.jobs:
-		t.Fatalf("refresh dispatched before due time for %s", id)
+	case job := <-loop.jobs:
+		t.Fatalf("refresh dispatched before due time for %s", job.id)
 	default:
 	}
 	loop.handleDueAuth(ctx, item.next, primary.ID)
 	select {
-	case id := <-loop.jobs:
-		if id != primary.ID {
-			t.Fatalf("scheduled auth = %q, want %q", id, primary.ID)
+	case job := <-loop.jobs:
+		if job.id != primary.ID || job.registrationEpoch != recovered.RegistrationEpoch {
+			t.Fatalf("scheduled auth = %q at epoch %d, want %q at epoch %d", job.id, job.registrationEpoch, primary.ID, recovered.RegistrationEpoch)
 		}
 	default:
 		t.Fatal("recovered auth was not dispatched again before token expiry")

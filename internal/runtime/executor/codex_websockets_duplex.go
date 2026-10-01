@@ -11,9 +11,9 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -212,7 +212,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 				return false
 			}
-			payload = buildCodexWebsocketRequestBody(prepared.upstreamBody)
+			payload = buildCodexWebsocketRequestBody(prepared.clientBody)
 			release, ok := cliproxyexecutor.AdmitDispatch(streamCtx, auth.ID)
 			if !ok {
 				_ = reject("dispatch authority rejected admission")
@@ -588,7 +588,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				// Retain response settings, not request history or authorization headers.
 				// In-flight steering pins its parent's settings independently of this window.
 				snapshot := *current
-				snapshot.originalPayload, snapshot.upstreamBody, snapshot.wsHeaders = nil, nil, nil
+				snapshot.originalPayload, snapshot.wsHeaders = nil, nil
 				snapshot.clientBody = []byte("{}")
 				if reasoning := gjson.GetBytes(current.clientBody, "reasoning"); reasoning.Exists() {
 					snapshot.clientBody, _ = sjson.SetRawBytes(snapshot.clientBody, "reasoning", []byte(reasoning.Raw))
@@ -719,7 +719,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				metadataMu.Lock()
 				// A failure for the running response must not consume a queued create.
 				// A rejection before response.created instead owns the oldest pending
-				// create, including its identity mapping and reasoning replay scope.
+				// create, including its reasoning replay scope.
 				currentFailure := failedID != "" && failedID == responseID
 				ambiguous := failedID == "" && ((len(pending) > 0 && responseActive) || len(unacknowledgedSteers) > 0)
 				if len(pending) > 0 && !currentFailure && !ambiguous {
@@ -755,7 +755,6 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					return
 				}
 			}
-			payload = applyCodexIdentityConfuseResponsePayload(payload, eventPrepared.identityState)
 			restoreMultiAgent := !eventPrepared.multiAgentV2Conflict && (eventPrepared.optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 			payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgent)
 			// Parse and invalidate replay for every rejected request, using the
@@ -811,7 +810,6 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					reporter.EnsurePublished(ctx)
 				}
 			}
-			payload = applyCodexIdentityExposeResponsePayload(payload, eventPrepared.identityState)
 			if !send(cliproxyexecutor.StreamChunk{Payload: helps.EnsureResponsesUsageDetails(payload)}) {
 				return
 			}

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 type dispatchAuthorityStub struct {
@@ -384,12 +384,19 @@ func TestDispatchAuthorityClosedStopsAutoRefreshWorkerWithoutSideEffects(t *test
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loop := newAuthAutoRefreshLoop(manager, time.Second, 1)
+	manager.refreshLoop = loop
+	current, _ := manager.GetByID(auth.ID)
+	job := manager.markRefreshPending(loop, auth.ID, current.RegistrationEpoch, time.Now())
+	if job == nil {
+		cancel()
+		t.Fatal("failed to create auto-refresh job")
+	}
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
 		loop.worker(ctx)
 	}()
-	loop.jobs <- auth.ID
+	loop.jobs <- job
 	select {
 	case <-authority.admitCh:
 	case <-time.After(time.Second):
@@ -409,7 +416,7 @@ func TestDispatchAuthorityClosedStopsAutoRefreshWorkerWithoutSideEffects(t *test
 	if got := hook.results.Load(); got != 0 {
 		t.Fatalf("result hook calls = %d, want 0", got)
 	}
-	current, _ := manager.GetByID(auth.ID)
+	current, _ = manager.GetByID(auth.ID)
 	if got := authAccessToken(current); got != "stale" {
 		t.Fatalf("access token = %q, want unchanged stale token", got)
 	}

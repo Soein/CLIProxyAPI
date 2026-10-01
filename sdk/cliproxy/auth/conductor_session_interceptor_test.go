@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestApplyRequestAfterAuthInterceptorPreservesSelectedSession(t *testing.T) {

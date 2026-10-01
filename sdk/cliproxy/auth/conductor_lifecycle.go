@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 )
 
 // SetRetryConfig updates additional credential retry rounds, the per-round credential limit, and the cooldown wait interval.
@@ -208,6 +209,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	errPersist := m.persistRegisteredIfCurrent(ctx, authClone, registeringNew)
 	if errPersist != nil {
+		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist registered auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
 		current, _ := m.GetByID(auth.ID)
 		return current, fmt.Errorf("persist registered auth %q: %w", auth.ID, errPersist)
@@ -604,6 +606,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
 	if errPersist := m.persistPublishedIfCurrent(ctx, authClone); errPersist != nil {
+		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist updated auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
 		current, _ := m.GetByID(auth.ID)
 		return current, fmt.Errorf("persist updated auth %q: %w", auth.ID, errPersist)

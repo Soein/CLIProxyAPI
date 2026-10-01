@@ -19,24 +19,25 @@ import (
 	"time"
 
 	gin "github.com/gin-gonic/gin"
-	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
-	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
-	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
-	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
-	runtimehelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/google/uuid"
+	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
+	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
+	proxyconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	runtimehelps "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"gopkg.in/yaml.v3"
@@ -886,10 +887,17 @@ func TestServerStartedReportsListenerFailure(t *testing.T) {
 func TestServerStopForceClosesActiveRequestsAndWaitsForExit(t *testing.T) {
 	server := newTestServer(t)
 	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
 	handlerExited := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseHandler) }) }
+	defer release()
 	server.engine.GET("/blocking-stop", func(c *gin.Context) {
 		close(handlerStarted)
 		<-c.Request.Context().Done()
+		close(handlerCanceled)
+		<-releaseHandler
 		close(handlerExited)
 	})
 
@@ -925,11 +933,39 @@ func TestServerStopForceClosesActiveRequestsAndWaitsForExit(t *testing.T) {
 		t.Fatal("blocking handler did not start")
 	}
 
-	stopCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	errStop := server.Stop(stopCtx)
+	stopCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if !errors.Is(errStop, context.DeadlineExceeded) {
-		t.Fatalf("Stop() error = %v, want context deadline exceeded from graceful shutdown", errStop)
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- server.Stop(stopCtx) }()
+	select {
+	case <-handlerCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not cancel the active handler")
+	}
+	select {
+	case errRequest := <-requestDone:
+		if errRequest == nil {
+			t.Fatal("Stop() did not interrupt the client connection")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client connection remained open after Stop()")
+	}
+	select {
+	case errStop := <-stopDone:
+		t.Fatalf("Stop() returned while the tracked handler was still running: %v", errStop)
+	default:
+	}
+	if server.IsStopped() {
+		t.Fatal("server reported stopped while a tracked handler was still running")
+	}
+	release()
+	select {
+	case errStop := <-stopDone:
+		if errStop != nil {
+			t.Fatalf("Stop() error = %v, want nil after handler completion", errStop)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return after the handler exited")
 	}
 	select {
 	case <-handlerExited:
@@ -946,11 +982,6 @@ func TestServerStopForceClosesActiveRequestsAndWaitsForExit(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start() did not return after force-close")
-	}
-	select {
-	case <-requestDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("client request did not return after force-close")
 	}
 }
 
@@ -1078,9 +1109,12 @@ func TestCodexAlphaSearchForwardsRequest(t *testing.T) {
 		t.Fatalf("response Content-Type = %q", got)
 	}
 	traceID := rr.Header().Get(internallogging.CPATraceIDHeader)
-	parts := strings.Split(traceID, "-")
-	if len(parts) != 3 || parts[1] != credential.Index || len(parts[2]) != 8 {
+	parts := strings.SplitN(traceID, "-", 3)
+	if len(parts) != 3 || parts[1] != credential.Index || parts[2] == "" {
 		t.Fatalf("trace ID = %q, want timestamp-%s-requestID", traceID, credential.Index)
+	}
+	if _, errParseUUID := uuid.Parse(parts[2]); errParseUUID != nil {
+		t.Fatalf("trace requestID = %q: %v", parts[2], errParseUUID)
 	}
 	if _, errParse := time.Parse("20060102150405", parts[0]); errParse != nil {
 		t.Fatalf("trace timestamp = %q: %v", parts[0], errParse)
@@ -2934,6 +2968,78 @@ func TestDecodeHomeModelsKeepsTokenMetadata(t *testing.T) {
 	}
 	if got, ok := formatted["thinking"].(*registry.ThinkingSupport); !ok || !reflect.DeepEqual(got.Levels, []string{"low", "medium", "high"}) {
 		t.Fatalf("formatted Gemini thinking metadata = %#v, want low/medium/high", formatted["thinking"])
+	}
+}
+
+func TestHomeCodexModels_MaxContextLength(t *testing.T) {
+	entries, errDecode := decodeHomeModels([]byte(`{
+		"codex": [
+			{"id": "gpt-6-sol", "context_length": 272000, "max_context_length": 524288}
+		]
+	}`))
+	if errDecode != nil {
+		t.Fatalf("decodeHomeModels error = %v", errDecode)
+	}
+	if len(entries) != 1 || entries[0].maxContextLength != 524288 {
+		t.Fatalf("unexpected decoded entry: %+v", entries)
+	}
+
+	formatted := formatHomeCodexModel(entries[0])
+	if got := formatted["max_context_length"]; got != 524288 {
+		t.Fatalf("formatHomeCodexModel max_context_length = %v, want 524288", got)
+	}
+}
+
+func TestHomeCodexModels_OAuthSettingsChannelIsolation(t *testing.T) {
+	cfg := &proxyconfig.Config{
+		OAuthSettings: map[string][]proxyconfig.OAuthModelSetting{
+			"codex": {
+				{Name: "shared-model", MaxContextLength: 524288},
+			},
+			"claude": {
+				{Name: "shared-model", MaxContextLength: 200000},
+			},
+		},
+	}
+
+	// 1. Entry from codex only -> receives codex setting (524288)
+	codexEntry := homeModelEntry{
+		id:        "shared-model",
+		providers: []string{"codex"},
+	}
+	mCodex := formatHomeCodexModelWithSettings(codexEntry, cfg)
+	if got := mCodex["max_context_length"]; got != 524288 {
+		t.Errorf("mCodex max_context_length = %v, want 524288", got)
+	}
+
+	// 2. Entry from claude only -> receives claude setting (200000), NOT codex setting
+	claudeEntry := homeModelEntry{
+		id:        "shared-model",
+		providers: []string{"claude"},
+	}
+	mClaude := formatHomeCodexModelWithSettings(claudeEntry, cfg)
+	if got := mClaude["max_context_length"]; got != 200000 {
+		t.Errorf("mClaude max_context_length = %v, want 200000", got)
+	}
+
+	// 3. Entry from other provider -> does not receive either setting
+	otherEntry := homeModelEntry{
+		id:        "shared-model",
+		providers: []string{"vertex"},
+	}
+	mOther := formatHomeCodexModelWithSettings(otherEntry, cfg)
+	if got := mOther["max_context_length"]; got != nil {
+		t.Errorf("mOther max_context_length = %v, want nil", got)
+	}
+
+	// 4. Entry from multiple providers (claude, codex) -> deterministic codex precedence
+	multiEntry := homeModelEntry{
+		id:        "shared-model",
+		providers: []string{"claude", "codex"},
+	}
+	mMulti := formatHomeCodexModelWithSettings(multiEntry, cfg)
+	if got := mMulti["max_context_length"]; got != 524288 {
+		t.Errorf("mMulti max_context_length = %v, want 524288", got)
 	}
 }
 

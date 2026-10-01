@@ -40,7 +40,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
 )
 
 func main() {

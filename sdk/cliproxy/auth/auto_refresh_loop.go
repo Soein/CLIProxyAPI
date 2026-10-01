@@ -27,7 +27,16 @@ type authAutoRefreshLoop struct {
 	dirty map[string]struct{}
 
 	wakeCh chan struct{}
-	jobs   chan string
+	jobs   chan *authRefreshJob
+}
+
+type authRefreshJob struct {
+	id                string
+	registrationEpoch uint64
+	pendingUntil      time.Time
+	pendingGeneration uint64
+	loop              *authAutoRefreshLoop
+	running           bool // guarded by manager.mu
 }
 
 func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrency int) *authAutoRefreshLoop {
@@ -48,7 +57,7 @@ func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrenc
 		index:       make(map[string]*refreshHeapItem),
 		dirty:       make(map[string]struct{}),
 		wakeCh:      make(chan struct{}, 1),
-		jobs:        make(chan string, jobBuffer),
+		jobs:        make(chan *authRefreshJob, jobBuffer),
 	}
 }
 
@@ -70,6 +79,8 @@ func (l *authAutoRefreshLoop) run(ctx context.Context) {
 		return
 	}
 
+	defer l.releaseQueuedJobs()
+
 	workers := l.concurrency
 	if workers <= 0 {
 		workers = refreshMaxConcurrency
@@ -86,25 +97,45 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case authID := <-l.jobs:
-			if authID == "" {
+		case job := <-l.jobs:
+			if job == nil {
 				continue
 			}
-			// Phase 4 Sprint 2: eligibility is "ShouldRefreshLocally" rather
-			// than "IsLeader". When AuthSharding is on, each replica
-			// refreshes only its own shard; when off, only the leader
-			// refreshes (legacy behavior). Either way non-eligible replicas
-			// re-queue the item at a future time instead of calling
-			// queueReschedule — queueReschedule immediately re-evaluates
-			// shouldRefresh and would busy-loop on non-owners whose auths
-			// have NextRefreshAfter in the past.
-			if !l.manager.ShouldRefreshLocally(authID) {
-				l.upsert(authID, time.Now().Add(l.interval))
+			// Non-owners must defer the pending job so rescheduling cannot
+			// immediately queue the same expired credential again.
+			if !l.manager.ShouldRefreshLocally(job.id) {
+				var retryAt time.Time
+				if ctx.Err() == nil {
+					retryAt = time.Now().Add(l.interval)
+				}
+				l.manager.finishRefreshJob(job, retryAt, false)
 				continue
 			}
-			l.manager.refreshAuth(ctx, authID)
-			l.queueReschedule(authID)
+			var retryAt time.Time
+			if l.manager.beginRefreshJob(ctx, job) {
+				_, _ = l.manager.refreshAuthForRequestAtEpoch(ctx, job.id, "", job.registrationEpoch)
+				if ctx.Err() == nil {
+					// Acquisition or admission rejection leaves the pending marker
+					// unchanged; defer that attempt instead of immediately retrying.
+					retryAt = time.Now().Add(l.interval)
+				}
+			}
+			l.manager.finishRefreshJob(job, retryAt, false)
 		}
+	}
+}
+
+func (l *authAutoRefreshLoop) releaseQueuedJobs() {
+	l.manager.mu.RLock()
+	var jobs []*authRefreshJob
+	for _, job := range l.manager.refreshJobs {
+		if job.loop == l && !job.running {
+			jobs = append(jobs, job)
+		}
+	}
+	l.manager.mu.RUnlock()
+	for _, job := range jobs {
+		l.manager.finishRefreshJob(job, time.Time{}, true)
 	}
 }
 
@@ -273,6 +304,7 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	next, shouldSchedule := nextRefreshCheckAt(now, auth, l.interval)
 	shouldRefresh := manager.shouldRefresh(auth, now)
 	exec, _ := manager.executorLocked(executorKeyFromAuth(auth))
+	registrationEpoch := auth.RegistrationEpoch
 	manager.mu.RUnlock()
 
 	if !shouldSchedule {
@@ -290,12 +322,16 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		return
 	}
 
-	if !manager.markRefreshPending(authID, now) {
+	job := manager.markRefreshPending(l, authID, registrationEpoch, now)
+	if job == nil {
 		manager.mu.RLock()
 		auth = manager.auths[authID]
 		next, shouldSchedule = nextRefreshCheckAt(now, auth, l.interval)
 		manager.mu.RUnlock()
 		if shouldSchedule {
+			if !next.After(now) {
+				next = now.Add(l.interval)
+			}
 			l.upsert(authID, next)
 		} else {
 			l.remove(authID)
@@ -303,11 +339,18 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		return
 	}
 
-	select {
-	case <-ctx.Done():
-		return
-	case l.jobs <- authID:
+	if ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case l.jobs <- job:
+			return
+		default:
+		}
 	}
+	// A full queue must not hold the dispatcher or leave a phantom pending job.
+	retryAt := now.Add(l.interval)
+	manager.finishRefreshJob(job, retryAt, false)
+	l.upsert(authID, retryAt)
 }
 
 func (l *authAutoRefreshLoop) applyDirty(now time.Time) {
@@ -366,6 +409,7 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.dirty, authID)
 	item, ok := l.index[authID]
 	if !ok || item == nil {
 		return
@@ -378,7 +422,7 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 	if auth == nil {
 		return time.Time{}, false
 	}
-	if hasUnauthorizedAuthFailure(auth) {
+	if hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) {
 		return time.Time{}, false
 	}
 

@@ -19,18 +19,18 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
-	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
@@ -115,6 +115,7 @@ type Server struct {
 	server *http.Server
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
+	listenerMu      sync.Mutex
 	muxBaseListener net.Listener
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
@@ -130,8 +131,8 @@ type Server struct {
 	serveCalled  atomic.Bool
 	forceStopped atomic.Bool
 
-	// activeRequests prevents Shutdown from reporting a full stop while
-	// handlers that survived graceful shutdown are still running.
+	// activeRequests prevents Stop from reporting a full stop while handlers
+	// that outlive their closed HTTP connections are still running.
 	activeRequests *activeRequestTracker
 	forceCloseWait time.Duration
 
@@ -140,7 +141,8 @@ type Server struct {
 	codexLiveHandler *codexlive.Handler
 
 	// cfg holds the current server configuration.
-	cfg *config.Config
+	cfgMu sync.RWMutex
+	cfg   *config.Config
 
 	// oldConfigYaml stores a YAML snapshot of the previous configuration for change detection.
 	// This prevents issues when the config object is modified in place by Management API.
@@ -445,6 +447,15 @@ func (s *Server) WaitUntilStopped(ctx context.Context) error {
 	return s.waitUntilStopped(ctx, s.activeRequests.stopAccepting())
 }
 
+func (s *Server) getConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
+}
+
 // Handler returns the HTTP handler used by the server.
 func (s *Server) Handler() http.Handler {
 	if s == nil || s.server == nil {
@@ -479,10 +490,11 @@ func (s *Server) Start() error {
 		return errStart
 	}
 
-	useTLS := s.cfg != nil && s.cfg.TLS.Enable
+	cfg := s.getConfig()
+	useTLS := cfg != nil && cfg.TLS.Enable
 	if useTLS {
-		certPath := strings.TrimSpace(s.cfg.TLS.Cert)
-		keyPath := strings.TrimSpace(s.cfg.TLS.Key)
+		certPath := strings.TrimSpace(cfg.TLS.Cert)
+		keyPath := strings.TrimSpace(cfg.TLS.Key)
 		if certPath == "" || keyPath == "" {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
@@ -516,8 +528,10 @@ func (s *Server) Start() error {
 	}
 
 	httpListener := newMuxListener(listener.Addr(), 1024)
+	s.listenerMu.Lock()
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
+	s.listenerMu.Unlock()
 
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
@@ -532,13 +546,19 @@ func (s *Server) Start() error {
 
 	select {
 	case errServe := <-httpErrCh:
-		if s.muxBaseListener != nil {
-			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		s.listenerMu.Lock()
+		muxBase := s.muxBaseListener
+		muxHTTP := s.muxHTTPListener
+		s.muxBaseListener = nil
+		s.muxHTTPListener = nil
+		s.listenerMu.Unlock()
+		if muxBase != nil {
+			if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 				log.Debugf("failed to close shared listener after HTTP serve exit: %v", errClose)
 			}
 		}
-		if s.muxHTTPListener != nil {
-			_ = s.muxHTTPListener.Close()
+		if muxHTTP != nil {
+			_ = muxHTTP.Close()
 		}
 		errAccept := <-acceptErrCh
 		errServe = normalizeHTTPServeError(errServe)
@@ -551,11 +571,17 @@ func (s *Server) Start() error {
 		}
 		return nil
 	case errAccept := <-acceptErrCh:
-		if s.muxHTTPListener != nil {
-			_ = s.muxHTTPListener.Close()
+		s.listenerMu.Lock()
+		muxHTTP := s.muxHTTPListener
+		muxBase := s.muxBaseListener
+		s.muxHTTPListener = nil
+		s.muxBaseListener = nil
+		s.listenerMu.Unlock()
+		if muxHTTP != nil {
+			_ = muxHTTP.Close()
 		}
-		if s.muxBaseListener != nil {
-			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		if muxBase != nil {
+			if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 				log.Debugf("failed to close shared listener after accept loop exit: %v", errClose)
 			}
 		}
@@ -572,66 +598,41 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop first attempts a graceful shutdown. If the context expires, it
-// force-closes active connections and waits for the serving loop and tracked
-// handlers to exit before returning.
+// Stop immediately closes HTTP connections and waits for the serving loop and
+// tracked handlers to exit before returning. The bounded completion check keeps
+// cluster ownership leases from being released while handlers are still running.
 //
 // Parameters:
-//   - ctx: The context for graceful shutdown
+//   - ctx: Context passed for compatibility.
 //
 // Returns:
-//   - error: An error if the server fails to stop
+//   - error: An error if the server fails to stop or confirm handler completion.
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
 	if s == nil || s.server == nil {
 		return errors.New("failed to shutdown HTTP server: server not initialized")
 	}
 	requestsDrained := s.activeRequests.stopAccepting()
-
 	if s.keepAliveEnabled {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
 	}
-	s.closeListeners()
-	if s.forceStopped.Load() {
-		forceCtx, cancel := context.WithTimeout(context.Background(), s.forceCloseWait)
-		errWait := s.waitUntilStopped(forceCtx, requestsDrained)
-		cancel()
-		if errWait != nil {
-			return fmt.Errorf("failed to confirm HTTP server stopped after force-close: %w", errWait)
-		}
-		return nil
-	}
-
-	// Shutdown the HTTP server. If graceful shutdown times out, Close is
-	// required to cancel active request contexts; closing listeners alone only
-	// stops new accepts and can leave handlers running after Stop returns.
-	errShutdown := normalizeHTTPServeError(s.server.Shutdown(ctx))
-	if s.codexLiveHandler != nil {
-		s.codexLiveHandler.Close()
-	}
-	if errShutdown != nil {
-		errClose := s.ForceStop()
-		forceCtx, cancel := context.WithTimeout(context.Background(), s.forceCloseWait)
-		errWait := s.waitUntilStopped(forceCtx, requestsDrained)
-		cancel()
-
-		shutdownErr := fmt.Errorf("failed to shutdown HTTP server gracefully: %w", errShutdown)
+	errClose := s.ForceStop()
+	forceCtx, cancel := context.WithTimeout(context.Background(), s.forceCloseWait)
+	defer cancel()
+	errWait := s.waitUntilStopped(forceCtx, requestsDrained)
+	if errClose != nil || errWait != nil {
+		var errStop error
 		if errClose != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("failed to force-close HTTP server: %w", errClose))
+			errStop = fmt.Errorf("failed to force-close HTTP server: %w", errClose)
 		}
 		if errWait != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("failed to confirm HTTP server stopped after force-close: %w", errWait))
+			errStop = errors.Join(errStop, fmt.Errorf("failed to confirm HTTP server stopped after force-close: %w", errWait))
 		}
-		return shutdownErr
+		return errStop
 	}
-
-	if errWait := s.waitUntilStopped(ctx, requestsDrained); errWait != nil {
-		return fmt.Errorf("failed to confirm HTTP server stopped: %w", errWait)
-	}
-
 	log.Debug("API server stopped")
 	return nil
 }
@@ -657,11 +658,17 @@ func (s *Server) closeListeners() {
 	if s == nil {
 		return
 	}
-	if s.muxHTTPListener != nil {
-		_ = s.muxHTTPListener.Close()
+	s.listenerMu.Lock()
+	muxHTTP := s.muxHTTPListener
+	s.muxHTTPListener = nil
+	muxBase := s.muxBaseListener
+	s.muxBaseListener = nil
+	s.listenerMu.Unlock()
+	if muxHTTP != nil {
+		_ = muxHTTP.Close()
 	}
-	if s.muxBaseListener != nil {
-		if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+	if muxBase != nil {
+		if errClose := muxBase.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 			log.Debugf("failed to close shared listener: %v", errClose)
 		}
 	}

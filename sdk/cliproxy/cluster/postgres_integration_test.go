@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
 )
 
 const postgresIntegrationDSNEnv = "CLIPROXY_POSTGRES_TEST_DSN"
