@@ -107,7 +107,6 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 		var pendingEventLine []byte
 		replayableTerminal := false
-		terminalSeen := false
 		emitTranslatedLine := func(translatedLine []byte) bool {
 			lines, errBridge := prepared.applyPatch.Stream(translatedLine)
 			if errBridge != nil {
@@ -224,12 +223,16 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						return
 					}
 					if terminalEvent {
-						terminalSeen = true
-						if !prepared.applyPatch.Active() {
-							streamUsage.Publish(ctx, reporter)
-							reporter.EnsurePublished(ctx)
-							return
+						if prepared.applyPatch.Active() {
+							// The bridge validated the source terminal. Finish SSE framing
+							// without waiting for an upstream transport marker or EOF.
+							if !emitTranslatedLine([]byte("\n\n")) || !emitTranslatedLine([]byte("data: [DONE]\n\n")) {
+								return
+							}
 						}
+						streamUsage.Publish(ctx, reporter)
+						reporter.EnsurePublished(ctx)
+						return
 					}
 				}
 				continue
@@ -288,11 +291,6 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
-			return
-		}
-		if terminalSeen && ctx.Err() == nil {
-			streamUsage.Publish(ctx, reporter)
-			reporter.EnsurePublished(ctx)
 			return
 		}
 		if ctx.Err() == nil {

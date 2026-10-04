@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -133,6 +134,9 @@ func TestXAIWebsocketsPayloadBarrierOnReconnect(t *testing.T) {
 }
 
 func TestXAIApplyPatchStreamCancellationReleasesUpstream(t *testing.T) {
+	const model = "grok-patch-cancellation"
+	plugin := &captureXAIUsagePlugin{model: model, records: make(chan usage.Record, 1)}
+	usage.RegisterPlugin(plugin)
 	upstreamClosed := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -146,7 +150,7 @@ func TestXAIApplyPatchStreamCancellationReleasesUpstream(t *testing.T) {
 	defer cancel()
 	executor := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "xai", Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
-	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: []byte(`{"input":"hello","tools":[{"type":"custom","name":"apply_patch"}]}`)}
+	req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hello","tools":[{"type":"custom","name":"apply_patch"}]}`)}
 	result, errStream := executor.ExecuteStream(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -158,14 +162,21 @@ func TestXAIApplyPatchStreamCancellationReleasesUpstream(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
-		case _, ok := <-result.Chunks:
+		case chunk, ok := <-result.Chunks:
 			if !ok {
 				select {
 				case <-upstreamClosed:
 				case <-deadline:
 					t.Fatal("cancel did not release upstream request")
 				}
+				record := waitForXAIUsageRecord(t, plugin.records)
+				if !record.Failed || record.Phases == nil || record.Phases.TerminalKind != "canceled" || record.Fail.Body != context.Canceled.Error() {
+					t.Fatalf("cancellation reported as another failure: %+v", record)
+				}
 				return
+			}
+			if chunk.Err != nil || bytes.Contains(chunk.Payload, []byte("response.failed")) || bytes.Contains(chunk.Payload, []byte("[DONE]")) {
+				t.Fatalf("cancellation emitted a source error or success marker: %+v", chunk)
 			}
 		case <-deadline:
 			t.Fatal("cancel did not close patch stream")
@@ -202,5 +213,90 @@ func TestXAICompactUsageReflectsFinalPayloadReasoning(t *testing.T) {
 	record := waitForXAIUsageRecord(t, plugin.records)
 	if record.ReasoningEffort != "xhigh" {
 		t.Fatalf("usage effort = %q, want final upstream xhigh", record.ReasoningEffort)
+	}
+}
+
+func TestXAIApplyPatchTerminalClosesKeepOpenUpstream(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		called       bool
+		upstreamDone bool
+	}{
+		{name: "declared_only", upstreamDone: true},
+		{name: "patch_call", called: true, upstreamDone: true},
+		{name: "patch_call_without_done", called: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			model := "grok-terminal-" + tt.name
+			plugin := &captureXAIUsagePlugin{model: model, records: make(chan usage.Record, 1)}
+			usage.RegisterPlugin(plugin)
+			upstreamClosed := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				output := "[]"
+				if tt.called {
+					item := `{"type":"function_call","id":"a","call_id":"c","name":"apply_patch","arguments":"{\"input\":\"valid patch\"}"}`
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":%s}\n\n", item)
+					output = "[" + item + "]"
+				}
+				_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_completed\",\"status\":\"completed\",\"output\":%s,\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n", output)
+				if tt.upstreamDone {
+					_, _ = io.WriteString(w, "data: [DONE]\n\ndata: [DONE]\n\n")
+				}
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+				close(upstreamClosed)
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			executor := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "xai", Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+			req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"input":"hello","stream":true,"tools":[{"type":"custom","name":"apply_patch"}]}`)}
+			result, errStream := executor.ExecuteStream(ctx, auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: true})
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			var output []byte
+			completed := false
+			deadline := time.After(2 * time.Second)
+			for {
+				select {
+				case chunk, ok := <-result.Chunks:
+					if !ok {
+						if !completed || bytes.Count(output, []byte("[DONE]")) != 1 || !bytes.Contains(output, []byte("\n\ndata: [DONE]\n\n")) {
+							t.Fatalf("terminal SSE output lost: %s", output)
+						}
+						if tt.called && (!bytes.Contains(output, []byte(`"type":"custom_tool_call"`)) || !bytes.Contains(output, []byte(`"input":"valid patch"`))) {
+							t.Fatalf("converted patch output lost: %s", output)
+						}
+						select {
+						case <-upstreamClosed:
+						case <-deadline:
+							t.Fatal("closed stream did not release upstream request")
+						}
+						select {
+						case record := <-plugin.records:
+							if record.Failed || record.Detail.InputTokens != 1 || record.Detail.OutputTokens != 2 || record.Detail.TotalTokens != 3 || record.Phases == nil || record.Phases.TerminalKind != "completed" {
+								t.Fatalf("terminal usage = %+v", record)
+							}
+						case <-deadline:
+							t.Fatal("terminal usage was not published")
+						}
+						return
+					}
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+					output = append(output, chunk.Payload...)
+					for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
+						data := bytes.TrimSpace(bytes.TrimPrefix(line, xaiDataTag))
+						completed = completed || gjson.GetBytes(data, "type").String() == "response.completed"
+					}
+				case <-deadline:
+					t.Fatalf("stream still open after flushed terminal: completed=%t done=%d", completed, bytes.Count(output, []byte("[DONE]")))
+				}
+			}
+		})
 	}
 }
