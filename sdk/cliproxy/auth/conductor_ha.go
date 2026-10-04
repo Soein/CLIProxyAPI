@@ -221,6 +221,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 		if disabled {
 			auth.revision = m.nextAuthRevisionLocked()
 			auth.durableRevision = m.nextAuthDurableRevisionLocked()
+			m.notifyAuthChangeLocked(id)
 			if m.shouldTrackDisabledPersistenceLocked(ctx, auth) {
 				if m.pendingDisabledPersistence == nil {
 					m.pendingDisabledPersistence = make(map[string]struct{})
@@ -303,6 +304,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 					current := m.auths[id]
 					m.finalizeEnabledAuthLocked(updated[index], current, committedAt)
 					m.auths[id] = updated[index].Clone()
+					m.notifyAuthChangeLocked(id)
 					delete(m.pendingDisabledPersistence, id)
 				}
 				if m.scheduler != nil {
@@ -372,6 +374,7 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 					current := m.auths[id]
 					m.finalizeEnabledAuthLocked(updated[index], current, committedAt)
 					m.auths[id] = updated[index].Clone()
+					m.notifyAuthChangeLocked(id)
 					delete(m.pendingDisabledPersistence, id)
 				}
 				if m.scheduler != nil {
@@ -604,6 +607,7 @@ func (m *Manager) removeAuthsLocked(ids []string) []removedAuthState {
 			continue
 		}
 		delete(m.auths, id)
+		m.notifyAuthChangeLocked(id)
 		removed = append(removed, removedAuthState{
 			id:       id,
 			provider: strings.TrimSpace(existing.Provider),
@@ -938,6 +942,9 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 		cfg = &internalconfig.Config{}
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
+	for id := range m.authChangeWatchers {
+		m.notifyAuthChangeLocked(id)
+	}
 	m.mu.Unlock()
 	if m.scheduler != nil {
 		for id, epoch := range removedEpochs {
@@ -1638,6 +1645,7 @@ func (m *Manager) failCloseAuthStoreConflicts(authIDs []string) ([]string, map[s
 			disabled.StatusMessage = "durable auth conflict; authoritative reload required"
 			disabled.revision = revision
 			m.auths[authID] = disabled
+			m.notifyAuthChangeLocked(authID)
 			baselines[authID] = disabled.durableRevision
 		}
 		removals[authID] = revision
@@ -1762,6 +1770,7 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 				delete(m.pendingDisabledPersistence, authID)
 				delete(m.enablingTransitions, authID)
 				delete(m.auths, authID)
+				m.notifyAuthChangeLocked(authID)
 				delete(m.modelPoolOffsets, authID)
 				continue
 			}
@@ -1779,6 +1788,7 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 			next.revision = m.nextAuthRevisionLocked()
 			next.durableRevision = m.nextAuthDurableRevisionLocked()
 			m.auths[authID] = next
+			m.notifyAuthChangeLocked(authID)
 			delete(m.pendingDisabledPersistence, authID)
 			published = append(published, next.Clone())
 		}

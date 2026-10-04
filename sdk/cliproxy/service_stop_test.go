@@ -150,6 +150,15 @@ func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for service.Run to exit")
 	}
+	service.cfgMu.RLock()
+	probeCtx := service.antigravityContext
+	service.cfgMu.RUnlock()
+	if probeCtx == nil {
+		t.Fatal("Run did not publish the background model probe context")
+	}
+	if !errors.Is(probeCtx.Err(), context.Canceled) {
+		t.Fatalf("background model probe context error = %v, want canceled after Run exit", probeCtx.Err())
+	}
 
 	// Verify server port is closed.
 	connClosed, errDialClosed := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))

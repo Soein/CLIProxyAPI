@@ -191,6 +191,8 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.markPersistenceInFlightLocked(ctx, authClone)
+	m.notifyAuthChangeLocked(auth.ID)
+	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
 	if m.scheduler != nil {
 		schedulerSnapshot = authClone.Clone()
@@ -567,6 +569,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 
 		committed := candidate.Clone()
 		m.auths[candidate.ID] = committed.Clone()
+		m.notifyAuthChangeLocked(candidate.ID)
 		m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
 		m.mu.Unlock()
 
@@ -592,6 +595,8 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.markPersistenceInFlightLocked(ctx, authClone)
+	m.notifyAuthChangeLocked(auth.ID)
+	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
 	if m.scheduler != nil {
 		schedulerSnapshot = authClone.Clone()
@@ -642,6 +647,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
+	m.notifyAuthChangeLocked(id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
 	}

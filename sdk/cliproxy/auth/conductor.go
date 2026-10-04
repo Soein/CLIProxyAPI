@@ -166,6 +166,7 @@ type Manager struct {
 	configCooldownMu             sync.Mutex
 	auths                        map[string]*Auth
 	authEpochs                   map[string]uint64
+	authChangeWatchers           map[string]map[chan struct{}]struct{}
 	authRevision                 uint64
 	authDurableRevision          uint64
 	persistenceInFlightRevisions map[string]uint64
@@ -498,6 +499,7 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 		m.auths[id] = cloned
 		schedulerCopy = cloned.Clone()
 	}
+	m.notifyAuthChangeLocked(id)
 	m.mu.Unlock()
 
 	if m.scheduler != nil {

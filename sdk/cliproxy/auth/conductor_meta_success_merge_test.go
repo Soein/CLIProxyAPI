@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"reflect"
 	"testing"
@@ -230,15 +231,14 @@ func TestManagerMetaConcurrentSuccess(t *testing.T) {
 
 func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 	cases := []struct {
-		name       string
-		mode       string
-		statusCode int
-		err        *Error
+		name     string
+		mode     string
+		terminal bool
+		err      *Error
 	}{
 		{
-			name:       "UpdatePreparedAuth_401",
-			mode:       "prepare",
-			statusCode: http.StatusUnauthorized,
+			name: "UpdatePreparedAuth_401",
+			mode: "prepare",
 			err: &Error{
 				Code:       "401",
 				Message:    "unauthorized",
@@ -246,9 +246,8 @@ func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 			},
 		},
 		{
-			name:       "UpdatePreparedAuth_503",
-			mode:       "prepare",
-			statusCode: http.StatusServiceUnavailable,
+			name: "UpdatePreparedAuth_503",
+			mode: "prepare",
 			err: &Error{
 				Code:       "503",
 				Message:    "service unavailable",
@@ -256,9 +255,8 @@ func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 			},
 		},
 		{
-			name:       "UpdateRefreshedAuth_401",
-			mode:       "refresh",
-			statusCode: http.StatusUnauthorized,
+			name: "UpdateRefreshedAuth_401",
+			mode: "refresh",
 			err: &Error{
 				Code:       "401",
 				Message:    "unauthorized",
@@ -266,14 +264,25 @@ func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 			},
 		},
 		{
-			name:       "UpdateRefreshedAuth_503",
-			mode:       "refresh",
-			statusCode: http.StatusServiceUnavailable,
+			name: "UpdateRefreshedAuth_503",
+			mode: "refresh",
 			err: &Error{
 				Code:       "503",
 				Message:    "service unavailable",
 				HTTPStatus: http.StatusServiceUnavailable,
 			},
+		},
+		{
+			name:     "UpdatePreparedAuth_Terminal401",
+			mode:     "prepare",
+			terminal: true,
+			err:      &Error{Code: "unauthorized", Message: "invalid_grant", HTTPStatus: http.StatusUnauthorized},
+		},
+		{
+			name:     "UpdateRefreshedAuth_Terminal401",
+			mode:     "refresh",
+			terminal: true,
+			err:      &Error{Code: "unauthorized", Message: "invalid_grant", HTTPStatus: http.StatusUnauthorized},
 		},
 	}
 
@@ -288,6 +297,9 @@ func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 			}
 			manager := NewManager(store, &RoundRobinSelector{}, nil)
 			manager.RegisterExecutor(schedulerTestExecutor{provider: "meta"})
+			if tc.terminal {
+				manager.RegisterExecutor(&unauthorizedRefreshExecutor{id: "meta", refreshErr: errors.New(tc.err.Message)})
+			}
 
 			modelKey := "meta-llama-3"
 			baseAuth := &Auth{
@@ -344,13 +356,19 @@ func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 				t.Fatal("timed out waiting for saveStarted")
 			}
 
-			manager.MarkResult(ctx, Result{
-				AuthID:   base.ID,
-				Provider: "meta",
-				Model:    "",
-				Success:  false,
-				Error:    cloneError(tc.err),
-			})
+			if tc.terminal {
+				if _, errRefresh := manager.refreshAuthForRequest(ctx, base.ID, "original-token"); errRefresh == nil {
+					t.Fatal("expected rejected access token and invalid grant to terminate the credential")
+				}
+			} else {
+				manager.MarkResult(ctx, Result{
+					AuthID:   base.ID,
+					Provider: "meta",
+					Model:    "",
+					Success:  false,
+					Error:    cloneError(tc.err),
+				})
+			}
 
 			midAuth, ok := manager.GetByID(base.ID)
 			if !ok || midAuth == nil {
@@ -365,17 +383,14 @@ func TestManagerMetaConcurrentAuthFailure(t *testing.T) {
 			if !midAuth.Unavailable {
 				t.Fatal("expected mid Unavailable to be true")
 			}
-			if !midAuth.NextRetryAfter.After(time.Now()) {
+			if tc.terminal && !midAuth.NextRetryAfter.IsZero() {
+				t.Fatalf("terminal unauthorized auth has a retry deadline: %v", midAuth.NextRetryAfter)
+			}
+			if !tc.terminal && !midAuth.NextRetryAfter.After(time.Now()) {
 				t.Fatalf("expected mid NextRetryAfter to be in the future, got %v", midAuth.NextRetryAfter)
 			}
-			if tc.statusCode == http.StatusUnauthorized {
-				if !hasUnauthorizedAuthFailure(midAuth) {
-					t.Fatal("expected mid hasUnauthorizedAuthFailure to be true for 401")
-				}
-			} else {
-				if hasUnauthorizedAuthFailure(midAuth) {
-					t.Fatal("expected mid hasUnauthorizedAuthFailure to be false for 503")
-				}
+			if hasUnauthorizedAuthFailure(midAuth) != tc.terminal {
+				t.Fatalf("mid terminal unauthorized = %v, want %v", hasUnauthorizedAuthFailure(midAuth), tc.terminal)
 			}
 
 			saveReleased = true
