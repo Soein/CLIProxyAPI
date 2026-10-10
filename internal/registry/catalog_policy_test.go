@@ -26,9 +26,6 @@ func TestEffectiveCatalogSources(t *testing.T) {
 					if index == 0 && home {
 						want = "disabled"
 					}
-					if index == 2 && home {
-						want = "disabled"
-					}
 					if values[index] != want {
 						t.Fatalf("local=%v home=%v mask=%d catalog=%d: got %q want %q", local, home, mask, index, values[index], want)
 					}
@@ -44,5 +41,30 @@ func TestDisabledCatalogDoesNotFetch(t *testing.T) {
 	defer u.cancel()
 	if u.source != "disabled" {
 		t.Fatal("Home source not disabled")
+	}
+}
+
+func TestHomeDevinCatalogSources(t *testing.T) {
+	path := "/catalogs/devin.json"
+	for _, tc := range []struct {
+		name   string
+		local  bool
+		source string
+		want   string
+	}{
+		{name: "default remote"},
+		{name: "local embedded", local: true, want: embeddedCatalogSource},
+		{name: "explicit path", source: path, want: path},
+		{name: "local explicit path", local: true, source: path, want: path},
+		{name: "explicit URL", source: "https://example.com/devin.json", want: "https://example.com/devin.json"},
+		{name: "local explicit URL", local: true, source: "https://example.com/devin.json", want: "https://example.com/devin.json"},
+		{name: "internal disabled", source: "disabled", want: "disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveCatalogSources(CatalogSources{DevinCatalog: tc.source}, tc.local, true)
+			if got.Catalog != "disabled" || got.DevinCatalog != tc.want {
+				t.Fatalf("Home sources = %+v, want general disabled and Devin %q", got, tc.want)
+			}
+		})
 	}
 }

@@ -254,7 +254,6 @@ func effectiveCatalogSources(sources CatalogSources, local, home bool) CatalogSo
 	devin := selectSource(sources.DevinCatalog)
 	if home {
 		general = "disabled"
-		devin = "disabled"
 	}
 	return CatalogSources{Catalog: general, CodexCatalog: selectSource(sources.CodexCatalog), DevinCatalog: devin}
 }

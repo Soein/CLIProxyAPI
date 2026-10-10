@@ -49,8 +49,9 @@ func TestCatalogPolicyHotReload(t *testing.T) {
 	UpdateModelCatalogSources(CatalogSources{CodexCatalog: "https://example.com/codex"}, false)
 	awaitSource(general, embeddedCatalogSource)
 	awaitSource(codex, "https://example.com/codex")
-	UpdateModelCatalogSources(CatalogSources{Catalog: "https://example.com/ignored"}, true)
+	UpdateModelCatalogSources(CatalogSources{Catalog: "https://example.com/ignored", DevinCatalog: "https://example.com/home-devin"}, true)
 	awaitSource(codex, embeddedCatalogSource)
+	awaitSource(devin, "https://example.com/home-devin")
 	generalCatalogUpdater.mu.Lock()
 	source := generalCatalogUpdater.source
 	generalCatalogUpdater.mu.Unlock()
@@ -60,11 +61,12 @@ func TestCatalogPolicyHotReload(t *testing.T) {
 	devinCatalogUpdater.mu.Lock()
 	source = devinCatalogUpdater.source
 	devinCatalogUpdater.mu.Unlock()
-	if source != "disabled" {
-		t.Fatal("Home allowed Devin catalog")
+	if source != "https://example.com/home-devin" {
+		t.Fatal("Home did not retain the configured Devin catalog")
 	}
 	UpdateModelCatalogSources(CatalogSources{}, false)
 	awaitSource(general, embeddedCatalogSource)
+	awaitSource(devin, embeddedCatalogSource)
 
 	// Shutdown must fence reloads, and a new SDK lifetime must retain CLI policy.
 	cancel()
@@ -82,6 +84,7 @@ func TestCatalogPolicyHotReload(t *testing.T) {
 	defer restartCancel()
 	StartModelCatalogUpdaters(restartCtx, CatalogSources{Catalog: "https://example.com/ignored"}, true)
 	awaitSource(codex, embeddedCatalogSource)
+	awaitSource(devin, embeddedCatalogSource)
 	generalCatalogUpdater.mu.Lock()
 	source = generalCatalogUpdater.source
 	generalCatalogUpdater.mu.Unlock()

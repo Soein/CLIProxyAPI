@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -123,5 +124,76 @@ func TestCatalogRefreshKeepsLastValidData(t *testing.T) {
 	u.refresh(context.Background(), "", 0)
 	if last != "last valid" {
 		t.Fatal("invalid catalog changed data")
+	}
+}
+
+func TestHomeDevinCatalogLoadsSelectedSource(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		local        bool
+		kind         string
+		wantOfficial int32
+		wantCustom   int32
+	}{
+		{name: "default remote", wantOfficial: 1},
+		{name: "local embedded", local: true},
+		{name: "explicit path", kind: "path"},
+		{name: "local explicit path", local: true, kind: "path"},
+		{name: "explicit URL", kind: "url", wantCustom: 1},
+		{name: "local explicit URL", local: true, kind: "url", wantCustom: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var officialHits, customHits atomic.Int32
+			official := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				officialHits.Add(1)
+				_, _ = w.Write(embeddedDevinModelsJSON)
+			}))
+			defer official.Close()
+			custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				customHits.Add(1)
+				_, _ = w.Write(embeddedDevinModelsJSON)
+			}))
+			defer custom.Close()
+			source := ""
+			switch tc.kind {
+			case "path":
+				source = filepath.Join(t.TempDir(), "devin.json")
+				if errWrite := os.WriteFile(source, embeddedDevinModelsJSON, 0600); errWrite != nil {
+					t.Fatal(errWrite)
+				}
+			case "url":
+				source = custom.URL
+			}
+			configured := CatalogSources{DevinCatalog: source}
+			if errValidate := configured.Validate(); errValidate != nil {
+				t.Fatal(errValidate)
+			}
+			selected := effectiveCatalogSources(configured, tc.local, true)
+			published := make(chan []byte, 1)
+			updater := &catalogUpdater{
+				fetch: catalogFetcher(embeddedDevinModelsJSON, []string{official.URL}, validateDevinCatalogBytes),
+				publish: func(data []byte) ([]string, error) {
+					if _, errValidate := ValidateDevinModelsJSON(data); errValidate != nil {
+						return nil, errValidate
+					}
+					published <- bytes.Clone(data)
+					return nil, nil
+				},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			updater.configure(ctx, selected.DevinCatalog)
+			select {
+			case data := <-published:
+				if !bytes.Equal(data, embeddedDevinModelsJSON) {
+					t.Fatal("selected Devin catalog was not loaded")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Home Devin catalog did not load")
+			}
+			if officialHits.Load() != tc.wantOfficial || customHits.Load() != tc.wantCustom {
+				t.Fatalf("catalog fetches official=%d custom=%d, want %d/%d", officialHits.Load(), customHits.Load(), tc.wantOfficial, tc.wantCustom)
+			}
+		})
 	}
 }
