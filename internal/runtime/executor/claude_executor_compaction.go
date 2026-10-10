@@ -12,7 +12,6 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -23,7 +22,6 @@ type claudeCompactionSummaryContextKey struct{}
 // before translation. Unrecognized capsules fail the request instead of being dropped.
 func expandClaudeResponsesCompaction(req *cliproxyexecutor.Request, opts *cliproxyexecutor.Options) error {
 	if req != nil {
-		req.Payload = dropForeignClaudeCompactionItems(req.Payload)
 		if helps.HasResponsesCompactionItem(req.Payload) {
 			expanded, errExpand := helps.ExpandAntigravityCompactionCapsules(req.Payload)
 			if errExpand != nil {
@@ -33,7 +31,6 @@ func expandClaudeResponsesCompaction(req *cliproxyexecutor.Request, opts *clipro
 		}
 	}
 	if opts != nil {
-		opts.OriginalRequest = dropForeignClaudeCompactionItems(opts.OriginalRequest)
 		if helps.HasResponsesCompactionItem(opts.OriginalRequest) {
 			expanded, errExpand := helps.ExpandAntigravityCompactionCapsules(opts.OriginalRequest)
 			if errExpand != nil {
@@ -43,28 +40,6 @@ func expandClaudeResponsesCompaction(req *cliproxyexecutor.Request, opts *clipro
 		}
 	}
 	return nil
-}
-
-func dropForeignClaudeCompactionItems(payload []byte) []byte {
-	input := gjson.GetBytes(payload, "input")
-	if !input.IsArray() {
-		return payload
-	}
-	dropped := 0
-	items := make([]string, 0, len(input.Array()))
-	for _, item := range input.Array() {
-		if item.Get("type").String() == "compaction" && !helps.RecognizedAntigravityCompactionCapsule(item.Get("encrypted_content").String()) {
-			dropped++
-			continue
-		}
-		items = append(items, item.Raw)
-	}
-	if dropped == 0 {
-		return payload
-	}
-	log.Warnf("claude compaction: dropped %d non-CPA compaction item(s)", dropped)
-	out, _ := sjson.SetRawBytes(payload, "input", []byte("["+strings.Join(items, ",")+"]"))
-	return out
 }
 
 func claudeResponsesCompactionRequested(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {

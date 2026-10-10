@@ -288,37 +288,68 @@ func TestClaudeExecutor_CompactionTriggerIncludesPreviousCapsule(t *testing.T) {
 	assertClaudeCompactionSummaryRequest(t, seen)
 }
 
-func TestClaudeExecutor_ForeignCompactionCapsuleIsDropped(t *testing.T) {
-	var seen []byte
-	server := httptest.NewServer(claudeCompactionUpstream(t, &seen))
-	defer server.Close()
-
-	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-compaction",
-		"base_url": server.URL,
-	}}
-	payload := []byte(`{"model":"claude-haiku-4-5-20251001","stream":false,"input":[` +
-		`{"type":"compaction","encrypted_content":"gAAAAA-openai-native"},` +
-		`{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]},` +
-		`{"type":"compaction_trigger"}]}`)
-
-	resp, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-haiku-4-5-20251001",
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat:    sdktranslator.FormatOpenAIResponse,
-		ResponseFormat:  sdktranslator.FormatOpenAIResponse,
-		OriginalRequest: payload,
-	})
-	if errExecute != nil {
-		t.Fatalf("Execute() error = %v", errExecute)
+func TestClaudeExecutor_ForeignCompactionCapsuleReturns400(t *testing.T) {
+	for _, source := range []string{"payload", "original"} {
+		for _, stream := range []bool{false, true} {
+			for _, trigger := range []bool{false, true} {
+				name := source
+				if stream {
+					name += "/stream"
+				} else {
+					name += "/execute"
+				}
+				if trigger {
+					name += "/compact"
+				} else {
+					name += "/continue"
+				}
+				t.Run(name, func(t *testing.T) {
+					var seen []byte
+					server := httptest.NewServer(claudeCompactionUpstream(t, &seen))
+					defer server.Close()
+					executor := NewClaudeExecutor(&config.Config{})
+					auth := &cliproxyauth.Auth{Attributes: map[string]string{
+						"api_key": "key-compaction", "base_url": server.URL,
+					}}
+					message := `{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}`
+					if trigger {
+						message += `,{"type":"compaction_trigger"}`
+					}
+					plain := []byte(`{"model":"claude-haiku-4-5-20251001","input":[` + message + `]}`)
+					foreign := []byte(`{"model":"claude-haiku-4-5-20251001","input":[{"type":"compaction","encrypted_content":"gAAAAA-openai-native"},` + message + `]}`)
+					req := cliproxyexecutor.Request{Model: "claude-haiku-4-5-20251001", Payload: plain}
+					opts := cliproxyexecutor.Options{
+						SourceFormat:    sdktranslator.FormatOpenAIResponse,
+						ResponseFormat:  sdktranslator.FormatOpenAIResponse,
+						OriginalRequest: plain, Stream: stream,
+					}
+					if source == "payload" {
+						req.Payload = foreign
+					} else {
+						opts.OriginalRequest = foreign
+					}
+					var errExecute error
+					if stream {
+						var result *cliproxyexecutor.StreamResult
+						result, errExecute = executor.ExecuteStream(context.Background(), auth, req, opts)
+						if result != nil {
+							for range result.Chunks {
+							}
+						}
+					} else {
+						_, errExecute = executor.Execute(context.Background(), auth, req, opts)
+					}
+					if errExecute == nil {
+						t.Fatal("foreign history capsule accepted, want 400")
+					}
+					assertStatusErr(t, errExecute, http.StatusBadRequest)
+					if len(seen) != 0 {
+						t.Fatalf("invalid history request reached upstream: %s", seen)
+					}
+				})
+			}
+		}
 	}
-	assertSingleCompactionOutput(t, resp.Payload)
-	if bytes.Contains(seen, []byte("gAAAAA-openai-native")) {
-		t.Fatalf("foreign compaction capsule reached upstream: %s", seen)
-	}
-	assertClaudeCompactionSummaryRequest(t, seen)
 }
 
 func TestClaudeExecutor_CompactionUsageMatchesResponsesAccounting(t *testing.T) {
