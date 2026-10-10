@@ -136,7 +136,7 @@ func TestManagerBlockedSaveSerializesLoad(t *testing.T) {
 				store.mu.Lock()
 				saved := store.records[base.ID].Clone()
 				store.mu.Unlock()
-				if got.RegistrationEpoch <= saved.RegistrationEpoch {
+				if got.RegistrationEpoch != saved.RegistrationEpoch || got.Generation <= saved.Generation {
 					t.Error("Load did not run after save/publication")
 				}
 				saved.RegistrationEpoch, saved.Generation = got.RegistrationEpoch, got.Generation
@@ -149,7 +149,7 @@ func TestManagerBlockedSaveSerializesLoad(t *testing.T) {
 				scheduled := manager.scheduler.providers["meta"].auths[base.ID].auth.Clone()
 				manager.scheduler.mu.Unlock()
 				if !reflect.DeepEqual(got, scheduled) {
-					t.Error("scheduler differs from reloaded credential")
+					t.Errorf("scheduler differs from reloaded credential: manager epoch=%d generation=%d revision=%d durable=%d; scheduler epoch=%d generation=%d revision=%d durable=%d", got.RegistrationEpoch, got.Generation, got.revision, got.durableRevision, scheduled.RegistrationEpoch, scheduled.Generation, scheduled.revision, scheduled.durableRevision)
 				}
 			})
 		})

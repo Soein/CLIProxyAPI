@@ -885,10 +885,12 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 			merged.durableRevision = m.nextAuthDurableRevisionLocked()
 		}
 		merged.EnsureIndex()
-		epoch := max(m.authEpochs[auth.ID], auth.RegistrationEpoch, merged.RegistrationEpoch) + 1
-		m.authEpochs[auth.ID] = epoch
-		merged.RegistrationEpoch = epoch
-		merged.Generation = 1
+		// Periodic resync must keep in-flight results valid for the current registration.
+		if current != nil {
+			m.advanceAuthGenerationLocked(merged, current)
+		} else {
+			m.beginAuthRegistrationLocked(merged, nil)
+		}
 		next[auth.ID] = merged
 		loadedSnapshots = append(loadedSnapshots, merged.Clone())
 		if previous[auth.ID] == nil {
@@ -959,7 +961,15 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 			m.scheduler.RecordRemovalTombstone(id, epoch)
 		}
 	}
-	m.syncScheduler()
+	// Reloads can change scheduling fields within the same registration lifecycle.
+	// Snapshot after taking the sync lock so newer runtime updates are retained.
+	m.syncSchedulerMu.Lock()
+	currentVer := m.currentVersion()
+	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+	if !m.schedulerNeedsSync() {
+		m.advanceSyncedVersion(currentVer)
+	}
+	m.syncSchedulerMu.Unlock()
 	if m.scheduler != nil {
 		for _, id := range removedIDs {
 			m.scheduler.removeAuthAtRevision(id, removedRevisions[id])

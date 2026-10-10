@@ -4137,8 +4137,8 @@ func (s *memoryAuthTestStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// Test 45: Manager Load assigns monotonically increasing epochs on reload and records tombstones for removed items
-func TestManager_Load_MonotonicEpochAssignment_AndRemovalTombstones(t *testing.T) {
+// Test 45: Manager Load preserves active registration epochs and records tombstones for removed items
+func TestManager_Load_PreservesEpoch_AndRemovalTombstones(t *testing.T) {
 	const (
 		provider = "gemini"
 		model    = "gemini-load-epoch-test-model"
@@ -4232,9 +4232,9 @@ func TestManager_Load_MonotonicEpochAssignment_AndRemovalTombstones(t *testing.T
 	epochAuth2Tombstone := manager.authEpochs[authID2]
 	manager.mu.RUnlock()
 
-	// auth1 must get new epoch: max(6, 6) + 1 = 7
-	if reloadedAuth1 == nil || reloadedAuth1.RegistrationEpoch != 7 {
-		t.Fatalf("expected reloaded auth1 with epoch 7, got %#v", reloadedAuth1)
+	// An existing registration keeps its epoch while newer snapshots advance generation.
+	if reloadedAuth1 == nil || reloadedAuth1.RegistrationEpoch != loadedAuth1.RegistrationEpoch || reloadedAuth1.Generation <= loadedAuth1.Generation {
+		t.Fatalf("expected reloaded auth1 to preserve epoch and advance generation, got %#v", reloadedAuth1)
 	}
 	// auth2 must NOT exist in manager.auths
 	if reloadedAuth2 != nil {
@@ -4251,6 +4251,19 @@ func TestManager_Load_MonotonicEpochAssignment_AndRemovalTombstones(t *testing.T
 	manager.scheduler.mu.Unlock()
 	if metaAuth2.epoch != 5 || metaAuth2.generation != 0 {
 		t.Fatalf("expected scheduler tombstone for auth2 with epoch 5, generation 0, got %#v", metaAuth2)
+	}
+
+	// A delayed prior-generation update must not disable the reloaded auth.
+	staleAuth1 := loadedAuth1.Clone()
+	staleAuth1.Disabled = true
+	staleAuth1.Status = StatusDisabled
+	manager.scheduler.upsertAuth(staleAuth1)
+	manager.scheduler.mu.Lock()
+	metaAuth1 := manager.scheduler.authGenerations[authID1]
+	_, auth1Scheduled := manager.scheduler.authProviders[authID1]
+	manager.scheduler.mu.Unlock()
+	if !auth1Scheduled || metaAuth1.generation != reloadedAuth1.Generation {
+		t.Fatalf("older generation replaced the reloaded scheduler auth: %#v", metaAuth1)
 	}
 
 	// Refresh scheduler for auth1 and test picks
