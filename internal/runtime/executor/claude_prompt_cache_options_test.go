@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -600,56 +601,86 @@ func TestClaudeExecutor_CountTokens_StripsPromptCacheOptions(t *testing.T) {
 	}
 }
 
-func TestClaudeExecutor_CountTokensUpstream_StripsPromptCacheOptions_EvenWithPayloadRule(t *testing.T) {
-	var seenBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		seenBody = bytes.Clone(body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"input_tokens": 15}`))
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{
-		Payload: config.PayloadConfig{
-			Override: []config.PayloadRule{
-				{
-					Models: []config.PayloadModelRule{{Name: "claude-3-5-sonnet-20241022"}},
-					Params: map[string]any{
-						"prompt_cache_options.mode": "explicit",
-					},
+func TestClaudeExecutor_PromptCacheOptions_PayloadRuleWins(t *testing.T) {
+	for _, path := range []string{"execute", "stream", "count_tokens"} {
+		t.Run(path, func(t *testing.T) {
+			var seenBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, errRead := io.ReadAll(r.Body)
+				if errRead != nil {
+					t.Errorf("read request: %v", errRead)
+				}
+				seenBody = bytes.Clone(body)
+				if path == "count_tokens" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"input_tokens":15}`))
+				} else {
+					writeClaudeSSEMockResponse(w)
+				}
+			}))
+			defer server.Close()
+			cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: "claude-3-5-sonnet-20241022"}},
+				Params: map[string]any{
+					"prompt_cache_options.mode":      "explicit",
+					"prompt_cache_options.ttl":       "1h",
+					"prompt_cache_options.cache_key": "configured-key",
 				},
-			},
-		},
+			}}}}
+			executor := NewClaudeExecutor(cfg)
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123", "base_url": server.URL}}
+			payload := []byte(`{"model":"claude-3-5-sonnet-20241022","prompt_cache_options":{"mode":"implicit","ttl":"5m","cache_key":"caller-key"},"messages":[{"role":"user","content":"How many tokens?"}]}`)
+			req := cliproxyexecutor.Request{Model: "claude-3-5-sonnet-20241022", Payload: payload}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: payload}
+			var errExecute error
+			switch path {
+			case "execute":
+				_, errExecute = executor.Execute(context.Background(), auth, req, opts)
+			case "stream":
+				var result *cliproxyexecutor.StreamResult
+				opts.Stream = true
+				result, errExecute = executor.ExecuteStream(context.Background(), auth, req, opts)
+				if result != nil {
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatalf("stream chunk: %v", chunk.Err)
+						}
+					}
+				}
+			case "count_tokens":
+				_, errExecute = executor.countTokensUpstream(context.Background(), auth, req, opts)
+			}
+			if errExecute != nil {
+				t.Fatalf("%s error: %v", path, errExecute)
+			}
+			options := gjson.GetBytes(seenBody, "prompt_cache_options")
+			if options.Get("mode").String() != "explicit" || options.Get("ttl").String() != "1h" || options.Get("cache_key").String() != "configured-key" {
+				t.Fatalf("final payload rules were overwritten: %s", seenBody)
+			}
+		})
 	}
+}
+
+func TestClaudeExecutor_CountTokens_CleansPromptCacheOptionsBeforePayloadRules(t *testing.T) {
+	configured := "Count this configured message after the local control field is removed."
+	cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+		Models: []config.PayloadModelRule{{Name: "claude-3-5-sonnet-20241022", NotExist: []string{"prompt_cache_options"}}},
+		Params: map[string]any{"messages.0.content": configured, "prompt_cache_options.mode": "explicit"},
+	}}}}
 	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": server.URL,
-	}}
-
-	originalReq := []byte(`{
-		"model": "claude-3-5-sonnet-20241022",
-		"messages": [
-			{"role": "user", "content": "How many tokens?"}
-		]
-	}`)
-
-	upstreamResp, errUpstream := executor.countTokensUpstream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "claude-3-5-sonnet-20241022",
-		Payload: originalReq,
-	}, cliproxyexecutor.Options{
-		SourceFormat:    sdktranslator.FromString("openai"),
-		OriginalRequest: originalReq,
-	})
-	if errUpstream != nil {
-		t.Fatalf("countTokensUpstream() error = %v", errUpstream)
+	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","prompt_cache_options":{"mode":"implicit"},"messages":[{"role":"user","content":"Hi"}]}`)
+	response, errCount := executor.CountTokens(context.Background(), nil, cliproxyexecutor.Request{
+		Model: "claude-3-5-sonnet-20241022", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	if errCount != nil {
+		t.Fatal(errCount)
 	}
-	if len(upstreamResp.Payload) == 0 {
-		t.Fatal("expected non-empty countTokensUpstream payload")
+	want, errExpected := helps.CountClaudeInputTokens([]byte(`{"messages":[{"role":"user","content":"` + configured + `"}]}`))
+	if errExpected != nil {
+		t.Fatal(errExpected)
 	}
-	if gjson.GetBytes(seenBody, "prompt_cache_options").Exists() {
-		t.Fatalf("prompt_cache_options should not be forwarded in count_tokens upstream even if injected by payload rule: %s", string(seenBody))
+	if got := gjson.GetBytes(response.Payload, "input_tokens").Int(); got != want {
+		t.Fatalf("local CountTokens input=%d, want configured message count %d (body cleanup must precede rule matching)", got, want)
 	}
 }
 
