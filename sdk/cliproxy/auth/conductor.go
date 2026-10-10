@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -235,6 +237,10 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+	// authMutationLocks serialize durable lifecycle transactions per credential.
+	authMutationLocks sync.Map
+	// authLoadGate excludes full reloads while credential saves are in progress.
+	authLoadGate *semaphore.Weighted
 }
 
 // LeaderGate reports whether this process should run singleton background loops.
@@ -588,6 +594,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	manager := &Manager{
 		store:                        store,
+		authLoadGate:                 semaphore.NewWeighted(math.MaxInt64),
 		executors:                    make(map[string]ProviderExecutor),
 		selector:                     selector,
 		hook:                         hook,

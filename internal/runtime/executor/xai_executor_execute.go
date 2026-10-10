@@ -32,6 +32,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if xaiIsVideoRequest(opts) {
 		return e.executeVideos(ctx, auth, req, opts)
 	}
+	if xaiIsSpeechRequest(opts) {
+		return e.executeSpeech(ctx, auth, req, opts)
+	}
 	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
 		ctx = cliproxyusage.EnablePhases(ctx)
 	}
@@ -93,6 +96,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 	phaseMarker := xaiResponsePhaseMarker{reporter: reporter}
 	namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
+	var upstreamUsage helps.StreamUsageBuffer
 	scanner := bufio.NewScanner(httpResp.Body)
 	scanner.Buffer(nil, 52_428_800)
 	for scanner.Scan() {
@@ -102,6 +106,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			continue
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
+		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+			upstreamUsage.Observe(detail, true)
+		}
 		prepared.applyPatch.RememberDispatcherEvent(eventData)
 		eventData = namespaceRestorer.restore(eventData)
 		if prepared.webSearchAlias != "" {
@@ -125,6 +132,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		events, errBridge := prepared.applyPatch.Transform(eventData)
 		if errBridge != nil {
 			errBridge = statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+			upstreamUsage.PublishFailure(ctx, reporter, errBridge)
 			return resp, errBridge
 		}
 		for _, eventData := range events {
@@ -145,7 +153,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 				var param any
 				out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
 				if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
-					return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+					errTranslation := statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+					upstreamUsage.PublishFailure(ctx, reporter, errTranslation)
+					return cliproxyexecutor.Response{}, errTranslation
 				}
 				if detail, ok := helps.ParseCodexUsage(eventData); ok {
 					reporter.Publish(ctx, detail)
@@ -170,7 +180,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 
 	reporter.MarkTerminal("disconnect")
 	if errFinish := prepared.applyPatch.Finish(); errFinish != nil {
-		return resp, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		errFinish = statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		upstreamUsage.PublishFailure(ctx, reporter, errFinish)
+		return resp, errFinish
 	}
 	return resp, statusErr{code: http.StatusRequestTimeout, msg: "xai stream error: stream disconnected before terminal response"}
 }
@@ -182,17 +194,21 @@ func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	defer reporter.TrackFailure(ctx, &err)
+	upstreamUsage := helps.ParseOpenAIUsage(data)
 	converted, errBridge := prepared.applyPatch.Bridge.TransformNonStream(data)
 	if errBridge != nil {
 		errBridge = statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		reporter.PublishFailureWithDetail(ctx, upstreamUsage, errBridge)
 		return resp, errBridge
 	}
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, converted, &param)
 	if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
-		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		errTranslation := statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		reporter.PublishFailureWithDetail(ctx, upstreamUsage, errTranslation)
+		return cliproxyexecutor.Response{}, errTranslation
 	}
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
+	reporter.Publish(ctx, upstreamUsage)
 	if prepared.responseFormat == sdktranslator.FormatOpenAIResponse {
 		out = helps.EnsureResponsesUsageDetails(out)
 	}

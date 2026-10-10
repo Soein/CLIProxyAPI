@@ -424,7 +424,7 @@ func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexe
 		}
 	}
 	source := opts.SourceFormat.String()
-	if source == "openai-image" || source == "openai-video" {
+	if source == "openai-image" || source == "openai-video" || source == "openai-speech" {
 		return opts.SourceFormat
 	}
 	if opts.Alt == "responses/compact" && !opts.Stream {
@@ -569,7 +569,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				stateModel = canonicalModelKey(routeModel)
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: stateModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts}
-			m.markResult(execCtx, result, affinityState, false, routeModel, false)
+			m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, false, routeModel, false)
 			lastErr = errPrepare
 			continue
 		}
@@ -673,9 +673,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				compactRequestFault := isResponsesCompactRequestFaultError(execOpts, errExec)
 				intermediate := !okAction && !compactRequestFault && !isRequestInvalidError(errExec) && !result.CredentialScope && modelIndex < len(models)-1
 				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) {
-					m.recordAvailabilityNeutralResultWithAffinity(execCtx, result, affinityState, intermediate)
+					m.recordAvailabilityNeutralResultWithAffinity(withExecutionResultAuth(execCtx, auth), result, affinityState, intermediate)
 				} else {
-					m.markResult(execCtx, result, affinityState, intermediate, routeModel, false)
+					m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, intermediate, routeModel, false)
 				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
@@ -693,7 +693,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				continue
 			}
-			m.markResult(execCtx, result, affinityState, false, routeModel, false)
+			m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, false, routeModel, false)
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
@@ -794,7 +794,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				stateModel = canonicalModelKey(routeModel)
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: stateModel, Success: false, Error: resultErrorFromError(errPrepare), Options: pickOpts}
-			m.markResult(execCtx, result, affinityState, false, routeModel, true)
+			m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, false, routeModel, true)
 			lastErr = errPrepare
 			continue
 		}
@@ -901,9 +901,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				// the failure for hooks and metrics without suspending a model
 				// that remains usable through the messages endpoint.
 				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
-					m.recordAvailabilityNeutralResultWithAffinity(execCtx, result, affinityState, intermediate)
+					m.recordAvailabilityNeutralResultWithAffinity(withExecutionResultAuth(execCtx, auth), result, affinityState, intermediate)
 				} else {
-					m.markResult(execCtx, result, affinityState, intermediate, routeModel, true)
+					m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, intermediate, routeModel, true)
 				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
@@ -921,7 +921,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				continue
 			}
-			m.markResult(execCtx, result, affinityState, false, routeModel, true)
+			m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, false, routeModel, true)
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
@@ -1104,7 +1104,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		// Enrich before auth preparation so prepare-stage usage records observe the client request.
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = newUpstreamAttemptContext(execCtx)
-		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(auth, routeModel)
+		// Home owns dispatched credential availability; only local selections need state filtering.
+		if selection == nil {
+			models = m.filterExecutionModels(auth, routeModel, models, pooled)
+		}
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias
 		}
@@ -1164,7 +1168,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				m.reportHomeResult(execCtx, result, auth)
 				releaseAttempt()
 			} else {
-				m.markResult(execCtx, result, affinityState, false, routeModel, false)
+				m.markResult(withExecutionResultAuth(execCtx, auth), result, affinityState, false, routeModel, false)
 				lease.Release()
 			}
 			lastErr = errPrepare

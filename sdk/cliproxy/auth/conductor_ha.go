@@ -658,11 +658,19 @@ func mergePersistedAuthRuntime(persisted, current *Auth) *Auth {
 	}
 	merged := persisted.Clone()
 	if current == nil {
+		merged.CredentialVersion = max(merged.CredentialVersion, 1)
 		merged.EnsureIndex()
 		return merged
 	}
 
 	local := current.Clone()
+	merged.CredentialVersion = max(merged.CredentialVersion, local.CredentialVersion)
+	if CredentialsChanged(local, merged) {
+		merged.CredentialVersion++
+	} else {
+		merged.RejectedAccessToken = local.RejectedAccessToken
+	}
+	merged.CredentialVersion = max(merged.CredentialVersion, 1)
 	if local.indexAssigned || strings.TrimSpace(local.Index) != "" {
 		merged.Index = local.Index
 		merged.indexAssigned = local.indexAssigned
@@ -796,10 +804,10 @@ func (m *Manager) mergeFailClosedStoreSnapshotLocked(id string, snapshot, curren
 }
 
 func (m *Manager) Reconcile(ctx context.Context) error {
-	return m.load(ctx, true)
+	return m.load(ctx, true, nil)
 }
 
-func (m *Manager) load(ctx context.Context, authoritative bool) error {
+func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate func()) error {
 	if m == nil {
 		return nil
 	}
@@ -956,6 +964,10 @@ func (m *Manager) load(ctx context.Context, authoritative bool) error {
 		for _, id := range removedIDs {
 			m.scheduler.removeAuthAtRevision(id, removedRevisions[id])
 		}
+	}
+	// Lifecycle hooks may reenter mutations after the reload has been published.
+	if releaseLoadGate != nil {
+		releaseLoadGate()
 	}
 	for _, auth := range loadedSnapshots {
 		m.queueRefreshReschedule(auth.ID)
@@ -1538,10 +1550,15 @@ func (m *Manager) persistPublishedWithModeIfCurrent(ctx context.Context, auth *A
 	if snapshot == nil {
 		return nil
 	}
+	beforeSave := snapshot.Clone()
+	var errPersist error
 	if allowRestore && snapshot.StoreGeneration() == 0 {
-		return m.persistRestore(ctx, snapshot)
+		errPersist = m.persistRestore(ctx, snapshot)
+	} else {
+		errPersist = m.persist(ctx, snapshot)
 	}
-	return m.persist(ctx, snapshot)
+	m.mergePublishedSaveDelta(beforeSave, snapshot)
+	return errPersist
 }
 
 func (m *Manager) persistPendingDisabled(ctx context.Context, authID string) error {

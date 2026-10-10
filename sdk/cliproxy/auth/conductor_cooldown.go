@@ -493,6 +493,8 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	registeredModels := modelsForRegisteredAuth(authID)
 	cooldownStateChanged := false
 
+	releaseMutation := m.lockAuthMutation(authID)
+	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if !ok || auth == nil {
@@ -567,6 +569,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		m.schedulerUpsert(snapshot)
 	}
 	if errPersist := m.persistPublishedIfCurrent(ctx, snapshot); errPersist != nil {
+		releaseMutation()
 		m.reloadAfterAuthStoreConflict(ctx, authID, errPersist)
 		return nil, nil, errPersist
 	}
@@ -764,7 +767,21 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 	return ""
 }
 
-// MarkResult records an execution result and notifies hooks.
+// isStaleExecutionResult reports whether an execution result originated from a superseded
+// credential version or an earlier registration epoch than the currently active auth.
+func isStaleExecutionResult(ctx context.Context, result Result, current *Auth) bool {
+	snapshot, ok := executionResultAuthFromContext(ctx)
+	if !ok || current == nil || snapshot.id != result.AuthID {
+		return false
+	}
+	staleVersion := snapshot.credentialVersion < current.CredentialVersion && (snapshot.credentialVersion > 0 || current.CredentialVersion > 1)
+	staleEpoch := snapshot.registrationEpoch > 0 && snapshot.registrationEpoch < current.RegistrationEpoch
+	return staleVersion || staleEpoch
+}
+
+// MarkResult records an execution result and notifies hooks. Legacy callers
+// without an execution snapshot apply their result to the current auth state.
+// Manager execution paths attach the selected credential version and epoch.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
@@ -797,6 +814,12 @@ func (m *Manager) markResult(ctx context.Context, result Result, affinityState r
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		if isStaleExecutionResult(ctx, result, auth) {
+			m.mu.Unlock()
+			m.hook.OnResult(ctx, result)
+			m.publishErrorEvent(result, nil)
+			return
+		}
 		operatorDisabled := auth.Disabled || auth.Status == StatusDisabled
 		disabledMessage := auth.StatusMessage
 		if modelKey == "" && strings.TrimSpace(routeModel) != "" {
@@ -1133,7 +1156,7 @@ func isRequestScopedCodexStoreMiss(message string) bool {
 
 func (m *Manager) recordExecutionResultWithAffinity(ctx context.Context, result Result, auth *Auth, ephemeral bool, affinityState resultSessionAffinity, affinityIntermediate bool, routeModel string, skipQuotaObservation bool) {
 	if !ephemeral {
-		m.markResult(ctx, result, affinityState, affinityIntermediate, routeModel, skipQuotaObservation)
+		m.markResult(withExecutionResultAuth(ctx, auth), result, affinityState, affinityIntermediate, routeModel, skipQuotaObservation)
 		return
 	}
 	m.reportHomeResult(ctx, result, auth)
@@ -1171,6 +1194,12 @@ func (m *Manager) recordAvailabilityNeutralResultWithAffinity(ctx context.Contex
 	var authSnapshot *Auth
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		if isStaleExecutionResult(ctx, result, auth) {
+			m.mu.Unlock()
+			m.hook.OnResult(ctx, result)
+			m.publishErrorEvent(result, nil)
+			return
+		}
 		now := time.Now()
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {

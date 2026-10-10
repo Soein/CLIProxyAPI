@@ -3,8 +3,10 @@ package auth
 import (
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -148,6 +150,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.ID = uuid.NewString()
 	}
 	auth.discardStoreGenerationMetadata()
+	releaseMutation, errMutation := m.lockAuthLifecycleContext(ctx, auth, updateModeReplace)
+	if errMutation != nil {
+		return nil, errMutation
+	}
+	defer releaseMutation()
 	now := time.Now()
 	if auth.Generation == 0 {
 		auth.Generation = 1
@@ -185,6 +192,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.authEpochs[auth.ID]++
 	auth.RegistrationEpoch = m.authEpochs[auth.ID]
+	if existing, exists := m.auths[auth.ID]; exists && existing != nil {
+		auth.CredentialVersion = max(auth.CredentialVersion, existing.CredentialVersion) + 1
+	} else if auth.CredentialVersion == 0 {
+		auth.CredentialVersion = 1
+	}
 	auth.Generation = 1
 	auth.revision = m.nextAuthRevisionLocked()
 	auth.durableRevision = m.nextAuthDurableRevisionLocked()
@@ -212,6 +224,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	errPersist := m.persistRegisteredIfCurrent(ctx, authClone, registeringNew)
 	if errPersist != nil {
 		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist registered auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+		releaseMutation()
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
 		current, _ := m.GetByID(auth.ID)
 		return current, fmt.Errorf("persist registered auth %q: %w", auth.ID, errPersist)
@@ -220,6 +233,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if !okCommitted || committed == nil {
 		committed = auth.Clone()
 	}
+	releaseMutation()
 	m.hook.OnAuthRegistered(ctx, committed.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -266,6 +280,12 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	auth.discardStoreGenerationMetadata()
 
+	releaseMutation, errMutation := m.lockAuthLifecycleContext(ctx, auth, mode)
+	if errMutation != nil {
+		return nil, errMutation
+	}
+	defer releaseMutation()
+
 	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) &&
 		(strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") || (base != nil && strings.EqualFold(strings.TrimSpace(base.Provider), "meta")))
 	var unlockPersistence func()
@@ -304,6 +324,12 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if (mode == updateModeRefresh || mode == updateModePrepare) && base != nil && existing.RegistrationEpoch != base.RegistrationEpoch {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+	}
+	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
+	if mode == updateModeRefresh && base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing)) {
+		current := existing.Clone()
+		m.mu.Unlock()
+		return current, nil
 	}
 	if mode == updateModeRefresh {
 		merged := MergeRefreshedAuth(base, existing, auth)
@@ -363,18 +389,33 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	} else {
 		auth.Generation++
 	}
+	existingVersion := existing.CredentialVersion
+	if existingVersion == 0 {
+		existingVersion = 1
+	}
+	credChanged := CredentialsChanged(existing, auth)
+	if credChanged {
+		auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
+	} else {
+		auth.CredentialVersion = existingVersion
+	}
 	cooldownStateChanged := false
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if mode == updateModeReplace && len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
-		credChanged := CredentialsChanged(existing, auth)
+		if credChanged || mode == updateModeRefresh {
+			auth.RejectedAccessToken = ""
+		} else {
+			auth.RejectedAccessToken = existing.RejectedAccessToken
+		}
 		if credChanged && mode != updateModeRefresh {
 			if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
 				auth.Unavailable = false
 				auth.LastError = nil
 				auth.StatusMessage = ""
 				auth.Status = StatusActive
+				cooldownStateChanged = true
 			}
 			resumed := clearUnauthorizedModelStates(auth, time.Now())
 			if len(resumed) > 0 {
@@ -414,6 +455,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 				unlockPersistence()
 				unlockPersistence = nil
 			}
+			releaseMutation()
 			m.reloadAfterAuthStoreConflict(ctx, candidate.ID, errPersist)
 			return nil, fmt.Errorf("persist meta auth: %w", errPersist)
 		}
@@ -439,6 +481,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 					unlockPersistence()
 					unlockPersistence = nil
 				}
+				releaseMutation()
 				m.reloadAfterAuthStoreConflict(ctx, candidate.ID, ErrAuthStoreConflict)
 				return nil, fmt.Errorf("prepare meta auth: concurrent credential change: %w", ErrAuthStoreConflict)
 			}
@@ -585,6 +628,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			m.schedulerUpsert(committed)
 		}
 		m.queueRefreshReschedule(candidate.ID)
+		releaseMutation()
 		m.hook.OnAuthUpdated(ctx, committed.Clone())
 		if cooldownStateChanged {
 			m.persistCooldownStates(context.Background())
@@ -612,6 +656,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	m.queueRefreshReschedule(auth.ID)
 	if errPersist := m.persistPublishedIfCurrent(ctx, authClone); errPersist != nil {
 		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist updated auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
+		releaseMutation()
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
 		current, _ := m.GetByID(auth.ID)
 		return current, fmt.Errorf("persist updated auth %q: %w", auth.ID, errPersist)
@@ -620,6 +665,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if !okCommitted || committed == nil {
 		committed = auth.Clone()
 	}
+	releaseMutation()
 	m.hook.OnAuthUpdated(ctx, committed.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -638,6 +684,8 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		return
 	}
 	_ = ctx
+	releaseMutation := m.lockAuthMutation(id)
+	defer releaseMutation()
 
 	m.mu.Lock()
 	existing := m.auths[id]
@@ -670,6 +718,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	tombstoneEpoch := m.authEpochs[id]
 	m.nextAuthRevisionLocked()
 	m.mu.Unlock()
+	releaseMutation()
 
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -704,7 +753,19 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 }
 
 func (m *Manager) Load(ctx context.Context) error {
-	return m.load(ctx, false)
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errAcquire := m.authLoadGate.Acquire(ctx, math.MaxInt64); errAcquire != nil {
+		return errAcquire
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { m.authLoadGate.Release(math.MaxInt64) }) }
+	defer release()
+	return m.load(ctx, false, release)
 }
 
 func (m *Manager) persistCandidate(ctx context.Context, candidate *Auth) error {

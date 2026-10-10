@@ -1433,13 +1433,13 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				if isCredentialScopedError(errExec) {
 					result.CredentialScope = true
 				}
-				m.markResult(attemptCtx, result, affinityState, false, routeModel, false)
+				m.markResult(withExecutionResultAuth(attemptCtx, c.auth), result, affinityState, false, routeModel, false)
 				if result.CredentialScope {
 					break
 				}
 				continue
 			}
-			m.markResult(attemptCtx, result, affinityState, false, routeModel, false)
+			m.markResult(withExecutionResultAuth(attemptCtx, c.auth), result, affinityState, false, routeModel, false)
 			attemptAliasResult := resolveAttemptAliasResult(routing, c.auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, true, nil

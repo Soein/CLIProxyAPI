@@ -9,6 +9,17 @@
 # The compatibility notes at the end show old spellings for existing deployments.
 config-version: 8
 
+# Optional model catalog sources: http(s) URLs or absolute local file paths.
+# Each explicit source overrides --local-model; otherwise --local-model uses
+# embedded catalogs, and normal mode uses the official remote sources.
+# Failed refreshes retain the last valid catalog; custom sources never fall back
+# to official URLs. Files and URLs are refreshed every 3 hours and on source changes.
+# Home mode never loads the general catalog, even when explicitly configured.
+models:
+  catalog: ""
+  codex-catalog: ""
+  devin-catalog: ""
+
 # Listener, TLS, network discovery, and server operation.
 server:
   # Server host/interface to bind to. Default is empty ("") to bind all interfaces (IPv4 + IPv6).
@@ -17,6 +28,11 @@ server:
 
   # Server port
   port: 8317
+
+  # Global token for GitHub requests (for example, release and asset downloads).
+  # A non-empty config token takes precedence over the GITHUB_TOKEN environment variable.
+  # Leave empty to use GITHUB_TOKEN, or unauthenticated requests if neither is set.
+  github-token: ""
 
   # IP addresses or CIDRs of proxies allowed to supply forwarded client IP headers.
   # An empty list (the default) does not trust forwarded headers. Restart after changing this setting.
@@ -634,6 +650,7 @@ upstream:
 #       base-url: "https://example.com/api"         # optional, e.g. https://zenmux.ai/api; falls back to Google Vertex when omitted
 #       proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
 #       # proxy-url: "direct" # optional: explicit direct connect for this credential
+#       # interactions: true                        # optional: opt into native Vertex Interactions API routing (/v1beta1/interactions). For service account JSON files under auths/, add "interactions": true at the root of the file.
 #       headers:
 #         X-Custom-Header: "custom-value"
 #         # Values starting with "$" dynamically copy the header value from downstream client requests.
