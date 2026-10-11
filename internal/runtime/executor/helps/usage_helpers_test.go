@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httptrace"
 	"net/url"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -1392,4 +1394,112 @@ func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
 	if record.TraceID != "explicit-trace-1" {
 		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
 	}
+}
+
+func TestExecutorUsageReporterAccessMetadataPreservesPhases(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		provider := "config-inline"
+		if native {
+			provider = "custom-auth-plugin"
+		}
+		t.Run(provider, func(t *testing.T) {
+			ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ginCtx.Set("userApiKey", "client-key")
+			ctx := usage.EnablePhases(context.WithValue(context.Background(), "gin", ginCtx))
+			ctx = usage.WithAccessProvider(ctx, provider)
+			ctx = usage.WithIsNativeKey(ctx, native)
+			auth := &cliproxyauth.Auth{ID: "upstream-auth", Provider: "codex", Metadata: map[string]any{"access_token": "upstream-token"}}
+			reporter := NewExecutorUsageReporter(ctx, &TestUsageExecutor{}, "gpt-5.4", auth)
+			reporter.MarkFirstSemanticToken()
+			reporter.MarkTerminal("completed")
+			primary := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false)
+			additional, ok := reporter.buildAdditionalModelRecord("image-model", usage.Detail{TotalTokens: 5})
+			if !ok {
+				t.Fatal("additional-model record was discarded")
+			}
+			for _, record := range []usage.Record{primary, additional} {
+				if record.APIKey != "client-key" || record.AccessProvider != provider || record.IsNativeKey != native {
+					t.Fatalf("access metadata lost its explicit native flag: key=%q provider=%q native=%t", record.APIKey, record.AccessProvider, record.IsNativeKey)
+				}
+				if record.AuthID != auth.ID || record.AuthIndex == "" || record.AccessTokenSHA256 != cliproxyauth.AccessTokenSHA256(auth) {
+					t.Fatal("upstream credential identity was lost")
+				}
+				if record.Phases == nil || record.Phases.Attempt != 1 || record.Phases.TerminalKind != "completed" {
+					t.Fatalf("access metadata discarded phase accounting: %+v", record.Phases)
+				}
+			}
+			if primary.RequestID == additional.RequestID {
+				t.Fatal("additional-model record reused the primary request identity")
+			}
+		})
+	}
+}
+
+func TestUsageReporter_DistinguishesNativeKey(t *testing.T) {
+	t.Run("native_key_via_gin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(w)
+		ginCtx.Set("userApiKey", "sk-native-key")
+		ginCtx.Set("accessProvider", "config-inline")
+
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if !reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = false, want true")
+		}
+		if reporter.AccessProvider() != "config-inline" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "config-inline")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if !record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = false, want true")
+		}
+		if record.AccessProvider != "config-inline" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "config-inline")
+		}
+	})
+
+	t.Run("plugin_key_via_gin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(w)
+		ginCtx.Set("userApiKey", "plugin-principal")
+		ginCtx.Set("accessProvider", "custom-auth-plugin")
+
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = true, want false")
+		}
+		if reporter.AccessProvider() != "custom-auth-plugin" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "custom-auth-plugin")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = true, want false")
+		}
+		if record.AccessProvider != "custom-auth-plugin" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "custom-auth-plugin")
+		}
+	})
+
+	t.Run("native_key_via_context", func(t *testing.T) {
+		ctx := usage.WithAccessProvider(context.Background(), "config-api-key")
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if !reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = false, want true")
+		}
+		if reporter.AccessProvider() != "config-api-key" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "config-api-key")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if !record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = false, want true")
+		}
+		if record.AccessProvider != "config-api-key" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "config-api-key")
+		}
+	})
 }
