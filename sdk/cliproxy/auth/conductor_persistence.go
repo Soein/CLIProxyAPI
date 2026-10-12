@@ -349,7 +349,9 @@ func equalSaveValue(a, b reflect.Value) bool {
 // the given registration epoch and persists it to the backing store without
 // advancing Generation or firing credential-lifecycle hooks. It reports whether
 // the metadata was accepted and whether a foreground mutation preempted it.
-// Preemption depends on the backing store honoring context cancellation.
+// Foreground mutations request cancellation of in-flight saves. Immediate
+// preemption requires the store to honor cancellation; detached transactions
+// may finish their commit before foreground persistence can proceed.
 func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedEpoch uint64, key string, value any, validate func(existing *Auth) bool) (bool, bool) {
 	if m == nil || id == "" || key == "" {
 		return false, false
@@ -379,18 +381,18 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 	}
 	defer releaseMutation()
 
+	releaseSaveGate, okGate := m.acquireMetadataSaveGate(persistCtx, preemptFn)
+	if !okGate {
+		return false, preempted.Load() && ctx.Err() == nil
+	}
+	defer releaseSaveGate()
+
 	unlockPersistence := m.lockAuthPersistence([]string{id})
 	defer func() {
 		if unlockPersistence != nil {
 			unlockPersistence()
 		}
 	}()
-
-	releaseSaveGate, okGate := m.acquireMetadataSaveGate(persistCtx, preemptFn)
-	if !okGate {
-		return false, preempted.Load() && ctx.Err() == nil
-	}
-	defer releaseSaveGate()
 
 	m.mu.Lock()
 	existing = m.auths[id]

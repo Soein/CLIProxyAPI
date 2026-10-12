@@ -141,15 +141,24 @@ func (m *Manager) SetDisabled(ctx context.Context, ids []string, disabled bool) 
 	}
 	updated := make([]*Auth, 0, len(normalizedIDs))
 	var unlockPersistence func()
+	var releaseForeground func()
 	if !disabled {
+		var errForeground error
+		releaseForeground, errForeground = m.beginForegroundStoreSave(ctx)
+		if errForeground != nil {
+			return nil, errForeground
+		}
 		unlockPersistence = m.lockAuthPersistence(normalizedIDs)
 	}
 	releasePersistence := func() {
-		if unlockPersistence == nil {
-			return
+		if unlockPersistence != nil {
+			unlockPersistence()
+			unlockPersistence = nil
 		}
-		unlockPersistence()
-		unlockPersistence = nil
+		if releaseForeground != nil {
+			releaseForeground()
+			releaseForeground = nil
+		}
 	}
 	defer releasePersistence()
 	enableTransitionActive := false
@@ -476,6 +485,11 @@ func (m *Manager) persistPendingDisabledAtomicBatch(ctx context.Context, ids []s
 		return false, nil
 	}
 
+	releaseForeground, errForeground := m.beginForegroundStoreSave(ctx)
+	if errForeground != nil {
+		return false, errForeground
+	}
+	defer releaseForeground()
 	unlock := m.lockAuthPersistence(ids)
 	defer unlock()
 
@@ -552,9 +566,15 @@ func (m *Manager) DeleteAuths(ctx context.Context, ids []string, deletePersisten
 		return deletePersistent(ctx)
 	}
 
+	releaseForeground, errForeground := m.beginForegroundStoreSave(ctx)
+	if errForeground != nil {
+		return errForeground
+	}
+	defer releaseForeground()
 	unlockPersistence := m.lockAuthPersistence(ids)
 	if errDelete := deletePersistent(ctx); errDelete != nil {
 		unlockPersistence()
+		releaseForeground()
 		if authStoreRequiresAuthoritativeReload(errDelete) {
 			m.reloadAfterAuthStoreConflicts(ctx, ids, errDelete)
 		}
@@ -567,6 +587,7 @@ func (m *Manager) DeleteAuths(ctx context.Context, ids []string, deletePersisten
 	// Release persistence locks before callbacks and other cleanup. Hooks may
 	// re-enter Manager lifecycle methods and must never run under these locks.
 	unlockPersistence()
+	releaseForeground()
 	m.cleanupRemovedAuths(ctx, removed)
 	return nil
 }
@@ -1575,6 +1596,11 @@ func (m *Manager) persistPendingDisabled(ctx context.Context, authID string) err
 	if m == nil || strings.TrimSpace(authID) == "" {
 		return nil
 	}
+	releaseForeground, errForeground := m.beginForegroundStoreSave(ctx)
+	if errForeground != nil {
+		return errForeground
+	}
+	defer releaseForeground()
 	unlock := m.lockAuthPersistence([]string{authID})
 	defer unlock()
 
