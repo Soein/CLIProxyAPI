@@ -238,7 +238,9 @@ type Manager struct {
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
 	// authMutationLocks serialize durable lifecycle transactions per credential.
-	authMutationLocks sync.Map
+	authMutationLocks      sync.Map
+	metadataPersistCancels sync.Map
+	metadataSaveGate       sync.Map
 	// authLoadGate excludes full reloads while credential saves are in progress.
 	authLoadGate *semaphore.Weighted
 }

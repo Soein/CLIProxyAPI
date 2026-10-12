@@ -1613,6 +1613,11 @@ func (m *Manager) persistRestore(ctx context.Context, auth *Auth) error {
 	if _, ok := store.(VersionedAuthStore); !ok {
 		return m.persist(ctx, auth)
 	}
+	releaseFg, errWait := m.beginForegroundStoreSave(ctx)
+	if errWait != nil {
+		return errWait
+	}
+	defer releaseFg()
 	expectedGeneration := auth.StoreGeneration()
 	if _, errPersist := PersistExplicitAuth(ctx, store, auth); errPersist != nil {
 		return errPersist

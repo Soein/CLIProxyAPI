@@ -437,6 +437,14 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
+	if existing.Metadata != nil {
+		if persistedHints, hasHints := existing.Metadata["antigravity_capability_hints"]; hasHints {
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["antigravity_capability_hints"] = persistedHints
+		}
+	}
 	auth.EnsureIndex()
 	auth.revision = m.nextAuthRevisionLocked()
 	auth.durableRevision = m.nextAuthDurableRevisionLocked()
@@ -781,6 +789,11 @@ func (m *Manager) persistCandidate(ctx context.Context, candidate *Auth) error {
 	if store == nil || shouldSkipPersist(ctx) || isExplicitlyNonPersistentAuth(candidate) || candidate.Metadata == nil {
 		return nil
 	}
+	releaseFg, errWait := m.beginForegroundStoreSave(ctx)
+	if errWait != nil {
+		return errWait
+	}
+	defer releaseFg()
 	if versioned, ok := store.(VersionedAuthStore); ok {
 		expectedGeneration := candidate.StoreGeneration()
 		_, generation, errSave := versioned.SaveVersioned(ctx, candidate, expectedGeneration)
@@ -807,6 +820,11 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if store == nil || shouldSkipPersist(ctx) || isExplicitlyNonPersistentAuth(auth) || auth.Metadata == nil {
 		return nil
 	}
+	releaseFg, errWait := m.beginForegroundStoreSave(ctx)
+	if errWait != nil {
+		return errWait
+	}
+	defer releaseFg()
 	if versioned, ok := store.(VersionedAuthStore); ok {
 		expectedGeneration := auth.StoreGeneration()
 		_, generation, errSave := versioned.SaveVersioned(ctx, auth, expectedGeneration)

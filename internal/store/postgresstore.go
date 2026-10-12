@@ -207,7 +207,8 @@ type PostgresStore struct {
 	// authGenerations tracks generations installed into this node's local
 	// mirrors. Plain List/Get reads do not advance it: a delayed watcher delete
 	// must retain the generation of the mirror that actually disappeared.
-	authGenerations map[string]uint64
+	authGenerations       map[string]uint64
+	persistAuthExpectedFn func(context.Context, string, []byte, uint64) (uint64, bool, error)
 }
 
 var (
@@ -2290,6 +2291,9 @@ func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []by
 }
 
 func (s *PostgresStore) persistAuthExpected(ctx context.Context, relID string, data []byte, expectedGeneration uint64) (uint64, bool, error) {
+	if s != nil && s.persistAuthExpectedFn != nil {
+		return s.persistAuthExpectedFn(ctx, relID, data, expectedGeneration)
+	}
 	if s == nil || s.db == nil {
 		return 0, false, errors.New("postgres store: not initialized")
 	}
