@@ -790,6 +790,10 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 			webSearch := *model.NativeCapabilities.WebSearch
 			copyCapabilities.WebSearch = &webSearch
 		}
+		if model.NativeCapabilities.ToolSearch != nil {
+			toolSearch := *model.NativeCapabilities.ToolSearch
+			copyCapabilities.ToolSearch = &toolSearch
+		}
 		copyModel.NativeCapabilities = &copyCapabilities
 	}
 	if len(model.SupportedGenerationMethods) > 0 {
