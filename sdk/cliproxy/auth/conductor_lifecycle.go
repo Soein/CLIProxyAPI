@@ -61,6 +61,9 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if replaced == nil || replaced == executor {
 		return
 	}
+	if sharer, ok := replaced.(ExecutionSessionSharer); ok && sharer != nil && sharer.SharesExecutionSessionsWith(executor) {
+		return
+	}
 	if closer, ok := replaced.(ExecutionSessionCloser); ok && closer != nil {
 		closer.CloseExecutionSession(CloseAllExecutionSessionsID)
 	}
@@ -274,17 +277,27 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
-	NormalizeCredentialMetadata(auth.Metadata)
-	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
-		return nil, fmt.Errorf("update auth: %w", errWeight)
-	}
-	auth.discardStoreGenerationMetadata()
-
 	releaseMutation, errMutation := m.lockAuthLifecycleContext(ctx, auth, mode)
 	if errMutation != nil {
 		return nil, errMutation
 	}
 	defer releaseMutation()
+	committed, _, errUpdate := m.updateInternalWithMutation(ctx, base, auth, mode, releaseMutation)
+	return committed, errUpdate
+}
+
+// updateInternalWithMutation commits while the caller owns the lifecycle gate.
+// It releases that gate before reentrant hooks or conflict reloads. The boolean
+// distinguishes a committed update from a stale snapshot returned unchanged.
+func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Auth, mode updateAuthMode, releaseMutation func()) (*Auth, bool, error) {
+	if auth == nil || auth.ID == "" {
+		return nil, false, nil
+	}
+	NormalizeCredentialMetadata(auth.Metadata)
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, false, fmt.Errorf("update auth: %w", errWeight)
+	}
+	auth.discardStoreGenerationMetadata()
 
 	persistMetaMint := (mode == updateModePrepare || mode == updateModeRefresh) &&
 		(strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") || (base != nil && strings.EqualFold(strings.TrimSpace(base.Provider), "meta")))
@@ -302,7 +315,13 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
-		return nil, nil
+		return nil, false, nil
+	}
+	// Watcher snapshots may bypass the mutation gate. Check their identity
+	// changes under the same manager lock used for publication.
+	if mode == updateModeReplace && base != nil && !modelRegistrationInputsMatch(existing, base.RegistrationEpoch, base.Prefix, base.Provider, base.Disabled || base.Status == StatusDisabled, base.AuthKind(), base.Attributes) {
+		m.mu.Unlock()
+		return nil, false, nil
 	}
 	if !persistMetaMint && (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(existing.Provider), "meta") {
 		persistMetaMint = true
@@ -312,7 +331,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		existing, ok = m.auths[auth.ID]
 		if !ok || existing == nil {
 			m.mu.Unlock()
-			return nil, nil
+			return nil, false, nil
 		}
 	}
 	if m.authEpochs == nil {
@@ -323,13 +342,15 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	if (mode == updateModeRefresh || mode == updateModePrepare) && base != nil && existing.RegistrationEpoch != base.RegistrationEpoch {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+		return nil, false, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
 	}
 	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
 	if mode == updateModeRefresh && base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing)) {
-		current := existing.Clone()
-		m.mu.Unlock()
-		return current, nil
+		if auth.CodexRefreshPatch == nil || !auth.CodexRefreshPatch.CanApplyTo(existing.Metadata) {
+			current := existing.Clone()
+			m.mu.Unlock()
+			return current, false, nil
+		}
 	}
 	if mode == updateModeRefresh {
 		merged := MergeRefreshedAuth(base, existing, auth)
@@ -346,7 +367,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("update auth %s: stale registration epoch %d < %d", auth.ID, auth.RegistrationEpoch, m.authEpochs[auth.ID])
+		return nil, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", auth.ID, auth.RegistrationEpoch, m.authEpochs[auth.ID])
 	}
 	if auth.RegistrationEpoch >= m.authEpochs[auth.ID] {
 		m.authEpochs[auth.ID] = auth.RegistrationEpoch
@@ -356,14 +377,14 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if auth.durableRevision != 0 && auth.durableRevision < existing.durableRevision {
 		current := existing.Clone()
 		m.mu.Unlock()
-		return current, nil
+		return current, false, nil
 	}
 	incomingGeneration := auth.StoreGeneration()
 	existingGeneration := existing.StoreGeneration()
 	if incomingGeneration > 0 && existingGeneration > 0 && incomingGeneration < existingGeneration {
 		current := existing.Clone()
 		m.mu.Unlock()
-		return current, nil
+		return current, false, nil
 	}
 	unversionedWatcherSnapshot := incomingGeneration == 0 && existingGeneration > 0
 	if unversionedWatcherSnapshot {
@@ -465,7 +486,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			}
 			releaseMutation()
 			m.reloadAfterAuthStoreConflict(ctx, candidate.ID, errPersist)
-			return nil, fmt.Errorf("persist meta auth: %w", errPersist)
+			return nil, false, fmt.Errorf("persist meta auth: %w", errPersist)
 		}
 
 		m.mu.Lock()
@@ -473,12 +494,12 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		if current == nil {
 			m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
 			m.mu.Unlock()
-			return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
+			return nil, false, fmt.Errorf("prepare meta auth: credential removed during mint")
 		}
 		if current.RegistrationEpoch != candidate.RegistrationEpoch {
 			m.clearPersistenceInFlightLocked(candidate.ID, preSaveDurableRevision)
 			m.mu.Unlock()
-			return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
+			return nil, false, fmt.Errorf("prepare meta auth: credential removed during mint")
 		}
 		if current.durableRevision > candidate.durableRevision {
 			if CredentialsChanged(preSaveAuth, current) {
@@ -491,7 +512,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 				}
 				releaseMutation()
 				m.reloadAfterAuthStoreConflict(ctx, candidate.ID, ErrAuthStoreConflict)
-				return nil, fmt.Errorf("prepare meta auth: concurrent credential change: %w", ErrAuthStoreConflict)
+				return nil, false, fmt.Errorf("prepare meta auth: concurrent credential change: %w", ErrAuthStoreConflict)
 			}
 
 			// Notes or operator metadata was updated. Preserve concurrent operator changes
@@ -514,6 +535,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		candidate.Success = current.Success
 		candidate.Failed = current.Failed
 		candidate.recentRequests = current.recentRequests
+		candidate.cooldownRecordedSeq = current.cooldownRecordedSeq
 
 		// ModelStates: reconcile concurrent changes relative to pre-save snapshot
 		if candidate.ModelStates == nil && len(current.ModelStates) > 0 {
@@ -641,7 +663,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		if cooldownStateChanged {
 			m.persistCooldownStates(context.Background())
 		}
-		return committed, nil
+		return committed, true, nil
 	}
 
 	authClone := auth.Clone()
@@ -667,7 +689,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		releaseMutation()
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)
 		current, _ := m.GetByID(auth.ID)
-		return current, fmt.Errorf("persist updated auth %q: %w", auth.ID, errPersist)
+		return current, false, fmt.Errorf("persist updated auth %q: %w", auth.ID, errPersist)
 	}
 	committed, okCommitted := m.GetByID(auth.ID)
 	if !okCommitted || committed == nil {
@@ -678,7 +700,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
 	}
-	return committed, nil
+	return committed, true, nil
 }
 
 // Remove deletes an auth from runtime state without persisting.
@@ -739,14 +761,25 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	m.queueRefreshUnschedule(id)
 	m.invalidateSessionAffinity(id)
 
-	if provider != "" {
-		if exec, ok := m.Executor(provider); ok && exec != nil {
-			if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
-				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
-			}
-		}
-	}
+	m.closeAuthExecutionSessions(provider, id)
 	m.persistCooldownStates(context.Background())
+}
+
+// closeAuthExecutionSessions limits removal cleanup to the affected credential
+// when the executor supports it, preserving other credentials' live sessions.
+func (m *Manager) closeAuthExecutionSessions(provider, authID string) {
+	if provider == "" {
+		return
+	}
+	exec, ok := m.Executor(provider)
+	if !ok || exec == nil {
+		return
+	}
+	if closer, ok := exec.(AuthExecutionSessionCloser); ok && closer != nil {
+		closer.CloseAuthExecutionSessions(authID)
+	} else if closer, ok := exec.(ExecutionSessionCloser); ok && closer != nil {
+		closer.CloseExecutionSession(CloseAllExecutionSessionsID)
+	}
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {

@@ -10,6 +10,25 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type executionResultSeqContextKey struct{}
+
+// withExecutionResultSeq keeps dispatch ordering private without extending Result,
+// whose exported fields support legacy unkeyed literals.
+func withExecutionResultSeq(ctx context.Context, seq uint64) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, executionResultSeqContextKey{}, seq)
+}
+
+func executionResultSeqFromContext(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	seq, _ := ctx.Value(executionResultSeqContextKey{}).(uint64)
+	return seq
+}
+
 type executionResultAuthContextKey struct{}
 
 type executionResultAuthSnapshot struct {

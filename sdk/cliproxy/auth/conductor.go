@@ -53,6 +53,18 @@ type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
 }
 
+// ExecutionSessionSharer reports whether a replaced executor shares its execution
+// session store with the replacement executor so active sessions stay open.
+type ExecutionSessionSharer interface {
+	SharesExecutionSessionsWith(other ProviderExecutor) bool
+}
+
+// AuthExecutionSessionCloser allows executors to release execution sessions
+// associated with a removed credential without tearing down other credentials' sessions.
+type AuthExecutionSessionCloser interface {
+	CloseAuthExecutionSessions(authID string)
+}
+
 // Result captures execution outcome used to adjust auth state.
 type Result struct {
 	// AuthID references the auth that produced this result.
@@ -176,9 +188,11 @@ type Manager struct {
 	pendingDisabledPersistence   map[string]struct{}
 	enablingTransitions          map[string]int
 	syncSchedulerMu              sync.Mutex
-	structuralEpoch              atomic.Uint64
-	syncedVersion                atomic.Uint64
-	scheduler                    *authScheduler
+	// executionSeq orders dispatches against newly recorded cooldowns.
+	executionSeq    atomic.Uint64
+	structuralEpoch atomic.Uint64
+	syncedVersion   atomic.Uint64
+	scheduler       *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths retains legacy session auth lookups for non-execution callers.
@@ -533,11 +547,7 @@ func (m *Manager) ReloadByID(ctx context.Context, id string) error {
 		if removalHook, okRemoval := m.hook.(AuthRemovalHook); okRemoval {
 			removalHook.OnAuthRemoved(ctx, id)
 		}
-		if executor, okExecutor := m.Executor(removedProvider); okExecutor {
-			if closer, okCloser := executor.(ExecutionSessionCloser); okCloser {
-				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
-			}
-		}
+		m.closeAuthExecutionSessions(removedProvider, id)
 	}
 	if persistMergedDisabled {
 		if errPersist := m.persistPendingDisabled(ctx, id); errPersist != nil {

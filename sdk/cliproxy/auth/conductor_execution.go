@@ -612,6 +612,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
 			execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
+			execCtx = withExecutionResultSeq(execCtx, m.nextExecutionSeq())
 			startExec := time.Now()
 			resp, errExec := m.executeWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
@@ -636,6 +637,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
+					execCtx = withExecutionResultSeq(execCtx, m.nextExecutionSeq())
 					startRetry := time.Now()
 					resp, errExec = m.executeWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
@@ -837,6 +839,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
 			execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
+			execCtx = withExecutionResultSeq(execCtx, m.nextExecutionSeq())
 			startExec := time.Now()
 			resp, errExec := m.countTokensWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
@@ -861,6 +864,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
+					execCtx = withExecutionResultSeq(execCtx, m.nextExecutionSeq())
 					startRetry := time.Now()
 					resp, errExec = m.countTokensWithDispatchAdmission(execCtx, executor, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)

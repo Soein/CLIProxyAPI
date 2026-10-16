@@ -529,12 +529,13 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 				emittedToolResults[rawID] = struct{}{}
 			}
-			output := item.Get("output")
+			outputItem := item
 			if rawID != "" {
 				if lastItem, exists := lastToolResult[rawID]; exists {
-					output = lastItem.Get("output")
+					outputItem = lastItem
 				}
 			}
+			output := outputItem.Get("output")
 			// Standalone outputs (no call_id, or one that never paired with a
 			// function_call in this input, e.g. the create_thread delegation seed)
 			// have no tool_use to attach to. Claude rejects orphan tool_result
@@ -548,6 +549,12 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			callID := util.SanitizeClaudeToolID(rawID)
 			toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 			toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
+			// Responses reports an unfinished tool output as status
+			// "incomplete"; Claude's only in-band equivalent is is_error
+			// on tool_result, so carry the signal over instead of dropping it.
+			if strings.EqualFold(strings.TrimSpace(outputItem.Get("status").String()), "incomplete") {
+				toolResult, _ = sjson.SetBytes(toolResult, "is_error", true)
+			}
 			toolResult = applyResponsesToolResultContent(toolResult, output)
 
 			appendParts("user", toolResult)
@@ -635,6 +642,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	// one winner for each final name, while keeping the original order for the
 	// tools that survive conversion.
 	var toolItems [][]byte
+	// The deferred anchor goes between declared and discovered tools, so each
+	// discovery only appends to tools[].
+	anchorIndex := -1
 	for _, descriptor := range responsesToolDescriptors(root, toolSearch) {
 		winner, ok := winners[descriptor.name]
 		if !ok || winner.order != descriptor.order {
@@ -646,6 +656,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			continue
 		}
 		if nativeToolSearch && descriptor.sourcePriority == responsesDiscoveredToolPriority {
+			if anchorIndex < 0 {
+				anchorIndex = len(toolItems)
+			}
 			// Anthropic rejects cache_control on deferred tools.
 			tJSON, _ = sjson.DeleteBytes(tJSON, "cache_control")
 			tJSON, _ = sjson.SetBytes(tJSON, "defer_loading", true)
@@ -656,6 +669,14 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			includedToolNames[toolName] = struct{}{}
 		}
 		toolItems = append(toolItems, tJSON)
+	}
+	if nativeToolSearch {
+		if anchorIndex < 0 {
+			anchorIndex = len(toolItems)
+		}
+		if anchor, ok := responsesDeferredAnchorTool(toolItems); ok {
+			toolItems = append(toolItems[:anchorIndex], append([][]byte{anchor}, toolItems[anchorIndex:]...)...)
+		}
 	}
 	toolNameMap = responsesToolNameMap(root, includedToolNames, toolSearch)
 	if len(toolItems) > 0 {

@@ -20,7 +20,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -910,7 +912,7 @@ func (s *PostgresStore) SaveVersioned(ctx context.Context, auth *cliproxyauth.Au
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tempPath, data, errPrepare := s.prepareAuthTemp(auth, path, relID)
+	tempPath, data, errPrepare := s.prepareAuthTemp(ctx, auth, path, relID)
 	if errPrepare != nil {
 		return "", 0, errPrepare
 	}
@@ -935,6 +937,7 @@ func (s *PostgresStore) SaveVersioned(ctx context.Context, auth *cliproxyauth.Au
 		auth.FileName = auth.ID
 	}
 	auth.SetStoreGeneration(newGeneration)
+	applyPersistedCodexAuth(auth, data)
 
 	if errMirror := installAuthMirror(tempPath, path, data, newGeneration); errMirror != nil {
 		log.WithError(errMirror).Errorf("postgres store: install committed auth mirror %s failed", auth.ID)
@@ -966,7 +969,7 @@ func (s *PostgresStore) Restore(ctx context.Context, auth *cliproxyauth.Auth, ex
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tempPath, data, errPrepare := s.prepareAuthTemp(auth, path, relID)
+	tempPath, data, errPrepare := s.prepareAuthTemp(ctx, auth, path, relID)
 	if errPrepare != nil {
 		return "", 0, errPrepare
 	}
@@ -989,6 +992,7 @@ func (s *PostgresStore) Restore(ctx context.Context, auth *cliproxyauth.Auth, ex
 		auth.FileName = auth.ID
 	}
 	auth.SetStoreGeneration(newGeneration)
+	applyPersistedCodexAuth(auth, data)
 
 	if errMirror := installAuthMirror(tempPath, path, data, newGeneration); errMirror != nil {
 		log.WithError(errMirror).Errorf("postgres store: install restored auth mirror %s failed", auth.ID)
@@ -1003,7 +1007,7 @@ type postgresAuthMetadataSetter interface {
 	SetMetadata(map[string]any)
 }
 
-func (s *PostgresStore) prepareAuthTemp(auth *cliproxyauth.Auth, path, relID string) (tempPath string, data []byte, err error) {
+func (s *PostgresStore) prepareAuthTemp(ctx context.Context, auth *cliproxyauth.Auth, path, relID string) (tempPath string, data []byte, err error) {
 	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
 		return "", nil, fmt.Errorf("postgres store: create auth directory: %w", errMkdir)
 	}
@@ -1022,29 +1026,54 @@ func (s *PostgresStore) prepareAuthTemp(auth *cliproxyauth.Auth, path, relID str
 		}
 	}()
 
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
+	staged := auth.Clone()
+	_, canMarshal := staged.Storage.(interface{ MarshalTokenJSON() ([]byte, error) })
+	handledCodex := false
+	if staged.Storage == nil || staged.CodexRefreshPatch != nil || canMarshal {
+		var errCodex error
+		handledCodex, errCodex = cliproxyauth.PersistCodexAuthFileWithIO(ctx, path, staged, cliproxyauth.CodexAuthFileIO{
+			WithLock: codex.WithFileLock,
+			// PostgreSQL's generation-checked snapshot is authoritative; the
+			// local mirror can be stale, corrupt, or unavailable.
+			ReadFile: func(string) ([]byte, error) {
+				if auth.Metadata == nil {
+					return nil, os.ErrNotExist
+				}
+				return json.Marshal(auth.Metadata)
+			},
+			WriteJSON:      func(_ string, data map[string]any) error { return codex.WriteJSONFileAtomic(tempPath, data) },
+			WriteUnchanged: true,
+		})
+		if errCodex != nil {
+			return "", nil, fmt.Errorf("postgres store: prepare Codex auth %s: %w", relID, errCodex)
+		}
 	}
-	auth.Metadata["disabled"] = auth.Disabled
-	if auth.Storage != nil {
-		// Some token stores require a nonexistent destination and create the
-		// file themselves rather than truncating an existing temporary file.
-		if errRemove := os.Remove(tempPath); errRemove != nil && !errors.Is(errRemove, fs.ErrNotExist) {
-			return "", nil, fmt.Errorf("postgres store: prepare token temp path %s: %w", relID, errRemove)
+
+	if !handledCodex {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
 		}
-		if setter, ok := auth.Storage.(postgresAuthMetadataSetter); ok {
-			setter.SetMetadata(auth.Metadata)
-		}
-		if errSave := auth.Storage.SaveTokenToFile(tempPath); errSave != nil {
-			return "", nil, fmt.Errorf("postgres store: serialize auth %s: %w", relID, errSave)
-		}
-	} else {
-		raw, errMarshal := json.Marshal(auth.Metadata)
-		if errMarshal != nil {
-			return "", nil, fmt.Errorf("postgres store: marshal auth %s: %w", relID, errMarshal)
-		}
-		if errWrite := os.WriteFile(tempPath, raw, 0o600); errWrite != nil {
-			return "", nil, fmt.Errorf("postgres store: write temp auth %s: %w", relID, errWrite)
+		auth.Metadata["disabled"] = auth.Disabled
+		if auth.Storage != nil {
+			// Some token stores require a nonexistent destination and create the
+			// file themselves rather than truncating an existing temporary file.
+			if errRemove := os.Remove(tempPath); errRemove != nil && !errors.Is(errRemove, fs.ErrNotExist) {
+				return "", nil, fmt.Errorf("postgres store: prepare token temp path %s: %w", relID, errRemove)
+			}
+			if setter, ok := auth.Storage.(postgresAuthMetadataSetter); ok {
+				setter.SetMetadata(auth.Metadata)
+			}
+			if errSave := auth.Storage.SaveTokenToFile(tempPath); errSave != nil {
+				return "", nil, fmt.Errorf("postgres store: serialize auth %s: %w", relID, errSave)
+			}
+		} else {
+			raw, errMarshal := json.Marshal(auth.Metadata)
+			if errMarshal != nil {
+				return "", nil, fmt.Errorf("postgres store: marshal auth %s: %w", relID, errMarshal)
+			}
+			if errWrite := os.WriteFile(tempPath, raw, 0o600); errWrite != nil {
+				return "", nil, fmt.Errorf("postgres store: write temp auth %s: %w", relID, errWrite)
+			}
 		}
 	}
 	if errChmod := os.Chmod(tempPath, 0o600); errChmod != nil {
@@ -1055,6 +1084,24 @@ func (s *PostgresStore) prepareAuthTemp(auth *cliproxyauth.Auth, path, relID str
 		return "", nil, fmt.Errorf("postgres store: read temp auth %s: %w", relID, err)
 	}
 	return tempPath, data, nil
+}
+
+func applyPersistedCodexAuth(auth *cliproxyauth.Auth, data []byte) {
+	if !cliproxyauth.IsCodexAuthRecord(auth) {
+		return
+	}
+	var metadata map[string]any
+	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil || metadata == nil {
+		return
+	}
+	auth.Metadata = metadata
+	if auth.CodexRefreshPatch != nil {
+		auth.CodexRefreshPatch = nil
+		auth.Storage = nil
+		if disabled, ok := metadata["disabled"].(bool); ok {
+			auth.Disabled = disabled
+		}
+	}
 }
 
 func databaseAuthContent(data []byte) ([]byte, error) {
@@ -1195,7 +1242,7 @@ func (s *PostgresStore) SaveBatch(ctx context.Context, auths []*cliproxyauth.Aut
 
 	for i := range prepared {
 		item := &prepared[i]
-		tempPath, data, errPrepare := s.prepareAuthTemp(item.auth, item.path, item.relID)
+		tempPath, data, errPrepare := s.prepareAuthTemp(ctx, item.auth, item.path, item.relID)
 		if errPrepare != nil {
 			return errPrepare
 		}
@@ -1293,6 +1340,11 @@ func (s *PostgresStore) SaveBatch(ctx context.Context, auths []*cliproxyauth.Aut
 			}
 			commitErr = fmt.Errorf("postgres store: commit auth batch: %w", commitAckErr)
 		})
+		if committed {
+			for i := range prepared {
+				applyPersistedCodexAuth(prepared[i].auth, prepared[i].data)
+			}
+		}
 		return commitErr
 	}
 	errFinalize := finalize(commit)
@@ -2107,6 +2159,12 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 					return fmt.Errorf("postgres store: create empty config: %w", errWrite)
 				}
 			}
+		}
+		// Seed the database with the file the startup load leaves behind, so a plaintext
+		// management secret never reaches it. Fail instead of skipping: the startup load
+		// could turn a refused file into one that a later start would upload.
+		if errPrepare := config.PrepareConfigFileForUpload(s.configPath); errPrepare != nil {
+			return fmt.Errorf("postgres store: prepare local config for seeding: %w", errPrepare)
 		}
 		data, errRead := os.ReadFile(s.configPath)
 		if errRead != nil {

@@ -657,13 +657,7 @@ func (m *Manager) cleanupRemovedAuths(ctx context.Context, removed []removedAuth
 		if removalHook, okRemoval := m.hook.(AuthRemovalHook); okRemoval {
 			removalHook.OnAuthRemoved(ctx, state.id)
 		}
-		if state.provider != "" {
-			if exec, ok := m.Executor(state.provider); ok && exec != nil {
-				if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
-					closer.CloseExecutionSession(CloseAllExecutionSessionsID)
-				}
-			}
-		}
+		m.closeAuthExecutionSessions(state.provider, state.id)
 	}
 	m.wakeDispatchAuthority()
 	m.persistCooldownStates(ctx)
@@ -718,6 +712,7 @@ func mergePersistedAuthRuntime(persisted, current *Auth) *Auth {
 		merged.Quota = local.Quota
 		merged.LastError = local.LastError
 		merged.NextRetryAfter = local.NextRetryAfter
+		merged.cooldownRecordedSeq = local.cooldownRecordedSeq
 		merged.ModelStates = local.ModelStates
 	}
 	return merged
@@ -739,6 +734,7 @@ func applyDisabledRuntimeState(snapshot, current *Auth) {
 		snapshot.Quota = current.Quota
 		snapshot.LastError = current.LastError
 		snapshot.NextRetryAfter = current.NextRetryAfter
+		snapshot.cooldownRecordedSeq = current.cooldownRecordedSeq
 		snapshot.ModelStates = current.ModelStates
 		snapshot.Runtime = current.Runtime
 	}
@@ -1014,11 +1010,7 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 		if removalHook, okRemoval := m.hook.(AuthRemovalHook); okRemoval {
 			removalHook.OnAuthRemoved(ctx, id)
 		}
-		if executor, okExecutor := m.Executor(removedProviders[id]); okExecutor {
-			if closer, okCloser := executor.(ExecutionSessionCloser); okCloser {
-				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
-			}
-		}
+		m.closeAuthExecutionSessions(removedProviders[id], id)
 	}
 	for id := range persistMergedDisabledIDs {
 		if errPersist := m.persistPendingDisabled(ctx, id); errPersist != nil {
@@ -1177,10 +1169,16 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		ownership = nil
 		return true
 	}
+	affinitySelector, hasAffinity := m.Selector().(*SessionAffinitySelector)
+	trackTransientAffinity := hasAffinity && affinitySelector != nil && affinitySelector.rebindOnQuotaOnly
 	for {
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
 		candidates := make([]*Auth, 0, len(m.auths))
+		var affinityCandidates []*Auth
+		if trackTransientAffinity {
+			affinityCandidates = make([]*Auth, 0, len(m.auths))
+		}
 		for _, candidate := range m.auths {
 			if candidate == nil || candidate.Disabled {
 				continue
@@ -1201,13 +1199,16 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if _, ok := providerSet[providerKey]; !ok {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
 			if _, ok := m.executorLocked(providerKey); !ok {
 				continue
 			}
 			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+				continue
+			}
+			if trackTransientAffinity {
+				affinityCandidates = append(affinityCandidates, candidate)
+			}
+			if _, used := tried[candidate.ID]; used {
 				continue
 			}
 			candidates = append(candidates, candidate)
@@ -1220,6 +1221,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		candidateSnapshots := cloneAuthSlice(candidates)
+		affinitySnapshots := cloneAuthSlice(affinityCandidates)
 		m.mu.RUnlock()
 
 		var priorityAuths []*Auth
@@ -1259,6 +1261,8 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 				}
 			}
 			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+			transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(selector, affinitySnapshots, model, time.Now())
+			selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 			if sessionAffinity, okSession := selector.(*SessionAffinitySelector); okSession && inflight != nil && selectorProvider == "xai" {
 				selected, errPick = sessionAffinity.pickForExecution(selectorCtx, selectorProvider, model, opts, selectorAuths, inflight, preferredAuthID)
 			} else {
@@ -1878,11 +1882,7 @@ func (m *Manager) convergeAuthStoreConflicts(ctx context.Context, authIDs []stri
 		if removalHook, okRemoval := m.hook.(AuthRemovalHook); okRemoval {
 			removalHook.OnAuthRemoved(reloadCtx, item.id)
 		}
-		if executor, okExecutor := m.Executor(item.provider); okExecutor {
-			if closer, okCloser := executor.(ExecutionSessionCloser); okCloser {
-				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
-			}
-		}
+		m.closeAuthExecutionSessions(item.provider, item.id)
 	}
 	return published, true
 }

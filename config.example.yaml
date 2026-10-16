@@ -29,6 +29,11 @@ server:
   # Server port
   port: 8317
 
+  # Maximum allowed size (in bytes) for incoming HTTP request bodies.
+  # Requests exceeding this limit are rejected with HTTP 413 Payload Too Large.
+  # Default is 0 (disabled / no limit).
+  max-request-body-bytes: 0
+
   # Global token for GitHub requests (for example, release and asset downloads).
   # A non-empty config token takes precedence over the GITHUB_TOKEN environment variable.
   # Leave empty to use GITHUB_TOKEN, or unauthenticated requests if neither is set.
@@ -251,6 +256,13 @@ routing:
   # for maximum parallel concurrency.
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
+  # Controls which credential failures rebind an established session to the failover credential:
+  #   - "any" (default): any credential-attributed failure unbinds and rebinds on failover.
+  #   - "quota": transient errors (408, 5xx, empty stream, buffer limit) fail over for that
+  #     request only while keeping the session bound to its original credential; quota and auth
+  #     errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
+  # Ignored when routing.session-affinity is false.
+  session-affinity-rebind-on: "any"
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
@@ -298,6 +310,17 @@ requests:
   # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
   proxy-url: ""
 
+  # Maximum time, in seconds, for upstream TLS handshakes made by the shared built-in
+  # uTLS client. It applies to both the Claude Code Anthropic transport and the Chrome
+  # ChatGPT/Codex transport; the standard fallback transport is unaffected. The timer
+  # starts after TCP or proxy connection establishment returns; it does not bound dialing
+  # or proxy CONNECT. When the upstream path accepts the connection but never answers the
+  # TLS ClientHello, the request would otherwise wait indefinitely and request-retry could
+  # never engage. The bound applies only during the TLS handshake and is lifted once it
+  # succeeds, so inference and long-running streams are never time-limited.
+  # Set to 0 to disable (default).
+  tls-handshake-timeout-seconds: 0
+
   # When true, forward filtered upstream response headers to downstream clients.
   # Default is false (disabled).
   passthrough-headers: false
@@ -307,8 +330,9 @@ requests:
 
   # Streaming behavior (SSE keep-alives + safe bootstrap retries).
   # streaming:
-  #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-  #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+  #   keepalive-seconds: 15         # Default: 0 (disabled). <= 0 disables keep-alives.
+  #   bootstrap-retries: 1          # Default: 0 (disabled). Retries before first byte is sent.
+  #   send-keepalive-before-ft: false # Default: false. When true and keepalive-seconds > 0, send SSE heartbeats before the first token.
 
   # Optional payload configuration
   # payload:
@@ -523,6 +547,20 @@ upstream:
     #   timeout: "600"
     #   timezone: "Asia/Singapore"  # fallback IANA timezone for cloaked currentDate; a credential JSON "timezone" takes priority
     #   stabilize-device-profile: false  # optional, default false; set true to enable per-auth fingerprint pinning
+    #   # Advanced operator overrides for exact-parity or gateway lanes. They apply to every Claude
+    #   # request, after the per-request derivation above, and can produce a beta set real Claude Code
+    #   # never sends, which api.anthropic.com may reject. Names are matched exactly; strip runs first.
+    #   # A credential's own "headers" entries are more specific and keep precedence where they already
+    #   # did: Anthropic-Beta on custom gateways and x-client-request-id everywhere.
+    #   anthropic-beta-strip: []   # remove these names from the derived or caller-supplied set, keeping order
+    #   anthropic-beta-append: []  # append these names at the end unless already present
+    #   # Cloaked requests to api.anthropic.com get a "diagnostics" body field like Claude Code, which in
+    #   # turn adds cache-diagnosis-2026-04-07. Set false to stop injecting it (default true).
+    #   inject-diagnostics: true
+    #   # x-client-request-id on first-party CLI-profile requests: "on" (default) synthesizes a fresh
+    #   # UUID per request (a confirmed Claude Code client keeps its own), "passthrough" forwards only
+    #   # the caller's value and never synthesizes one, "off" never sends the header.
+    #   client-request-id: "on"
 
   xai:
     # When true, inject the native x_search tool when the request does not declare it.
@@ -1132,6 +1170,9 @@ oauth:
         #       - "turn:turn.example.com:3478?transport=udp"
         #     username: "user"
         #     credential: "secret"
+
+      # Identifier (agent_name_hint and User-Agent prefix) for Sign in with ChatGPT (SIWC) OAuth and API requests.
+      signin-with-chatgpt-identifier: "CLIProxyAPI"
 
       # Default headers for Codex OAuth model requests.
       # These are used only for file-backed/OAuth Codex requests when the client

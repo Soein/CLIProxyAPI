@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"reflect"
@@ -699,6 +700,30 @@ func selectorContextForAvailableAuths(ctx context.Context, selector Selector, ro
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true)
+}
+
+func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(selector Selector, affinityCandidates []*Auth, routeModel string, now time.Time) map[string]struct{} {
+	affinity, ok := selector.(*SessionAffinitySelector)
+	if !ok || affinity == nil || !affinity.rebindOnQuotaOnly || len(affinityCandidates) == 0 {
+		return nil
+	}
+	if _, weighted := affinity.fallback.(*WeightedRoundRobinSelector); weighted {
+		affinityCandidates = positiveWeightAuths(affinityCandidates)
+	}
+	var authIDs map[string]struct{}
+	for _, candidate := range affinityCandidates {
+		if candidate == nil || candidate.ID == "" {
+			continue
+		}
+		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		if !isAuthBlockedByQuotaOrAuthForModel(candidate, checkModel, now) {
+			if authIDs == nil {
+				authIDs = make(map[string]struct{}, len(affinityCandidates))
+			}
+			authIDs[candidate.ID] = struct{}{}
+		}
+	}
+	return authIDs
 }
 
 func restoreModelCooldownErrorModel(err error, requestedModel string) error {
@@ -1578,6 +1603,58 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 
+// PublishIfRegistrationCurrent serializes the final model-registration
+// publication against identity mutations for this auth, then calls publish
+// only if the manager still holds auth with the same model-registration
+// inputs. It does not persist or clone auth state. publish must be fast and
+// must not re-enter the manager.
+func (m *Manager) PublishIfRegistrationCurrent(id string, registrationEpoch uint64, prefix, provider string, disabled bool, authKind string, attributes map[string]string, publish func() bool) bool {
+	if m == nil || id == "" || publish == nil {
+		return false
+	}
+	releaseMutation := m.lockAuthMutation(id)
+	defer releaseMutation()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	current, ok := m.auths[id]
+	matches := ok && current != nil && modelRegistrationInputsMatch(current, registrationEpoch, prefix, provider, disabled, authKind, attributes)
+	if !matches {
+		return false
+	}
+	return publish()
+}
+
+// UpdateIfRegistrationCurrent applies a plugin-returned auth update only
+// while the manager still holds the exact registration inputs the plugin
+// computation started from. It prevents an old plugin result from adopting
+// a removed or re-registered identity merely because its zero registration
+// epoch would otherwise inherit the current epoch during Update.
+func (m *Manager) UpdateIfRegistrationCurrent(ctx context.Context, base *Auth, updated *Auth) (*Auth, bool, error) {
+	if m == nil || base == nil || updated == nil || base.ID == "" || updated.ID != base.ID {
+		return nil, false, nil
+	}
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, base.ID)
+	if errMutation != nil {
+		return nil, false, errMutation
+	}
+	defer releaseMutation()
+	committedAuth, didCommit, errUpdate := m.updateInternalWithMutation(ctx, base, updated.Clone(), updateModeReplace, releaseMutation)
+	return committedAuth, errUpdate == nil && didCommit && committedAuth != nil, errUpdate
+}
+
+func modelRegistrationInputsMatch(current *Auth, registrationEpoch uint64, prefix, provider string, disabled bool, authKind string, attributes map[string]string) bool {
+	if current == nil {
+		return false
+	}
+	currentDisabled := current.Disabled || current.Status == StatusDisabled
+	return current.RegistrationEpoch == registrationEpoch &&
+		current.Prefix == prefix &&
+		current.Provider == provider &&
+		currentDisabled == disabled &&
+		current.AuthKind() == authKind &&
+		maps.Equal(current.Attributes, attributes)
+}
+
 // GetExecutionSessionAuthByID retrieves a Home runtime auth scoped to an execution session.
 func (m *Manager) GetExecutionSessionAuthByID(sessionID string, authID string) (*Auth, bool) {
 	sessionID = strings.TrimSpace(sessionID)
@@ -1804,6 +1881,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		ownership = nil
 		return true
 	}
+	affinitySelector, hasAffinity := m.Selector().(*SessionAffinitySelector)
+	trackTransientAffinity := hasAffinity && affinitySelector != nil && affinitySelector.rebindOnQuotaOnly
 	for {
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
@@ -1813,6 +1892,10 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		candidates := make([]*Auth, 0, len(m.auths))
+		var affinityCandidates []*Auth
+		if trackTransientAffinity {
+			affinityCandidates = make([]*Auth, 0, len(m.auths))
+		}
 		targetKey := canonicalSchedulingProvider(provider)
 		for _, candidate := range m.auths {
 			if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey || candidate.Disabled {
@@ -1827,10 +1910,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			if !eligibility.allows(candidate) {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
+			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 				continue
 			}
-			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			if trackTransientAffinity {
+				affinityCandidates = append(affinityCandidates, candidate)
+			}
+			if _, used := tried[candidate.ID]; used {
 				continue
 			}
 			candidates = append(candidates, candidate)
@@ -1843,6 +1929,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		candidateSnapshots := cloneAuthSlice(candidates)
+		affinitySnapshots := cloneAuthSlice(affinityCandidates)
 		m.mu.RUnlock()
 
 		var priorityAuths []*Auth
@@ -1879,6 +1966,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 				return nil, nil, errSelectorAvailable
 			}
 			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+			transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(selector, affinitySnapshots, model, time.Now())
+			selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 			selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 			if errPick != nil {
 				if isBuiltInSelector(selector) {

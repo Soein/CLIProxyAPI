@@ -1418,6 +1418,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			execReq := req
 			execReq.Model = upstreamModel
 			attemptCtx = syncMetadataSessionToContext(attemptCtx, creditsOpts.Metadata)
+			attemptCtx = withExecutionResultSeq(attemptCtx, m.nextExecutionSeq())
 			resp, errExec := m.executeWithDispatchAdmission(attemptCtx, c.executor, c.auth, execReq, creditsOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(attemptCtx, errExec)
 			if errors.Is(errExec, ErrDispatchAdmissionRejected) {

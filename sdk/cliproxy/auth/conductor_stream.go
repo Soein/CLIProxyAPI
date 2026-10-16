@@ -282,6 +282,7 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 		}
 		execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 		ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
+		ctx = withExecutionResultSeq(ctx, m.nextExecutionSeq())
 		startStream := time.Now()
 		streamResult, dispatchRelease, errStream := m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
@@ -309,6 +310,7 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 					didRefreshOnUnauthorized = true
 					ctx = newUpstreamAttemptContext(ctx)
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
+					ctx = withExecutionResultSeq(ctx, m.nextExecutionSeq())
 					startRetry := time.Now()
 					streamResult, dispatchRelease, errStream = m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
 					errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
@@ -399,6 +401,7 @@ func (m *Manager) executeStreamWithModelPoolAndAffinity(ctx context.Context, exe
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
 					ctx = newUpstreamAttemptContext(ctx)
+					ctx = withExecutionResultSeq(ctx, m.nextExecutionSeq())
 					startRetry := time.Now()
 					retryStream, retryRelease, retryErr := m.executeStreamWithDispatchAdmission(ctx, executor, auth, execReq, execOpts)
 					if errors.Is(retryErr, ErrDispatchAdmissionRejected) {
