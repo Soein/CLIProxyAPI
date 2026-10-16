@@ -335,6 +335,9 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					// Steering carries business input but must not inherit response.create defaults.
 					steerReq := req
 					steerReq.Payload = payload
+					if codexUseSIWC(auth) {
+						payload = thinking.StripConfigurationUpdates(payload)
+					}
 					payload = helps.NewPayloadFinalizer(e.cfg, "codex-websockets", thinking.ParseSuffix(req.Model).ModelName, "codex", "", payload, steerReq, opts)(payload)
 					payload, _ = sjson.SetBytes(payload, "type", "response.steer")
 					parent := gjson.GetBytes(payload, "previous_response_id").String()
@@ -392,7 +395,8 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						metadataMu.Unlock()
 					}
 					// Control frames bypass response.create translations and built-in defaults.
-					// Unknown fields and unsupported input are left to upstream validation.
+					// Except for SIWC configuration_update stripping, unknown fields and unsupported
+					// input are left to upstream validation.
 					if !cliproxyexecutor.WebsocketAuthEnabled(streamCtx, auth.ID) {
 						var toRelease *helps.CodexDuplexLease
 						metadataMu.Lock()
