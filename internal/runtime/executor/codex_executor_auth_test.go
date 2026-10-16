@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
 	fileauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -1311,5 +1314,423 @@ func assertCodexRefreshPatch(t *testing.T, before, refreshed *cliproxyauth.Auth,
 	}
 	if saved["refresh_token"] != wantOuter || saved["siwc"].(map[string]any)["refresh_token"] != wantSIWC || saved["use_siwc"] != false || saved["new_property"] != "keep" {
 		t.Fatalf("refresh patch changed an unrefreshed partition or configuration: %#v", saved)
+	}
+}
+
+func codexRefreshDiskFixture(path string) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{
+		ID: "codex.json", FileName: "codex.json", Provider: "codex",
+		Attributes: map[string]string{cliproxyauth.AttributePath: path},
+		Metadata: map[string]any{
+			"type": "codex", "access_token": "outer-snapshot-A", "refresh_token": "outer-refresh-A",
+			"expired": time.Now().Add(-time.Hour).Format(time.RFC3339), "note": "authoritative-note",
+			"use_siwc": true,
+			"siwc": map[string]any{
+				"access_token": "siwc-snapshot-A", "refresh_token": "siwc-refresh-A", "client_id": "oaiapp_fixture",
+				"expired": time.Now().Add(-time.Hour).Format(time.RFC3339),
+			},
+		},
+	}
+}
+
+func captureCodexRefreshRequests(t *testing.T, beforeRequest func(*http.Request)) *[]string {
+	t.Helper()
+	requests := make([]string, 0, 2)
+	previous := http.DefaultTransport
+	http.DefaultTransport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if errParse := req.ParseForm(); errParse != nil {
+			return nil, errParse
+		}
+		requests = append(requests, req.Form.Get("refresh_token"))
+		if beforeRequest != nil {
+			beforeRequest(req)
+		}
+		var payload map[string]any
+		switch req.URL.Path {
+		case "/oauth/token":
+			payload = map[string]any{
+				"access_token": "outer-refreshed-C", "refresh_token": "outer-refresh-C",
+				"id_token": makeTestCodexRefreshJWT("plus", "account"), "expires_in": 720000,
+			}
+		case "/api/accounts/oauth/token":
+			payload = map[string]any{
+				"access_token": "siwc-refreshed-C", "refresh_token": "siwc-refresh-C", "id_token": "siwc-id-C",
+				"expires_in": 3600, "scope": codexauth.SIWCScope,
+			}
+		default:
+			return nil, fmt.Errorf("unexpected refresh endpoint %s", req.URL.Path)
+		}
+		raw, errMarshal := json.Marshal(payload)
+		if errMarshal != nil {
+			return nil, errMarshal
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(raw)))}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	return &requests
+}
+
+func TestCodexExecutorRefreshRemoteSnapshotIgnoresMirror(t *testing.T) {
+	for _, source := range []string{"postgres", "postgresql", "database", "db", "git", "objectstore", "object-store", "memory", "config", "custom-remote", "versioned-file"} {
+		for _, mirror := range []string{"rotated-future", "corrupt", "directory", "missing"} {
+			t.Run(source+"/"+mirror, func(t *testing.T) {
+				baseDir := t.TempDir()
+				path := filepath.Join(baseDir, "codex.json")
+				auth := codexRefreshDiskFixture(path)
+				auth.Attributes[cliproxyauth.AttributeSourceBackend] = source
+				if source == "versioned-file" {
+					auth.Attributes[cliproxyauth.AttributeSourceBackend] = cliproxyauth.AuthSourceFile
+				}
+				if source == "versioned-file" || strings.HasPrefix(source, "postgre") || source == "database" || source == "db" {
+					auth.SetStoreGeneration(7)
+				}
+				before := auth.Clone()
+				var original []byte
+				switch mirror {
+				case "rotated-future":
+					disk := before.Clone().Metadata
+					disk["access_token"], disk["refresh_token"] = "outer-mirror-B", "outer-mirror-refresh-B"
+					disk["expired"] = time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)
+					disk["note"] = "untrusted-mirror-note"
+					siwc := disk["siwc"].(map[string]any)
+					siwc["access_token"], siwc["refresh_token"] = "siwc-mirror-B", "siwc-mirror-refresh-B"
+					siwc["expired"] = disk["expired"]
+					original, _ = json.Marshal(disk)
+				case "corrupt":
+					original = []byte("{corrupt-mirror")
+				case "directory":
+					if errMkdir := os.Mkdir(path, 0o700); errMkdir != nil {
+						t.Fatal(errMkdir)
+					}
+				}
+				if original != nil {
+					if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
+						t.Fatal(errWrite)
+					}
+				}
+				requests := captureCodexRefreshRequests(t, nil)
+				refreshed, errRefresh := NewCodexExecutor(&config.Config{AuthDir: baseDir}).Refresh(context.Background(), auth)
+				if errRefresh != nil {
+					t.Fatalf("authoritative snapshot refresh failed on %s mirror: %v", mirror, errRefresh)
+				}
+				if got := strings.Join(*requests, ","); got != "outer-refresh-A,siwc-refresh-A" {
+					t.Fatalf("refresh tokens = %q, want authoritative snapshot tokens A", got)
+				}
+				if refreshed.Metadata["access_token"] != "outer-refreshed-C" || refreshed.Metadata["siwc"].(map[string]any)["access_token"] != "siwc-refreshed-C" || refreshed.Metadata["note"] != "authoritative-note" {
+					t.Fatalf("refresh imported stale mirror metadata: %#v", refreshed.Metadata)
+				}
+				if refreshed.StoreGeneration() != before.StoreGeneration() || refreshed.CodexRefreshPatch == nil || !refreshed.CodexRefreshPatch.CanApplyTo(before.Metadata) {
+					t.Fatal("refresh lost the generation or patch required for subsequent CAS persistence")
+				}
+				assertCodexRefreshPatch(t, before, refreshed, true, true)
+				if original != nil {
+					got, errRead := os.ReadFile(path)
+					if errRead != nil || string(got) != string(original) {
+						t.Fatalf("refresh changed the remote store mirror: %q, %v", got, errRead)
+					}
+				}
+				if _, errLock := os.Stat(path + ".lock"); !os.IsNotExist(errLock) {
+					t.Fatalf("refresh touched a remote store lockfile: %v", errLock)
+				}
+				if mirror == "missing" {
+					if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+						t.Fatalf("refresh recreated a missing mirror: %v", errStat)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCodexExecutorRefreshFileRejectsEscapes(t *testing.T) {
+	for _, escape := range []string{"credential-symlink", "parent-symlink", "lockfile-symlink", "outside-candidate", "missing-outside-candidate"} {
+		t.Run(escape, func(t *testing.T) {
+			baseDir, outsideDir := t.TempDir(), t.TempDir()
+			path := filepath.Join(baseDir, "codex.json")
+			outsidePath := filepath.Join(outsideDir, "codex.json")
+			auth := codexRefreshDiskFixture(path)
+			original, _ := json.Marshal(auth.Metadata)
+			for _, target := range []string{path, outsidePath} {
+				if errWrite := os.WriteFile(target, original, 0o600); errWrite != nil {
+					t.Fatal(errWrite)
+				}
+			}
+			var errLink error
+			switch escape {
+			case "credential-symlink":
+				if errRemove := os.Remove(path); errRemove != nil {
+					t.Fatal(errRemove)
+				}
+				errLink = os.Symlink(outsidePath, path)
+			case "parent-symlink":
+				errLink = os.Symlink(outsideDir, filepath.Join(baseDir, "nested"))
+				auth.Attributes[cliproxyauth.AttributePath] = filepath.Join(baseDir, "nested", "codex.json")
+			case "lockfile-symlink":
+				errLink = os.Symlink(filepath.Join(outsideDir, "outside.lock"), path+".lock")
+			case "outside-candidate":
+				auth.Attributes[cliproxyauth.AttributePath] = outsidePath
+			case "missing-outside-candidate":
+				auth.Attributes[cliproxyauth.AttributePath] = filepath.Join(outsideDir, "missing.json")
+			}
+			if errLink != nil {
+				t.Skipf("symlink unavailable: %v", errLink)
+			}
+			requests := captureCodexRefreshRequests(t, nil)
+			if _, errRefresh := NewCodexExecutor(&config.Config{AuthDir: baseDir}).Refresh(context.Background(), auth); errRefresh == nil {
+				t.Error("Refresh accepted a path escaping AuthDir")
+			}
+			if len(*requests) != 0 {
+				t.Errorf("unsafe source reached OAuth: %v", *requests)
+			}
+			got, errRead := os.ReadFile(outsidePath)
+			if errRead != nil || string(got) != string(original) {
+				t.Errorf("outside credential changed: %q, %v", got, errRead)
+			}
+			entries, errReadDir := os.ReadDir(outsideDir)
+			if errReadDir != nil || len(entries) != 1 {
+				t.Errorf("outside credential/lockfile created: %v, %v", entries, errReadDir)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorRefreshFileParentSwapStaysWithinRoot(t *testing.T) {
+	baseDir, outsideDir := t.TempDir(), t.TempDir()
+	probe := filepath.Join(baseDir, "symlink-probe")
+	if errLink := os.Symlink(outsideDir, probe); errLink != nil {
+		t.Skipf("symlink unavailable: %v", errLink)
+	}
+	if errRemove := os.Remove(probe); errRemove != nil {
+		t.Fatal(errRemove)
+	}
+	parent := filepath.Join(baseDir, "nested")
+	if errMkdir := os.Mkdir(parent, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	path := filepath.Join(parent, "codex.json")
+	auth := codexRefreshDiskFixture(path)
+	original, _ := json.Marshal(auth.Metadata)
+	outsidePath := filepath.Join(outsideDir, "codex.json")
+	for _, target := range []string{path, outsidePath} {
+		if errWrite := os.WriteFile(target, original, 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+	swapped := false
+	captureCodexRefreshRequests(t, func(*http.Request) {
+		if swapped {
+			return
+		}
+		swapped = true
+		if errRename := os.Rename(parent, filepath.Join(baseDir, "original-parent")); errRename != nil {
+			t.Fatal(errRename)
+		}
+		if errLink := os.Symlink(outsideDir, parent); errLink != nil {
+			t.Fatalf("replace parent: %v", errLink)
+		}
+	})
+	if _, errRefresh := NewCodexExecutor(&config.Config{AuthDir: baseDir}).Refresh(context.Background(), auth); errRefresh == nil {
+		t.Error("Refresh accepted the outside parent installed during OAuth")
+	}
+	got, errRead := os.ReadFile(outsidePath)
+	if errRead != nil || string(got) != string(original) {
+		t.Fatalf("credential escaped the opened root: %q, %v", got, errRead)
+	}
+}
+
+func TestCodexExecutorRefreshFileRotationWithConfiguredAndAbsoluteRoot(t *testing.T) {
+	for _, source := range []string{"legacy", "file", "filesystem", "absolute-without-authdir"} {
+		t.Run(source, func(t *testing.T) {
+			baseDir := t.TempDir()
+			path := filepath.Join(baseDir, "codex.json")
+			auth := codexRefreshDiskFixture(path)
+			if source == "file" || source == "filesystem" {
+				auth.Attributes[cliproxyauth.AttributeSourceBackend] = source
+			}
+			if errWrite := codexauth.WriteJSONFileAtomic(path, auth.Metadata); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			before := auth.Clone()
+			requests := captureCodexRefreshRequests(t, nil)
+			cfg := &config.Config{AuthDir: baseDir}
+			if source == "absolute-without-authdir" {
+				cfg.AuthDir = ""
+			}
+			executor := NewCodexExecutor(cfg)
+			refreshed, errRefresh := executor.Refresh(context.Background(), auth)
+			if errRefresh != nil {
+				t.Fatal(errRefresh)
+			}
+			if got := strings.Join(*requests, ","); got != "outer-refresh-A,siwc-refresh-A" {
+				t.Fatalf("refresh tokens = %q, want both original tokens", got)
+			}
+			if _, errAgain := executor.Refresh(context.Background(), before); errAgain != nil {
+				t.Fatal(errAgain)
+			}
+			if len(*requests) != 2 {
+				t.Fatalf("stale caller repeated an already persisted rotation: %v", *requests)
+			}
+			raw, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			var saved map[string]any
+			if errJSON := json.Unmarshal(raw, &saved); errJSON != nil {
+				t.Fatal(errJSON)
+			}
+			if saved["access_token"] != "outer-refreshed-C" || saved["siwc"].(map[string]any)["access_token"] != "siwc-refreshed-C" || refreshed.Metadata["note"] != "authoritative-note" {
+				t.Fatalf("rooted refresh lost tokens or configuration: %#v", saved)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorRefreshRelativeAuthDirUsesRotatedDisk(t *testing.T) {
+	for _, source := range []string{"filename", "attribute-path", "attribute-source"} {
+		t.Run(source, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			if errMkdir := os.Mkdir("auths", 0o700); errMkdir != nil {
+				t.Fatal(errMkdir)
+			}
+			path := filepath.Join("auths", "codex.json")
+			auth := codexRefreshDiskFixture(path)
+			if source == "filename" {
+				delete(auth.Attributes, cliproxyauth.AttributePath)
+			} else if source == "attribute-source" {
+				delete(auth.Attributes, cliproxyauth.AttributePath)
+				auth.Attributes[cliproxyauth.AttributeSource] = path
+			}
+			disk := auth.Clone().Metadata
+			disk["access_token"], disk["refresh_token"] = "outer-rotated-B", "outer-refresh-B"
+			disk["expired"] = time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)
+			siwc := disk["siwc"].(map[string]any)
+			siwc["access_token"], siwc["refresh_token"] = "siwc-rotated-B", "siwc-refresh-B"
+			siwc["expired"] = disk["expired"]
+			if errWrite := codexauth.WriteJSONFileAtomic(path, disk); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			requests := captureCodexRefreshRequests(t, nil)
+			refreshed, errRefresh := NewCodexExecutor(&config.Config{AuthDir: "auths"}).Refresh(context.Background(), auth)
+			if errRefresh != nil {
+				t.Fatal(errRefresh)
+			}
+			if len(*requests) != 0 || refreshed.Metadata["access_token"] != "outer-rotated-B" || refreshed.Metadata["siwc"].(map[string]any)["access_token"] != "siwc-rotated-B" {
+				t.Fatalf("relative AuthDir missed disk rotation: calls=%v metadata=%#v", *requests, refreshed.Metadata)
+			}
+			if _, errLock := os.Stat(path + ".lock"); errLock != nil {
+				t.Fatalf("refresh did not lock the resolved credential: %v", errLock)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorRefreshPostgresCASPersistence(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("CLIPROXY_POSTGRES_TEST_DSN"))
+	if dsn == "" {
+		t.Skip("set CLIPROXY_POSTGRES_TEST_DSN to run the real PostgreSQL refresh test")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("cliproxy_codex_refresh_%d_%d", os.Getpid(), time.Now().UnixNano())
+	pgStore, errStore := store.NewPostgresStore(ctx, store.PostgresStoreConfig{DSN: dsn, Schema: schema, SpoolDir: t.TempDir()})
+	if errStore != nil {
+		t.Fatal(errStore)
+	}
+	t.Cleanup(func() {
+		if _, errDrop := pgStore.DB().ExecContext(context.Background(), `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); errDrop != nil {
+			t.Errorf("drop test schema: %v", errDrop)
+		}
+		if errClose := pgStore.Close(); errClose != nil {
+			t.Errorf("close PostgreSQL test store: %v", errClose)
+		}
+	})
+	if errSchema := pgStore.EnsureSchema(ctx); errSchema != nil {
+		t.Fatal(errSchema)
+	}
+	for _, mirror := range []string{"rotated-future", "corrupt"} {
+		for _, conflict := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/conflict=%t", mirror, conflict), func(t *testing.T) {
+				id := fmt.Sprintf("codex-%s-%t.json", mirror, conflict)
+				path := filepath.Join(pgStore.AuthDir(), id)
+				auth := codexRefreshDiskFixture(path)
+				auth.ID, auth.FileName = id, id
+				if _, generation, errCreate := pgStore.Restore(ctx, auth, 0); errCreate != nil || generation != 1 {
+					t.Fatalf("create authoritative snapshot A: generation=%d error=%v", generation, errCreate)
+				}
+				loaded, errLoad := pgStore.GetByID(ctx, id)
+				if errLoad != nil || loaded == nil {
+					t.Fatalf("load authoritative snapshot A: %v", errLoad)
+				}
+				if loaded.AuthSourceKind() != cliproxyauth.AuthSourcePostgres || loaded.StoreGeneration() != 1 {
+					t.Fatalf("invalid store snapshot contract: %#v", loaded)
+				}
+				if conflict {
+					newer := loaded.Clone()
+					newer.Metadata["note"] = "newer-authoritative-note"
+					if _, _, errSave := pgStore.SaveVersioned(ctx, newer, 1); errSave != nil {
+						t.Fatal(errSave)
+					}
+				}
+				original := []byte("{corrupt-mirror")
+				if mirror == "rotated-future" {
+					disk := loaded.Clone().Metadata
+					disk["access_token"], disk["refresh_token"] = "outer-mirror-B", "outer-mirror-refresh-B"
+					disk["expired"] = time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)
+					siwc := disk["siwc"].(map[string]any)
+					siwc["access_token"], siwc["refresh_token"] = "siwc-mirror-B", "siwc-mirror-refresh-B"
+					siwc["expired"] = disk["expired"]
+					original, _ = json.Marshal(disk)
+				}
+				if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
+					t.Fatal(errWrite)
+				}
+				if errRemove := os.Remove(path + ".lock"); errRemove != nil && !os.IsNotExist(errRemove) {
+					t.Fatal(errRemove)
+				}
+				requests := captureCodexRefreshRequests(t, nil)
+				refreshed, errRefresh := NewCodexExecutor(&config.Config{AuthDir: pgStore.AuthDir()}).Refresh(ctx, loaded)
+				if errRefresh != nil {
+					t.Fatal(errRefresh)
+				}
+				if got := strings.Join(*requests, ","); got != "outer-refresh-A,siwc-refresh-A" {
+					t.Fatalf("refresh used mirror credentials: %q", got)
+				}
+				if got, errRead := os.ReadFile(path); errRead != nil || string(got) != string(original) {
+					t.Fatalf("executor changed mirror before CAS: %s, %v", got, errRead)
+				}
+				if _, errLock := os.Stat(path + ".lock"); !os.IsNotExist(errLock) {
+					t.Fatalf("executor touched a PostgreSQL mirror lock: %v", errLock)
+				}
+				patch := refreshed.CodexRefreshPatch
+				_, generation, errSave := pgStore.SaveVersioned(ctx, refreshed, 1)
+				if conflict {
+					if !errors.Is(errSave, cliproxyauth.ErrAuthStoreConflict) || refreshed.CodexRefreshPatch != patch {
+						t.Fatalf("stale CAS did not preserve refresh result: %v", errSave)
+					}
+					if got, errRead := os.ReadFile(path); errRead != nil || string(got) != string(original) {
+						t.Fatalf("failed CAS changed mirror: %s, %v", got, errRead)
+					}
+				} else if errSave != nil || generation != 2 || refreshed.CodexRefreshPatch != nil {
+					t.Fatalf("persist refreshed C: generation=%d error=%v", generation, errSave)
+				}
+				persisted, errGet := pgStore.GetByID(ctx, id)
+				if errGet != nil || persisted == nil {
+					t.Fatalf("load CAS result: %v", errGet)
+				}
+				wantAccess, wantNote := "outer-refreshed-C", "authoritative-note"
+				if conflict {
+					wantAccess, wantNote = "outer-snapshot-A", "newer-authoritative-note"
+				}
+				if persisted.StoreGeneration() != 2 || persisted.Metadata["access_token"] != wantAccess || persisted.Metadata["note"] != wantNote {
+					t.Fatalf("wrong authoritative CAS result: %#v", persisted)
+				}
+				if !conflict {
+					raw, errRead := os.ReadFile(path)
+					var saved map[string]any
+					if errRead != nil || json.Unmarshal(raw, &saved) != nil || saved["access_token"] != "outer-refreshed-C" || saved["siwc"].(map[string]any)["access_token"] != "siwc-refreshed-C" {
+						t.Fatalf("committed mirror did not receive C: %s, %v", raw, errRead)
+					}
+				}
+			})
+		}
 	}
 }

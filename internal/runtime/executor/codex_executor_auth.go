@@ -90,45 +90,80 @@ func cloneSIWCMap(src map[string]any) map[string]any {
 	return dst
 }
 
-func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (string, error) {
-	if auth == nil {
-		return "", nil
+func openCodexAuthFile(cfg *config.Config, auth *cliproxyauth.Auth) (*os.Root, string, error) {
+	if auth == nil || auth.StoreGeneration() != 0 || auth.AuthSourceKind() != cliproxyauth.AuthSourceFile {
+		return nil, "", nil
+	}
+	// Remote and versioned stores persist the manager snapshot themselves;
+	// their local mirrors must never become credential inputs or refresh targets.
+	if backend := strings.ToLower(strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSourceBackend])); backend != "" && backend != cliproxyauth.AuthSourceFile && backend != "filesystem" {
+		return nil, "", nil
+	}
+	var authDir string
+	if cfg != nil {
+		authDir = strings.TrimSpace(cfg.AuthDir)
 	}
 	var candidates []string
-	if len(auth.Attributes) > 0 {
-		if p := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); p != "" {
-			candidates = append(candidates, p)
-		}
-		if s := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); s != "" && !strings.Contains(s, ":") {
-			candidates = append(candidates, s)
-		}
-	}
-	for _, name := range []string{strings.TrimSpace(auth.FileName), strings.TrimSpace(auth.ID)} {
-		if name == "" {
+	for _, key := range []string{cliproxyauth.AttributePath, cliproxyauth.AttributeSource} {
+		candidate := strings.TrimSpace(auth.Attributes[key])
+		if candidate == "" || (key == cliproxyauth.AttributeSource && (strings.Contains(candidate, ":") || strings.EqualFold(candidate, cliproxyauth.AuthSourceFile) || strings.EqualFold(candidate, "filesystem"))) {
 			continue
 		}
-		if filepath.IsAbs(name) {
+		// File synthesizers store full paths relative to the working directory;
+		// only FileName and ID are relative to AuthDir.
+		path, errAbs := filepath.Abs(candidate)
+		if errAbs != nil {
+			return nil, "", fmt.Errorf("codex executor: resolve credential attribute %s: %w", key, errAbs)
+		}
+		candidates = append(candidates, path)
+	}
+	for _, name := range []string{strings.TrimSpace(auth.FileName), strings.TrimSpace(auth.ID)} {
+		if name != "" && (filepath.IsAbs(name) || authDir != "") {
 			candidates = append(candidates, name)
-		} else if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
-			candidates = append(candidates, filepath.Join(strings.TrimSpace(cfg.AuthDir), name))
 		}
 	}
 	for _, candidate := range candidates {
-		info, errStat := os.Stat(candidate)
-		if errStat != nil {
-			if os.IsNotExist(errStat) {
+		baseDir := authDir
+		if baseDir == "" {
+			if !filepath.IsAbs(candidate) {
 				continue
 			}
-			return "", fmt.Errorf("codex executor: stat credential file %s: %w", candidate, errStat)
+			baseDir = filepath.Dir(candidate)
 		}
-		if !info.IsDir() {
-			return candidate, nil
+		path, errPath := cliproxyauth.ResolveAuthFilePath(baseDir, candidate)
+		if errPath != nil {
+			return nil, "", fmt.Errorf("codex executor: resolve credential file %s: %w", candidate, errPath)
+		}
+		absBase, errAbs := filepath.Abs(baseDir)
+		if errAbs != nil {
+			return nil, "", fmt.Errorf("codex executor: resolve credential directory: %w", errAbs)
+		}
+		name, errRel := filepath.Rel(absBase, path)
+		if errRel != nil {
+			return nil, "", fmt.Errorf("codex executor: resolve rooted credential name: %w", errRel)
+		}
+		root, errOpen := os.OpenRoot(absBase)
+		if errOpen != nil {
+			if os.IsNotExist(errOpen) {
+				continue
+			}
+			return nil, "", fmt.Errorf("codex executor: open credential directory: %w", errOpen)
+		}
+		info, errStat := root.Stat(name)
+		if errStat == nil && !info.IsDir() {
+			return root, name, nil
+		}
+		if errClose := root.Close(); errClose != nil {
+			return nil, "", fmt.Errorf("codex executor: close credential directory: %w", errClose)
+		}
+		if errStat != nil && !os.IsNotExist(errStat) {
+			return nil, "", fmt.Errorf("codex executor: stat credential file %s: %w", path, errStat)
 		}
 	}
-	return "", nil
+	return nil, "", nil
 }
 
-func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (outAuth *cliproxyauth.Auth, err error) {
 	log.Debugf("codex executor: refresh called")
 	var cfg *config.Config
 	if e != nil {
@@ -142,23 +177,27 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
 	}
 
-	diskPath, errPath := resolveCodexAuthDiskPath(cfg, auth)
+	root, name, errPath := openCodexAuthFile(cfg, auth)
 	if errPath != nil {
 		return nil, errPath
 	}
-	if diskPath != "" {
-		var outAuth *cliproxyauth.Auth
-		errLock := codexauth.WithFileLock(diskPath, func() error {
-			var errInner error
-			outAuth, errInner = e.refreshLocked(ctx, auth, diskPath, homeEnabled)
-			return errInner
-		})
-		return outAuth, errLock
+	if root == nil {
+		return e.refreshLocked(ctx, auth, nil, "", homeEnabled)
 	}
-	return e.refreshLocked(ctx, auth, "", homeEnabled)
+	defer func() {
+		if errClose := root.Close(); errClose != nil && err == nil {
+			err = fmt.Errorf("codex executor: close credential directory: %w", errClose)
+		}
+	}()
+	errLock := codexauth.WithFileLockRoot(root, name, func() error {
+		var errInner error
+		outAuth, errInner = e.refreshLocked(ctx, auth, root, name, homeEnabled)
+		return errInner
+	})
+	return outAuth, errLock
 }
 
-func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, diskPath string, homeEnabled bool) (*cliproxyauth.Auth, error) {
+func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, root *os.Root, name string, homeEnabled bool) (*cliproxyauth.Auth, error) {
 	var cfg *config.Config
 	if e != nil {
 		cfg = e.cfg
@@ -177,8 +216,9 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 	diskRotatedOuter := false
 	diskRotatedSIWC := false
 	var diskBaseline map[string]any
-	if diskPath != "" {
-		existingBytes, errRead := os.ReadFile(diskPath)
+	if root != nil {
+		diskPath := filepath.Join(root.Name(), name)
+		existingBytes, errRead := root.ReadFile(name)
 		if errRead != nil {
 			return nil, fmt.Errorf("codex executor: read credential file %s: %w", diskPath, errRead)
 		}
@@ -442,8 +482,9 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		clonedStorage.RefreshPatch = patch
 		auth.Storage = &clonedStorage
 	}
-	if diskPath != "" {
-		latestBytes, errReadLatest := os.ReadFile(diskPath)
+	if root != nil {
+		diskPath := filepath.Join(root.Name(), name)
+		latestBytes, errReadLatest := root.ReadFile(name)
 		if errReadLatest != nil {
 			return auth, fmt.Errorf("codex executor: re-read credential file %s before write: %w", diskPath, errReadLatest)
 		}
@@ -452,7 +493,7 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 			return auth, fmt.Errorf("codex executor: invalid credential JSON in %s before write: %w", diskPath, errUnmarshal)
 		}
 		mergedDisk := patch.Apply(latestDisk)
-		if errWrite := codexauth.WriteJSONFileAtomic(diskPath, mergedDisk); errWrite != nil {
+		if errWrite := codexauth.WriteJSONFileAtomicRoot(root, name, mergedDisk); errWrite != nil {
 			return auth, fmt.Errorf("codex executor: persist refreshed credentials to %s: %w", diskPath, errWrite)
 		}
 		auth.Metadata = mergedDisk
