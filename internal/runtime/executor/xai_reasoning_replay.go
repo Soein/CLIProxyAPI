@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -92,8 +93,17 @@ func xaiReasoningReplayEnabledForSource(from sdktranslator.Format) bool {
 		sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse)
 }
 
+func canonicalXAIReasoningReplaySignatureKey(rawSignature string) string {
+	sig := signature.SignaturePayloadWithoutProviderPrefix(strings.TrimSpace(rawSignature))
+	if info, err := signature.InspectGrokEncryptedContent(sig); err == nil && info.RouterSuffix != "" {
+		return stripRouterSuffix(sig, info.RouterSuffix)
+	}
+	return sig
+}
+
 func xaiInputHasReasoningEncryptedContent(inputItems []gjson.Result, encryptedContent string) bool {
-	if encryptedContent == "" {
+	canonicalTarget := canonicalXAIReasoningReplaySignatureKey(encryptedContent)
+	if canonicalTarget == "" {
 		return false
 	}
 	for _, item := range inputItems {
@@ -104,7 +114,7 @@ func xaiInputHasReasoningEncryptedContent(inputItems []gjson.Result, encryptedCo
 		if inputEncryptedContent.Type != gjson.String {
 			continue
 		}
-		if inputEncryptedContent.String() == encryptedContent {
+		if canonicalXAIReasoningReplaySignatureKey(inputEncryptedContent.String()) == canonicalTarget {
 			return true
 		}
 	}

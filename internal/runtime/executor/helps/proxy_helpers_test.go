@@ -2,9 +2,12 @@ package helps
 
 import (
 	"context"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 type proxyHelperRoundTripper struct{}
@@ -36,171 +40,6 @@ func TestNewProxyAwareHTTPClientReusesContextRoundTripper(t *testing.T) {
 
 	if client.Transport != roundTripper {
 		t.Fatalf("transport = %T (%p), want context RoundTripper %T (%p)", client.Transport, client.Transport, roundTripper, roundTripper)
-	}
-	fallbackProxyTransports.mu.Lock()
-	_, cached := fallbackProxyTransports.entries["proxy:"+contextOnlyProxy]
-	fallbackProxyTransports.mu.Unlock()
-	if cached {
-		t.Fatal("context RoundTripper path unexpectedly populated the fallback proxy cache")
-	}
-}
-
-func TestProxyTransportCacheSlidingTTL(t *testing.T) {
-	t.Parallel()
-
-	now := time.Unix(1_000, 0)
-	var builds int
-	var closed []*http.Transport
-	cache := newProxyTransportCache(10*time.Minute, 8, func() time.Time { return now }, func(transport *http.Transport) {
-		closed = append(closed, transport)
-	})
-	builder := func() (*http.Transport, error) {
-		builds++
-		return &http.Transport{}, nil
-	}
-
-	first, err := cache.getOrBuild("proxy-a", builder)
-	if err != nil {
-		t.Fatalf("first getOrBuild() error = %v", err)
-	}
-	now = now.Add(9 * time.Minute)
-	second, err := cache.getOrBuild("proxy-a", builder)
-	if err != nil {
-		t.Fatalf("second getOrBuild() error = %v", err)
-	}
-	now = now.Add(9 * time.Minute)
-	third, err := cache.getOrBuild("proxy-a", builder)
-	if err != nil {
-		t.Fatalf("third getOrBuild() error = %v", err)
-	}
-	if first != second || second != third || builds != 1 {
-		t.Fatalf("sliding TTL transports = %p, %p, %p; builds = %d, want one cached transport", first, second, third, builds)
-	}
-
-	now = now.Add(10 * time.Minute)
-	rebuilt, err := cache.getOrBuild("proxy-a", builder)
-	if err != nil {
-		t.Fatalf("expired getOrBuild() error = %v", err)
-	}
-	if rebuilt == first || builds != 2 {
-		t.Fatalf("expired transport = %p, first = %p, builds = %d; want rebuilt transport", rebuilt, first, builds)
-	}
-	if len(closed) != 1 || closed[0] != first {
-		t.Fatalf("closed transports = %p, want expired transport %p", closed, first)
-	}
-}
-
-func TestProxyTransportCacheEvictsLeastRecentlyUsedAtCapacity(t *testing.T) {
-	t.Parallel()
-
-	now := time.Unix(2_000, 0)
-	var closed []*http.Transport
-	cache := newProxyTransportCache(time.Hour, 2, func() time.Time { return now }, func(transport *http.Transport) {
-		closed = append(closed, transport)
-	})
-	build := func() (*http.Transport, error) { return &http.Transport{}, nil }
-
-	first, _ := cache.getOrBuild("first", build)
-	now = now.Add(time.Minute)
-	second, _ := cache.getOrBuild("second", build)
-	now = now.Add(time.Minute)
-	if _, err := cache.getOrBuild("first", build); err != nil {
-		t.Fatalf("refresh first getOrBuild() error = %v", err)
-	}
-	now = now.Add(time.Minute)
-	third, err := cache.getOrBuild("third", build)
-	if err != nil {
-		t.Fatalf("third getOrBuild() error = %v", err)
-	}
-
-	if third == first || third == second {
-		t.Fatal("new cache entry unexpectedly reused an existing transport")
-	}
-	if len(closed) != 1 || closed[0] != second {
-		t.Fatalf("closed transports = %p, want least recently used transport %p", closed, second)
-	}
-	cache.mu.Lock()
-	_, hasFirst := cache.entries["first"]
-	_, hasSecond := cache.entries["second"]
-	_, hasThird := cache.entries["third"]
-	cache.mu.Unlock()
-	if !hasFirst || hasSecond || !hasThird {
-		t.Fatalf("cache keys: first=%t second=%t third=%t, want true false true", hasFirst, hasSecond, hasThird)
-	}
-}
-
-func TestProxyTransportCacheConcurrentMissBuildsOnce(t *testing.T) {
-	t.Parallel()
-
-	cache := newProxyTransportCache(time.Hour, 8, time.Now, func(*http.Transport) {})
-	want := &http.Transport{}
-	var builds atomic.Int32
-	builderStarted := make(chan struct{})
-	releaseBuilder := make(chan struct{})
-	builder := func() (*http.Transport, error) {
-		if builds.Add(1) == 1 {
-			close(builderStarted)
-		}
-		<-releaseBuilder
-		return want, nil
-	}
-
-	const callers = 64
-	results := make(chan *http.Transport, callers)
-	errs := make(chan error, callers)
-	var wg sync.WaitGroup
-	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			transport, err := cache.getOrBuild("shared", builder)
-			results <- transport
-			errs <- err
-		}()
-	}
-	<-builderStarted
-	close(releaseBuilder)
-	wg.Wait()
-	close(results)
-	close(errs)
-
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("getOrBuild() error = %v", err)
-		}
-	}
-	for transport := range results {
-		if transport != want {
-			t.Fatalf("transport = %p, want %p", transport, want)
-		}
-	}
-	if got := builds.Load(); got != 1 {
-		t.Fatalf("builder calls = %d, want 1", got)
-	}
-}
-
-func TestProxyTransportCacheClosesOutsideLock(t *testing.T) {
-	t.Parallel()
-
-	now := time.Unix(3_000, 0)
-	var cache *proxyTransportCache
-	closedOutsideLock := false
-	cache = newProxyTransportCache(time.Minute, 1, func() time.Time { return now }, func(*http.Transport) {
-		if cache.mu.TryLock() {
-			closedOutsideLock = true
-			cache.mu.Unlock()
-		}
-	})
-	build := func() (*http.Transport, error) { return &http.Transport{}, nil }
-	if _, err := cache.getOrBuild("first", build); err != nil {
-		t.Fatalf("first getOrBuild() error = %v", err)
-	}
-	now = now.Add(time.Minute)
-	if _, err := cache.getOrBuild("second", build); err != nil {
-		t.Fatalf("second getOrBuild() error = %v", err)
-	}
-	if !closedOutsideLock {
-		t.Fatal("evicted transport was closed while cache mutex was held")
 	}
 }
 
@@ -269,87 +108,34 @@ func TestNewProxyAwareHTTPClientInvalidProxyFallsBackToDefaultTransport(t *testi
 	}
 }
 
-func TestNewProxyAwareHTTPClientReusesFallbackProxyTransport(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "  http://shared-proxy.example.com:8080  "}}
-	first := NewProxyAwareHTTPClient(context.Background(), cfg, nil, 0)
-	second := NewProxyAwareHTTPClient(context.Background(), cfg, nil, 0)
-
-	if first.Transport == nil || first.Transport != second.Transport {
-		t.Fatalf("transports = %p and %p, want the same cached transport", first.Transport, second.Transport)
-	}
-}
-
-func TestNewProxyAwareHTTPClientIsolatesFallbackProxyTransports(t *testing.T) {
-	t.Parallel()
-
-	first := NewProxyAwareHTTPClient(
-		context.Background(),
-		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://first-proxy.example.com:8080"}},
-		nil,
-		0,
-	)
-	second := NewProxyAwareHTTPClient(
-		context.Background(),
-		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://second-proxy.example.com:8080"}},
-		nil,
-		0,
-	)
-
-	if first.Transport == second.Transport {
-		t.Fatalf("transports = %p and %p, want different transports for different proxies", first.Transport, second.Transport)
-	}
-}
-
-func TestNewProxyAwareHTTPClientConcurrentlyReusesFallbackProxyTransport(t *testing.T) {
-	t.Parallel()
-
-	const callers = 64
-	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://concurrent-proxy.example.com:8080"}}
-	transports := make(chan http.RoundTripper, callers)
-	var wg sync.WaitGroup
-
-	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			client := NewProxyAwareHTTPClient(context.Background(), cfg, nil, 0)
-			transports <- client.Transport
-		}()
-	}
-
-	wg.Wait()
-	close(transports)
-
-	var want http.RoundTripper
-	for transport := range transports {
-		if want == nil {
-			want = transport
-			continue
-		}
-		if transport != want {
-			t.Fatalf("transport = %p, want cached transport %p", transport, want)
-		}
-	}
-}
-
-func TestNewProxyAwareHTTPClientReusesDirectTransport(t *testing.T) {
-	t.Parallel()
-
-	auth := &cliproxyauth.Auth{ProxyURL: "direct"}
-	first := NewProxyAwareHTTPClient(context.Background(), nil, auth, 0)
-	second := NewProxyAwareHTTPClient(context.Background(), nil, auth, 0)
-
-	if first.Transport == nil || first.Transport != second.Transport {
-		t.Fatalf("transports = %p and %p, want the same cached direct transport", first.Transport, second.Transport)
-	}
-	transport, ok := first.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("transport type = %T, want *http.Transport", first.Transport)
-	}
-	if transport.Proxy != nil {
-		t.Fatal("expected cached direct transport to disable proxy function")
+func TestNewProxyAwareHTTPClientCredentialPoolModes(t *testing.T) {
+	for _, mode := range []string{"default", "disabled", "enabled"} {
+		t.Run(mode, func(t *testing.T) {
+			ResetProxyTransports()
+			t.Cleanup(ResetProxyTransports)
+			auth := &cliproxyauth.Auth{ID: "key-a", ProxyURL: "direct"}
+			if mode != "default" {
+				enabled := mode == "enabled"
+				auth.ProxyConnectionPool = &cliproxyauth.ProxyConnectionPoolOverride{Enabled: &enabled}
+			}
+			first := NewProxyAwareHTTPClient(context.Background(), nil, auth, 0)
+			second := NewProxyAwareHTTPClient(context.Background(), nil, auth, 0)
+			t.Cleanup(first.CloseIdleConnections)
+			t.Cleanup(second.CloseIdleConnections)
+			if first.Transport == nil || second.Transport == nil {
+				t.Fatal("direct transport missing")
+			}
+			if got := first.Transport == second.Transport; got != (mode == "enabled") {
+				t.Fatalf("transport reused = %t for %s pool", got, mode)
+			}
+			otherAuth := auth.Clone()
+			otherAuth.ID = "key-b"
+			other := NewProxyAwareHTTPClient(context.Background(), nil, otherAuth, 0)
+			t.Cleanup(other.CloseIdleConnections)
+			if first.Transport == other.Transport {
+				t.Fatal("different credentials shared a transport")
+			}
+		})
 	}
 }
 
@@ -486,4 +272,128 @@ type roundTripperFunc func(req *http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestProxyConnectionPoolReuse(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		enabled         bool
+		wantConnections int
+	}{{"disabled", false, 2}, {"enabled", true, 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ResetProxyTransports()
+			t.Cleanup(ResetProxyTransports)
+			var connections atomic.Int32
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) }))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			server.Start()
+			defer server.Close()
+			cfg := testConfig()
+			auth := &cliproxyauth.Auth{ProxyURL: "direct"}
+			if tc.enabled {
+				auth.ProxyConnectionPool = poolEnabled()
+			}
+			for i := 0; i < 2; i++ {
+				client := NewProxyAwareHTTPClient(context.Background(), cfg, auth, 0)
+				resp, err := client.Get(server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = io.Copy(io.Discard, resp.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = resp.Body.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if !tc.enabled {
+					client.CloseIdleConnections()
+				}
+			}
+			if got := connections.Load(); got != int32(tc.wantConnections) {
+				t.Fatalf("connections = %d, want %d", got, tc.wantConnections)
+			}
+		})
+	}
+}
+
+func TestProxyConnectionPoolSettingsIsolation(t *testing.T) {
+	enabled := true
+	maxIdle := 4
+	cfg := testConfig()
+	auth := poolAuth("settings", &cliproxyauth.ProxyConnectionPoolOverride{Enabled: &enabled, IdleConnTimeout: "15s", MaxIdleConnsPerHost: &maxIdle})
+	defer ResetProxyTransports()
+	first := pooledProxyTransport("direct", cfg, auth)
+	if first == nil || first.IdleConnTimeout != 15*time.Second || first.MaxIdleConnsPerHost != 4 {
+		t.Fatalf("unexpected transport: %+v", first)
+	}
+	if pooledProxyTransport("direct", cfg, auth) != first {
+		t.Fatal("transport not reused")
+	}
+	auth.ProxyConnectionPool.IdleConnTimeout = "20s"
+	if pooledProxyTransport("direct", cfg, auth) == first {
+		t.Fatal("different settings reused transport")
+	}
+	if pooledProxyTransport("http://localhost:1234", cfg, auth) == first {
+		t.Fatal("different proxies reused transport")
+	}
+	ResetProxyTransports()
+	if pooledProxyTransport("direct", cfg, auth) == first {
+		t.Fatal("reset did not remove transport")
+	}
+}
+
+func TestProxyConnectionPoolAuthenticatedProxyIsolation(t *testing.T) {
+	ResetProxyTransports()
+	t.Cleanup(ResetProxyTransports)
+	cfg := testConfig()
+	auth := poolOptInAuth("credential-url")
+
+	first := pooledProxyTransport("http://user:old-secret@localhost:1234", cfg, auth)
+	second := pooledProxyTransport("http://user:old-secret@localhost:1234", cfg, auth)
+	if first == nil || second != first {
+		t.Fatal("identical authenticated proxy must reuse its pool")
+	}
+	rotated := pooledProxyTransport("http://user:new-secret@localhost:1234", cfg, auth)
+	if rotated == nil || rotated == first {
+		t.Fatal("different proxy credentials on the same host must not share a pool")
+	}
+	socks := pooledProxyTransport("socks5://user:old-secret@localhost:1234", cfg, auth)
+	if socks == nil || socks == first || pooledProxyTransport("socks5://user:old-secret@localhost:1234", cfg, auth) != socks {
+		t.Fatal("authenticated socks5 proxy must pool per scheme and credential")
+	}
+	setting, err := proxyutil.Parse("http://user:old-secret@localhost:1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheKey, label := proxyPoolCacheTarget(setting)
+	if strings.Contains(cacheKey, "old-secret") || strings.Contains(label, "old-secret") {
+		t.Fatalf("cache target leaked proxy secret: key=%q label=%q", cacheKey, label)
+	}
+}
+func TestProxyConnectionPoolCustomDefaultTransportDeclinesPooling(t *testing.T) {
+	ResetProxyTransports()
+	t.Cleanup(ResetProxyTransports)
+
+	oldDefault := http.DefaultTransport
+	defer func() { http.DefaultTransport = oldDefault }()
+
+	customRT := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200}, nil
+	})
+	http.DefaultTransport = customRT
+
+	cfg := testConfig()
+	auth := poolOptInAuth("custom-default")
+
+	// With empty proxy-url, pooling must be declined because http.DefaultTransport
+	// cannot be cloned into *http.Transport.
+	client := NewProxyAwareHTTPClient(context.Background(), cfg, auth, 0)
+	if client.Transport != nil {
+		t.Fatalf("client.Transport = %T, want nil so client uses http.DefaultTransport", client.Transport)
+	}
 }

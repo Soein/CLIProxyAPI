@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -72,6 +73,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
+				return
+			}
+			if errors.Is(errUpload, errInvalidAuthFile) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errUpload.Error()})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
@@ -130,7 +135,11 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidAuthFile) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -301,8 +310,10 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
+	release := h.beginSIWCFileMutation(ctx, dst)
+	defer release()
 	releaseFile := authfilelock.Lock(dst)
-	errWrite := os.WriteFile(dst, data, 0o600)
+	errWrite := h.writeAuthFileBytes(dst, data, auth)
 	releaseFile()
 	if errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
@@ -316,6 +327,27 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		}
 	}
 	return nil
+}
+
+func (h *Handler) writeAuthFileBytes(dst string, data []byte, auth *coreauth.Auth) error {
+	if h.shouldLockCodexAuthFile(auth) {
+		return codex.WithFileLock(dst, func() error {
+			return os.WriteFile(dst, data, 0o600)
+		})
+	}
+	return os.WriteFile(dst, data, 0o600)
+}
+
+func (h *Handler) shouldLockCodexAuthFile(auth *coreauth.Auth) bool {
+	if coreauth.IsCodexAuthRecord(auth) {
+		return true
+	}
+	if h != nil && h.authManager != nil && auth != nil && auth.ID != "" {
+		if existing, ok := h.authManager.GetByID(auth.ID); ok && coreauth.IsCodexAuthRecord(existing) {
+			return true
+		}
+	}
+	return false
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
@@ -406,6 +438,8 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 			targetPath = abs
 		}
 	}
+	release := h.beginSIWCFileMutation(ctx, targetPath)
+	defer release()
 
 	// Cluster mode (PG-backed token store) uploads land on whichever node
 	// served the upload request, but DELETE requests can hit any node via
@@ -511,12 +545,29 @@ func (h *Handler) authIDForPath(path string) string {
 }
 
 func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []byte) error {
+	return h.registerAuthFromFileWithID(ctx, path, data, "")
+}
+
+func (h *Handler) registerAuthFromFileWithID(ctx context.Context, path string, data []byte, preferredID string) error {
 	if h.authManager == nil {
 		return nil
 	}
 	auth, err := h.buildAuthFromFileData(path, data)
 	if err != nil {
 		return err
+	}
+	if trimmedID := strings.TrimSpace(preferredID); trimmedID != "" && auth != nil && auth.ID != trimmedID {
+		auth.ID = trimmedID
+		if existing, ok := h.authManager.GetByID(trimmedID); ok && existing != nil {
+			auth.CreatedAt = existing.CreatedAt
+			if !coreauth.CredentialsChanged(existing, auth) {
+				if auth.LastRefreshedAt.IsZero() {
+					auth.LastRefreshedAt = existing.LastRefreshedAt
+				}
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+			}
+			auth.Runtime = existing.Runtime
+		}
 	}
 	return h.upsertAuthRecord(ctx, auth)
 }
@@ -534,9 +585,13 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	metadata := make(map[string]any)
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid auth file: %w", err)
+		return nil, fmt.Errorf("%w: %w", errInvalidAuthFile, err)
 	}
 	coreauth.NormalizeCredentialMetadata(metadata)
+	// Loading tolerates invalid exclusion rules, so reject them here before anything is persisted.
+	if _, errExcluded := synthesizer.ExtractExcludedModelsFromMetadata(metadata); errExcluded != nil {
+		return nil, fmt.Errorf("%w: %w", errInvalidAuthFile, errExcluded)
+	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
@@ -561,7 +616,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		}
 		generated, errSynthesize := synthesizer.SynthesizeAuthFile(sctx, path, data)
 		if errSynthesize != nil {
-			return nil, fmt.Errorf("invalid auth file: %w", errSynthesize)
+			return nil, fmt.Errorf("%w: %w", errInvalidAuthFile, errSynthesize)
 		}
 		if len(generated) > 0 && generated[0] != nil {
 			auth = generated[0].Clone()
@@ -590,10 +645,12 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
 			auth.CreatedAt = existing.CreatedAt
-			if !hasLastRefresh {
-				auth.LastRefreshedAt = existing.LastRefreshedAt
+			if !coreauth.CredentialsChanged(existing, auth) {
+				if !hasLastRefresh {
+					auth.LastRefreshedAt = existing.LastRefreshedAt
+				}
+				auth.NextRefreshAfter = existing.NextRefreshAfter
 			}
-			auth.NextRefreshAfter = existing.NextRefreshAfter
 			auth.Runtime = existing.Runtime
 		}
 	}

@@ -43,20 +43,11 @@ func expandClaudeResponsesCompaction(req *cliproxyexecutor.Request, opts *clipro
 }
 
 func claudeResponsesCompactionRequested(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
-	return opts.Alt == "responses/compact" ||
-		helps.HasResponsesCompactionTrigger(req.Payload) ||
-		helps.HasResponsesCompactionTrigger(opts.OriginalRequest)
+	return opts.Alt == "responses/compact" || helps.HasResponsesCompactionTriggerRequest(req, opts)
 }
 
 func claudeCompactionSourcePayload(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) []byte {
-	payload := req.Payload
-	if !helps.HasResponsesCompactionTrigger(payload) && helps.HasResponsesCompactionTrigger(opts.OriginalRequest) {
-		payload = opts.OriginalRequest
-	}
-	if len(payload) == 0 && len(opts.OriginalRequest) > 0 {
-		payload = opts.OriginalRequest
-	}
-	return payload
+	return helps.ResponsesCompactionSourcePayload(req, opts)
 }
 
 func (e *ClaudeExecutor) executeClaudeCompaction(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

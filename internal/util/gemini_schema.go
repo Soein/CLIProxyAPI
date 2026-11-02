@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,18 +162,17 @@ func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
 		return len(jsonStr) <= maxInlineLocalRefOutputBytes
 	}
 
-	// Phase 0: Normalize malformed schemas (e.g. bare property maps and boolean required from MCP tools)
-	if !apply(func(schema string) string {
-		return normalizeMalformedSchemaObjects(schema, options.addMissingArrayItems)
-	}) {
+	// Phase 0: Defer inferred container types and array placeholders until references and
+	// conjunctions have supplied their own declarations.
+	if !apply(normalizeMalformedSchemaObjects) || !apply(NormalizeJSONSchemaNumericConstraints) {
 		return fallback
 	}
 
-	// Phase 1: Convert and add hints
-	if options.antigravitySemantics {
-		if !apply(inlineLocalRefs) {
-			return fallback
-		}
+	// Phase 1: Every route strips definitions later, so expand references before cleanup.
+	if !apply(func(schema string) string {
+		return inlineLocalRefsRooted(schema, options.preserveStandardConstraints, false, true)
+	}) {
+		return fallback
 	}
 	if !apply(func(schema string) string { return convertRefsToHints(schema, options.antigravitySemantics) }) ||
 		!apply(convertConstToEnum) ||
@@ -195,19 +195,25 @@ func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
 		}
 	}
 
-	// Phase 2: Flatten complex structures
-	if !apply(mergeConditionals) || !apply(mergeAllOf) {
+	// Phase 2: Preserve complete conjunction scopes on the standard JSON Schema carrier.
+	preserveConjunctions := options.preserveStandardConstraints && hasSchemaConjunction(jsonStr)
+	if !apply(mergeConditionals) {
 		return fallback
 	}
-	if options.flattenUnions {
-		if !apply(func(schema string) string {
-			return flattenAnyOfOneOf(schema, options.preserveStandardConstraints, options.flattenMultiBranchUnions)
-		}) {
+	if !options.preserveStandardConstraints && !apply(mergeAllOf) {
+		return fallback
+	}
+	if !preserveConjunctions {
+		if options.flattenUnions {
+			if !apply(func(schema string) string {
+				return flattenAnyOfOneOf(schema, options.preserveStandardConstraints, options.flattenMultiBranchUnions)
+			}) {
+				return fallback
+			}
+		}
+		if !apply(func(schema string) string { return flattenTypeArrays(schema, options.antigravitySemantics) }) {
 			return fallback
 		}
-	}
-	if !apply(func(schema string) string { return flattenTypeArrays(schema, options.antigravitySemantics) }) {
-		return fallback
 	}
 
 	// Phase 3: Cleanup
@@ -227,14 +233,11 @@ func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
 			return fallback
 		}
 	}
-	if !apply(cleanupRequiredFields) {
-		return fallback
-	}
-	if !apply(sanitizeArrayItems) {
-		return fallback
-	}
-	if !apply(sanitizeObjectProperties) {
-		return fallback
+	if !preserveConjunctions {
+		if !apply(cleanupRequiredFields) || !apply(sanitizeObjectProperties) ||
+			!apply(func(schema string) string { return sanitizeArrayItems(schema, options.addMissingArrayItems) }) {
+			return fallback
+		}
 	}
 	// Phase 4: Add placeholder for empty object schemas (Claude VALIDATED mode requirement)
 	if options.addPlaceholder {
@@ -433,10 +436,10 @@ func sanitizeObjectProperties(jsonStr string) string {
 	return jsonStr
 }
 
-// sanitizeArrayItems ensures that any schema node declaring "items" has "type": "array".
-// Gemini's protobuf validator enforces a strict field predicate on items ($type == Type.ARRAY);
-// if type is missing, it is inferred as array; if type is explicitly a non-array, items is removed.
-func sanitizeArrayItems(jsonStr string) string {
+// sanitizeArrayItems normalizes native Schema arrays and supplies missing items placeholders.
+// The caller skips this pass for JSON Schema conjunctions, where element and instance types
+// may be constrained elsewhere and synthesizing local fields can make the intersection impossible.
+func sanitizeArrayItems(jsonStr string, addMissing bool) string {
 	paths := findPaths(jsonStr, "items")
 	sortByDepth(paths)
 	for _, p := range paths {
@@ -452,6 +455,23 @@ func sanitizeArrayItems(jsonStr string) string {
 		} else if !strings.EqualFold(t, "array") {
 			jsonStr, _ = sjson.Delete(jsonStr, p)
 		}
+	}
+
+	if !addMissing {
+		return jsonStr
+	}
+	typePaths := findPaths(jsonStr, "type")
+	sortByDepth(typePaths)
+	for _, p := range typePaths {
+		parentPath := trimSuffix(p, ".type")
+		if isPropertyDefinition(parentPath) || !isArrayDeclaredType(gjson.Get(jsonStr, p).Value()) {
+			continue
+		}
+		if gjson.Get(jsonStr, joinPath(parentPath, "items")).Exists() || gjson.Get(jsonStr, joinPath(parentPath, "$ref")).Exists() {
+			continue
+		}
+		updated, _ := sjson.SetRawBytes([]byte(jsonStr), joinPath(parentPath, "items"), []byte(`{"type":"string"}`))
+		jsonStr = string(updated)
 	}
 	return jsonStr
 }
@@ -546,8 +566,8 @@ func removePlaceholderFields(jsonStr string) string {
 // certain MCP tool definitions (e.g. Asana MCP server):
 // 1. Bare property maps missing the "type": "object" and "properties": {...} wrappers are wrapped.
 // 2. Boolean "required": true on property definitions are stripped and promoted to the parent's "required" array.
-// 3. Tool array schemas missing "items" receive a string item schema required by Gemini and Antigravity.
-func normalizeMalformedSchemaObjects(jsonStr string, addMissingArrayItems bool) string {
+// 3. Boolean true subschemas are normalized to empty schema objects.
+func normalizeMalformedSchemaObjects(jsonStr string) string {
 	if jsonStr == "" {
 		return jsonStr
 	}
@@ -571,7 +591,7 @@ func normalizeMalformedSchemaObjects(jsonStr string, addMissingArrayItems bool) 
 	// If wrapped in single-key {"schema": ...} by cleanNestedSchema, unwrap, repair, and re-wrap.
 	if len(rootMap) == 1 {
 		if innerSchema, ok := rootMap["schema"].(map[string]any); ok {
-			repairedInner, modified := repairSchemaNode(innerSchema, addMissingArrayItems)
+			repairedInner, modified := repairSchemaNode(innerSchema)
 			if !modified {
 				return jsonStr
 			}
@@ -589,7 +609,7 @@ func normalizeMalformedSchemaObjects(jsonStr string, addMissingArrayItems bool) 
 		}
 	}
 
-	repaired, modified := repairSchemaNode(rootMap, addMissingArrayItems)
+	repaired, modified := repairSchemaNode(rootMap)
 	if !modified {
 		return jsonStr
 	}
@@ -684,7 +704,7 @@ func isAPIRequestDocument(m map[string]any) bool {
 	return false
 }
 
-func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[string]any, bool) {
+func repairSchemaNode(node map[string]any) (map[string]any, bool) {
 	if node == nil {
 		return nil, false
 	}
@@ -710,7 +730,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 		}
 
 		if len(bareProps) > 0 {
-			repairedProps, promotedReqs, _ := repairPropertyMap(bareProps, addMissingArrayItems)
+			repairedProps, promotedReqs, _ := repairPropertyMap(bareProps)
 			for k := range bareProps {
 				delete(clone, k)
 			}
@@ -740,13 +760,10 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 		}
 	}
 
-	// 2. If node has a "properties" map, recursively repair all properties inside it
+	// 2. Repair declared properties without inferring a type before refs are expanded.
+	// Final sanitization handles native object and array schemas once refs and conjunctions are resolved.
 	if propsVal, ok := clone["properties"].(map[string]any); ok {
-		if _, hasType := clone["type"]; !hasType {
-			clone["type"] = "object"
-			modified = true
-		}
-		repairedProps, promotedReqs, propsMod := repairPropertyMap(propsVal, addMissingArrayItems)
+		repairedProps, promotedReqs, propsMod := repairPropertyMap(propsVal)
 		if propsMod {
 			clone["properties"] = repairedProps
 			modified = true
@@ -759,31 +776,15 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 		}
 	}
 
-	// Gemini and Antigravity reject tool array schemas without an items definition,
-	// and reject tool schemas with items whose type is not ARRAY.
-	if addMissingArrayItems {
-		if isArrayDeclaredType(clone["type"]) {
-			if _, hasItems := clone["items"]; !hasItems {
-				clone["items"] = map[string]any{"type": "string"}
-				modified = true
-			}
-		} else if _, hasItems := clone["items"]; hasItems {
-			if clone["type"] == nil || clone["type"] == "" {
-				clone["type"] = "array"
-				modified = true
-			}
-		}
-	}
-
 	// 3. Recurse into all other standard schema containers
 	if itemsVal, ok := clone["items"].(map[string]any); ok {
-		repairedItems, itemsMod := repairSchemaNode(itemsVal, addMissingArrayItems)
+		repairedItems, itemsMod := repairSchemaNode(itemsVal)
 		if itemsMod {
 			clone["items"] = repairedItems
 			modified = true
 		}
 	} else if itemsList, ok := clone["items"].([]any); ok {
-		repairedList, listMod := repairSchemaList(itemsList, addMissingArrayItems)
+		repairedList, listMod := repairSchemaList(itemsList)
 		if listMod {
 			clone["items"] = repairedList
 			modified = true
@@ -794,7 +795,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 	}
 
 	if addProps, ok := clone["additionalProperties"].(map[string]any); ok {
-		repairedAddProps, addPropsMod := repairSchemaNode(addProps, addMissingArrayItems)
+		repairedAddProps, addPropsMod := repairSchemaNode(addProps)
 		if addPropsMod {
 			clone["additionalProperties"] = repairedAddProps
 			modified = true
@@ -802,7 +803,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 	}
 
 	if patProps, ok := clone["patternProperties"].(map[string]any); ok {
-		repairedPatProps, _, patMod := repairPropertyMap(patProps, addMissingArrayItems)
+		repairedPatProps, _, patMod := repairPropertyMap(patProps)
 		if patMod {
 			clone["patternProperties"] = repairedPatProps
 			modified = true
@@ -811,7 +812,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 
 	for _, key := range []string{"if", "then", "else", "not", "contains", "propertyNames", "unevaluatedProperties", "unevaluatedItems", "contentSchema", "additionalItems"} {
 		if subVal, ok := clone[key].(map[string]any); ok {
-			repairedSub, subMod := repairSchemaNode(subVal, addMissingArrayItems)
+			repairedSub, subMod := repairSchemaNode(subVal)
 			if subMod {
 				clone[key] = repairedSub
 				modified = true
@@ -824,7 +825,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 
 	for _, key := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
 		if listVal, ok := clone[key].([]any); ok {
-			repairedList, listMod := repairSchemaList(listVal, addMissingArrayItems)
+			repairedList, listMod := repairSchemaList(listVal)
 			if listMod {
 				clone[key] = repairedList
 				modified = true
@@ -838,7 +839,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 			defsModified := false
 			for dk, dv := range defsVal {
 				if defMap, ok := dv.(map[string]any); ok {
-					repairedDef, defMod := repairSchemaNode(defMap, addMissingArrayItems)
+					repairedDef, defMod := repairSchemaNode(defMap)
 					repairedDefs[dk] = repairedDef
 					if defMod {
 						defsModified = true
@@ -861,12 +862,12 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 	return clone, modified
 }
 
-func repairSchemaList(list []any, addMissingArrayItems bool) ([]any, bool) {
+func repairSchemaList(list []any) ([]any, bool) {
 	var repairedList []any
 	listModified := false
 	for _, item := range list {
 		if itemMap, ok := item.(map[string]any); ok {
-			repairedItem, itemMod := repairSchemaNode(itemMap, addMissingArrayItems)
+			repairedItem, itemMod := repairSchemaNode(itemMap)
 			repairedList = append(repairedList, repairedItem)
 			if itemMod {
 				listModified = true
@@ -881,7 +882,7 @@ func repairSchemaList(list []any, addMissingArrayItems bool) ([]any, bool) {
 	return repairedList, listModified
 }
 
-func repairPropertyMap(props map[string]any, addMissingArrayItems bool) (map[string]any, []string, bool) {
+func repairPropertyMap(props map[string]any) (map[string]any, []string, bool) {
 	out := make(map[string]any, len(props))
 	var promotedReqs []string
 	modified := false
@@ -912,7 +913,7 @@ func repairPropertyMap(props map[string]any, addMissingArrayItems bool) (map[str
 			}
 		}
 
-		repairedChild, childMod := repairSchemaNode(childClone, addMissingArrayItems)
+		repairedChild, childMod := repairSchemaNode(childClone)
 		if childMod {
 			modified = true
 		}
@@ -961,17 +962,25 @@ func mergeStringSlices(existing, promoted []string) []string {
 	return res
 }
 
-// InlineLocalRefs resolves JSON Pointer references against the original schema before definition
-// containers are stripped. Each expansion receives its own copy, sibling keywords override the
-// referenced definition, and cycles terminate as a typed hint instead of recursing forever.
+// InlineLocalRefs expands local references while preserving complete JSON Schema conjunction
+// scopes and root declarations. Expansion is bounded by depth, node, allocation, and byte limits.
 func InlineLocalRefs(jsonStr string) string {
-	return inlineLocalRefs(jsonStr)
+	return inlineLocalRefsRooted(jsonStr, true, true, false)
 }
 
-// inlineLocalRefs resolves JSON Pointer references against the original schema before definition
-// containers are stripped. Each expansion receives its own copy, sibling object schemas are
-// merged, and cycles or exhausted budgets terminate as typed hints instead of recursing forever.
+// inlineLocalRefs projects reference siblings into the canonical constraints used by native
+// provider schemas, which cannot carry arbitrary JSON Schema conjunctions.
 func inlineLocalRefs(jsonStr string) string {
+	return inlineLocalRefsRooted(jsonStr, false, false, false)
+}
+
+// inlineLocalRefsForClean resolves against the inner schema of the optional schema carrier
+// and omits definition containers that every cleaner removes later.
+func inlineLocalRefsForClean(jsonStr string) string {
+	return inlineLocalRefsRooted(jsonStr, true, false, true)
+}
+
+func inlineLocalRefsRooted(jsonStr string, preserveConjunctions, keepDefinitions, unwrapSchema bool) string {
 	if !strings.Contains(jsonStr, `"$ref"`) {
 		return jsonStr
 	}
@@ -985,19 +994,49 @@ func inlineLocalRefs(jsonStr string) string {
 	if err := decoder.Decode(&root); err != nil {
 		return jsonStr
 	}
+	wrapped := false
+	if unwrapSchema {
+		if rootMap, ok := root.(map[string]any); ok && len(rootMap) == 1 {
+			if inner, okInner := rootMap["schema"].(map[string]any); okInner {
+				root = inner
+				wrapped = true
+			}
+		}
+	}
 
 	resolver := localRefResolver{
-		maxDepth:      maxInlineLocalRefDepth,
-		maxNodes:      maxInlineLocalRefNodes,
-		maxAllocItems: maxInlineLocalRefAllocItems,
-		maxBytes:      maxInlineLocalRefOutputBytes,
+		maxDepth:                maxInlineLocalRefDepth,
+		maxNodes:                maxInlineLocalRefNodes,
+		maxAllocItems:           maxInlineLocalRefAllocItems,
+		maxBytes:                maxInlineLocalRefOutputBytes,
+		preserveRefConjunctions: preserveConjunctions,
 	}
-	resolved, ok := resolver.resolve(root, root, make(map[string]bool), 0)
+	active := make(map[string]bool)
+	resolved, ok := resolver.resolve(root, root, active, 0)
+	if ok && keepDefinitions {
+		rootMap, isMap := root.(map[string]any)
+		outMap, isOutMap := resolved.(map[string]any)
+		if isMap && isOutMap {
+			for _, key := range []string{"$defs", "definitions"} {
+				if value, exists := rootMap[key]; exists {
+					var copied any
+					copied, ok = resolver.resolveNameMap(root, value, active, 1)
+					if !ok || !resolver.reserveAllocation(1) || !resolver.reserveBytes(jsonStringEncodedLen(key)+2) {
+						ok = false
+						break
+					}
+					outMap[key] = copied
+				}
+			}
+		}
+	}
 	if !ok {
 		resolved = compactLocalRefFallback(root)
 	}
-	// estimatedBytes is deliberately conservative, so json.Marshal cannot allocate a result above
-	// the output cap on the successful resolver path.
+	if wrapped {
+		resolved = map[string]any{"schema": resolved}
+	}
+	// The conservative estimate keeps successful serialization within the output cap.
 	out, err := json.Marshal(resolved)
 	if err != nil || len(out) > maxInlineLocalRefOutputBytes {
 		return marshalCompactLocalRefFallback(root)
@@ -1006,13 +1045,14 @@ func inlineLocalRefs(jsonStr string) string {
 }
 
 type localRefResolver struct {
-	maxDepth       int
-	maxNodes       int
-	maxAllocItems  int
-	maxBytes       int
-	nodes          int
-	allocItems     int
-	estimatedBytes int
+	maxDepth                int
+	maxNodes                int
+	maxAllocItems           int
+	maxBytes                int
+	preserveRefConjunctions bool
+	nodes                   int
+	allocItems              int
+	estimatedBytes          int
 }
 
 func (r *localRefResolver) resolve(root, value any, active map[string]bool, depth int) (any, bool) {
@@ -1047,23 +1087,17 @@ func (r *localRefResolver) resolve(root, value any, active map[string]bool, dept
 		if hasRef && len(ref) <= maxInlineLocalRefPointerBytes && strings.HasPrefix(ref, "#/") {
 			if target, ok := resolveJSONPointer(root, ref); ok {
 				if active[ref] {
-					hint, okHint := r.typedLocalRefHint(target, ref)
-					if !okHint {
-						return nil, false
-					}
-					siblings, okSiblings := r.resolveMapEntries(root, node, active, depth, true)
-					if !okSiblings {
-						return nil, false
-					}
-					if len(siblings) == 0 {
-						return hint, true
-					}
-					return r.mergeRefSchemaMaps(hint, siblings)
+					return r.resolveRefFallback(root, node, target, ref, active, depth)
 				}
+				beforeTarget := *r
 				active[ref] = true
 				resolvedTarget, okResolved := r.resolve(root, target, active, depth+1)
 				delete(active, ref)
 				if !okResolved {
+					if r.preserveRefConjunctions {
+						*r = beforeTarget
+						return r.resolveRefFallback(root, node, target, ref, active, depth)
+					}
 					return nil, false
 				}
 				if targetMap, okTarget := resolvedTarget.(map[string]any); okTarget {
@@ -1074,7 +1108,7 @@ func (r *localRefResolver) resolve(root, value any, active map[string]bool, dept
 					if len(siblings) == 0 {
 						return targetMap, true
 					}
-					return r.mergeRefSchemaMaps(targetMap, siblings)
+					return r.mergeResolvedRefSchemas(targetMap, siblings)
 				}
 			}
 		}
@@ -1130,11 +1164,167 @@ func (r *localRefResolver) resolveMapEntries(root any, node map[string]any, acti
 	out := make(map[string]any, count)
 	for _, key := range keys {
 		item := node[key]
-		resolved, ok := r.resolve(root, item, active, depth+1)
+		var resolved any
+		var ok bool
+		if isLiteralValueKeyword(key) {
+			resolved, ok = r.copyLiteralValue(item, depth+1)
+		} else if _, isNameMap := schemaNameMapKeywords[key]; isNameMap {
+			resolved, ok = r.resolveNameMap(root, item, active, depth+1)
+		} else {
+			resolved, ok = r.resolve(root, item, active, depth+1)
+		}
 		if !ok {
 			return nil, false
 		}
 		out[key] = resolved
+	}
+	return out, true
+}
+
+// Literal keyword values are client data, including schema-looking keys and references.
+var literalValueKeywords = map[string]struct{}{
+	"default": {}, "example": {}, "examples": {}, "const": {}, "enum": {},
+}
+
+func isLiteralValueKeyword(key string) bool {
+	_, ok := literalValueKeywords[key]
+	return ok
+}
+
+func (r *localRefResolver) resolveNameMap(root, value any, active map[string]bool, depth int) (any, bool) {
+	node, ok := value.(map[string]any)
+	if !ok {
+		return r.copyLiteralValue(value, depth)
+	}
+	if depth > r.maxDepth || !r.reserveNode() || !r.preflightContainerLength(len(node)) ||
+		!r.commitContainer(len(node), literalObjectStructuralBytes(node)) {
+		return nil, false
+	}
+	keys, okKeys := r.sortedMapKeys(node)
+	if !okKeys {
+		return nil, false
+	}
+	out := make(map[string]any, len(node))
+	for _, key := range keys {
+		resolved, okResolved := r.resolve(root, node[key], active, depth+1)
+		if !okResolved {
+			return nil, false
+		}
+		out[key] = resolved
+	}
+	return out, true
+}
+
+func (r *localRefResolver) copyLiteralValue(value any, depth int) (any, bool) {
+	if depth > r.maxDepth || !r.reserveNode() {
+		return nil, false
+	}
+	switch node := value.(type) {
+	case map[string]any:
+		if !r.preflightContainerLength(len(node)) || !r.commitContainer(len(node), literalObjectStructuralBytes(node)) {
+			return nil, false
+		}
+		keys, okKeys := r.sortedMapKeys(node)
+		if !okKeys {
+			return nil, false
+		}
+		out := make(map[string]any, len(node))
+		for _, key := range keys {
+			copied, ok := r.copyLiteralValue(node[key], depth+1)
+			if !ok {
+				return nil, false
+			}
+			out[key] = copied
+		}
+		return out, true
+	case []any:
+		if !r.preflightContainerLength(len(node)) || !r.commitContainer(len(node), arrayStructuralBytes(len(node))) {
+			return nil, false
+		}
+		out := make([]any, len(node))
+		for i, value := range node {
+			copied, ok := r.copyLiteralValue(value, depth+1)
+			if !ok {
+				return nil, false
+			}
+			out[i] = copied
+		}
+		return out, true
+	default:
+		return value, r.reserveBytes(scalarJSONSize(value))
+	}
+}
+
+func literalObjectStructuralBytes(node map[string]any) int {
+	size := 2
+	for key := range node {
+		size += jsonStringEncodedLen(key) + 2
+	}
+	return size
+}
+
+func (r *localRefResolver) resolveRefFallback(root any, node map[string]any, target any, ref string, active map[string]bool, depth int) (any, bool) {
+	hint, okHint := r.typedLocalRefHint(target, ref)
+	if !okHint {
+		return nil, false
+	}
+	siblings, okSiblings := r.resolveMapEntries(root, node, active, depth, true)
+	if !okSiblings {
+		return nil, false
+	}
+	if len(siblings) == 0 {
+		return hint, true
+	}
+	return r.mergeResolvedRefSchemas(hint, siblings)
+}
+
+func (r *localRefResolver) mergeResolvedRefSchemas(target, siblings map[string]any) (map[string]any, bool) {
+	if !r.preserveRefConjunctions {
+		return r.mergeRefSchemaMaps(target, siblings)
+	}
+	if !r.reserveAllocation(len(target)+len(siblings)+2) || !r.reserveBytes(16) {
+		return nil, false
+	}
+	conjoin := len(siblings) > 0 && (target["unevaluatedProperties"] != nil || target["unevaluatedItems"] != nil)
+	for _, pair := range [][2]string{
+		{"additionalProperties", "properties"}, {"additionalProperties", "patternProperties"},
+		{"additionalProperties", "additionalProperties"}, {"items", "prefixItems"},
+		{"contains", "contains"}, {"contains", "minContains"}, {"contains", "maxContains"},
+	} {
+		if (target[pair[0]] != nil && siblings[pair[1]] != nil) || (siblings[pair[0]] != nil && target[pair[1]] != nil) {
+			conjoin = true
+		}
+	}
+	for key, value := range siblings {
+		switch key {
+		case "title", "description", "default", "example", "examples", "$comment", "deprecated", "readOnly", "writeOnly":
+		default:
+			if previous, exists := target[key]; exists && !reflect.DeepEqual(previous, value) {
+				conjoin = true
+			}
+		}
+	}
+	if conjoin {
+		out := make(map[string]any, len(siblings)+1)
+		for key, value := range siblings {
+			out[key] = value
+		}
+		branches := []any{target}
+		if existing, ok := siblings["allOf"].([]any); ok {
+			if !r.reserveAllocation(len(existing)) {
+				return nil, false
+			}
+			branches = append(branches, existing...)
+		}
+		out["allOf"] = branches
+		return out, true
+	}
+	out := make(map[string]any, len(target)+len(siblings))
+	for key, value := range target {
+		out[key] = value
+	}
+	for key, value := range siblings {
+		out[key] = value
 	}
 	return out, true
 }
@@ -2077,10 +2267,12 @@ func convertRefsToHints(jsonStr string, preserveSiblings bool) string {
 	sortByDepth(paths)
 
 	for _, p := range paths {
+		parentPath := trimSuffix(p, ".$ref")
+		if isPropertyDefinition(parentPath) {
+			continue // a property literally named "$ref", not a reference keyword
+		}
 		refVal := gjson.Get(jsonStr, p).String()
 		defName := refName(refVal)
-
-		parentPath := trimSuffix(p, ".$ref")
 		hint := fmt.Sprintf("See: %s", defName)
 		if !preserveSiblings {
 			if existing := gjson.Get(jsonStr, descriptionPath(parentPath)).String(); existing != "" {
@@ -2192,6 +2384,132 @@ func addAdditionalPropertiesHints(jsonStr string) string {
 		}
 	}
 	return jsonStr
+}
+
+var numericSchemaConstraintKeywords = []string{
+	"minLength", "maxLength",
+	"minItems", "maxItems",
+	"minProperties", "maxProperties",
+}
+
+type numericConstraintEdit struct {
+	offset      int
+	end         int
+	replacement string
+}
+
+// NormalizeJSONSchemaNumericConstraints converts string-encoded integer values on JSON Schema
+// numeric constraint keywords (minLength, maxLength, minItems, maxItems, minProperties,
+// maxProperties) to JSON numbers. Google's Protobuf Schema format represents these int64
+// fields as strings, whereas standard JSON Schema carriers (such as parametersJsonSchema)
+// require numeric values.
+func NormalizeJSONSchemaNumericConstraints(jsonStr string) string {
+	if !hasNumericSchemaConstraintKeyword(jsonStr) && !strings.Contains(jsonStr, `\u`) && !strings.Contains(jsonStr, `\U`) {
+		return jsonStr
+	}
+	root := gjson.Parse(jsonStr)
+	if !root.IsObject() {
+		return jsonStr
+	}
+	doc := root.Raw
+	root.Index = 0
+	var edits []numericConstraintEdit
+	collectNumericConstraintEdits(doc, root, &edits)
+	if len(edits) == 0 {
+		return jsonStr
+	}
+	var sb strings.Builder
+	sb.Grow(len(doc))
+	cursor := 0
+	for _, edit := range edits {
+		if edit.offset < cursor || edit.end > len(doc) {
+			return jsonStr
+		}
+		sb.WriteString(doc[cursor:edit.offset])
+		sb.WriteString(edit.replacement)
+		cursor = edit.end
+	}
+	sb.WriteString(doc[cursor:])
+	return sb.String()
+}
+
+func collectNumericConstraintEdits(doc string, node gjson.Result, edits *[]numericConstraintEdit) {
+	if !node.IsObject() {
+		return
+	}
+	node.ForEach(func(key, val gjson.Result) bool {
+		keyStr := key.String()
+		switch keyStr {
+		case "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties":
+			if val.Type == gjson.String {
+				if n, ok := parseSchemaNonNegativeInt(val.String()); ok {
+					end := val.Index + len(val.Raw)
+					if val.Index >= 0 && end <= len(doc) && doc[val.Index:end] == val.Raw {
+						*edits = append(*edits, numericConstraintEdit{
+							offset:      val.Index,
+							end:         end,
+							replacement: strconv.FormatInt(n, 10),
+						})
+					}
+				}
+			}
+		case "properties", "patternProperties", "dependentSchemas", "dependencies", "$defs", "definitions":
+			if val.IsObject() {
+				val.ForEach(func(_, propVal gjson.Result) bool {
+					if propVal.IsObject() {
+						collectNumericConstraintEdits(doc, propVal, edits)
+					}
+					return true
+				})
+			}
+		case "items":
+			if val.IsObject() {
+				collectNumericConstraintEdits(doc, val, edits)
+			} else if val.IsArray() {
+				val.ForEach(func(_, item gjson.Result) bool {
+					if item.IsObject() {
+						collectNumericConstraintEdits(doc, item, edits)
+					}
+					return true
+				})
+			}
+		case "additionalProperties", "additionalItems", "unevaluatedProperties", "unevaluatedItems",
+			"if", "then", "else", "not", "contains", "propertyNames", "contentSchema":
+			if val.IsObject() {
+				collectNumericConstraintEdits(doc, val, edits)
+			}
+		case "prefixItems", "anyOf", "oneOf", "allOf":
+			if val.IsArray() {
+				val.ForEach(func(_, item gjson.Result) bool {
+					if item.IsObject() {
+						collectNumericConstraintEdits(doc, item, edits)
+					}
+					return true
+				})
+			}
+		}
+		return true
+	})
+}
+
+func hasNumericSchemaConstraintKeyword(jsonStr string) bool {
+	for _, key := range numericSchemaConstraintKeywords {
+		if strings.Contains(jsonStr, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSchemaNonNegativeInt(raw string) (int64, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 || strconv.FormatInt(n, 10) != raw {
+		return 0, false
+	}
+	return n, true
 }
 
 var unsupportedConstraints = []string{
@@ -2318,6 +2636,10 @@ func mergeAllOf(jsonStr string) string {
 }
 
 func (r *localRefResolver) normalizeAllOf(value any, depth int) (any, bool) {
+	return r.normalizeAllOfNode(value, depth, false)
+}
+
+func (r *localRefResolver) normalizeAllOfNode(value any, depth int, inNameMap bool) (any, bool) {
 	if depth > r.maxDepth || !r.reserveNode() {
 		return nil, false
 	}
@@ -2337,10 +2659,14 @@ func (r *localRefResolver) normalizeAllOf(value any, depth int) (any, bool) {
 		return out, true
 	case map[string]any:
 		count := len(node)
-		if _, exists := node["allOf"]; exists {
-			count--
+		structuralBytes := literalObjectStructuralBytes(node)
+		if !inNameMap {
+			if _, exists := node["allOf"]; exists {
+				count--
+			}
+			structuralBytes = objectStructuralBytesSkipping(node, "allOf")
 		}
-		if !r.preflightContainerLength(count) || !r.commitContainer(count, objectStructuralBytesSkipping(node, "allOf")) {
+		if !r.preflightContainerLength(count) || !r.commitContainer(count, structuralBytes) {
 			return nil, false
 		}
 		keys, okKeys := r.sortedMapKeys(node)
@@ -2349,14 +2675,24 @@ func (r *localRefResolver) normalizeAllOf(value any, depth int) (any, bool) {
 		}
 		out := make(map[string]any, count)
 		for _, key := range keys {
-			if key == "allOf" {
+			if !inNameMap && key == "allOf" {
 				continue
 			}
-			normalized, ok := r.normalizeAllOf(node[key], depth+1)
+			var normalized any
+			var ok bool
+			if !inNameMap && isLiteralValueKeyword(key) {
+				normalized, ok = r.copyLiteralValue(node[key], depth+1)
+			} else {
+				_, childNameMap := schemaNameMapKeywords[key]
+				normalized, ok = r.normalizeAllOfNode(node[key], depth+1, !inNameMap && childNameMap)
+			}
 			if !ok {
 				return nil, false
 			}
 			out[key] = normalized
+		}
+		if inNameMap {
+			return out, true
 		}
 		clauses, hasAllOf := node["allOf"].([]any)
 		if !hasAllOf {
@@ -2795,8 +3131,8 @@ func removeUnsupportedKeywords(jsonStr string, options jsonSchemaCleanOptions) s
 		"propertyNames", "patternProperties", // Gemini doesn't support these schema keywords
 		"dependentRequired", "dependentSchemas", "dependencies",
 		"if", "then", "else",
-		"$comment", "enumDescriptions", "enumTitles", "prefill", "deprecated", "encrypted", "discriminator", // Schema metadata fields unsupported by Gemini
-		"additionalItems", "unevaluatedProperties", "unevaluatedItems", "contentSchema",
+		"$comment", "enumDescriptions", "enumTitles", "prefill", "deprecated", "encrypted", "discriminator", "readOnly", "writeOnly", // Schema metadata fields unsupported by Gemini
+		"additionalItems", "unevaluatedProperties", "unevaluatedItems", "contentSchema", "contentMediaType", "contentEncoding",
 	)
 	if options.antigravitySemantics {
 		keywords = append(keywords, "not")
@@ -2866,10 +3202,24 @@ func walkForExtensions(value gjson.Result, path string, paths *[]string) {
 				return true
 			}
 
+			// Literal values are client data; x-* keys inside them are not schema extensions.
+			if isLiteralValueKeyword(keyStr) && !isPropertyDefinition(path) {
+				return true
+			}
+
 			walkForExtensions(val, childPath, paths)
 			return true
 		})
 	}
+}
+
+func hasSchemaConjunction(jsonStr string) bool {
+	for _, path := range findPaths(jsonStr, "allOf") {
+		if gjson.Get(jsonStr, path).IsArray() {
+			return true
+		}
+	}
+	return false
 }
 
 func cleanupRequiredFields(jsonStr string) string {
@@ -2982,7 +3332,7 @@ func addEmptySchemaPlaceholder(jsonStr string) string {
 
 func findPaths(jsonStr, field string) []string {
 	var paths []string
-	Walk(gjson.Parse(jsonStr), "", field, &paths)
+	WalkSchema(gjson.Parse(jsonStr), "", field, &paths)
 	return paths
 }
 
@@ -3012,6 +3362,12 @@ func walkForFields(value gjson.Result, path string, fields map[string]struct{}, 
 
 			if _, ok := fields[keyStr]; ok {
 				paths[keyStr] = append(paths[keyStr], childPath)
+			}
+
+			// Literal values are client data; schema-looking keys inside them are not keywords.
+			// Under a name map the key is a property name instead, so keep descending there.
+			if isLiteralValueKeyword(keyStr) && !isPropertyDefinition(path) {
+				return true
 			}
 
 			walkForFields(val, childPath, fields, paths)
@@ -3051,11 +3407,14 @@ func setRawAt(jsonStr, path, value string) string {
 }
 
 // schemaNameMapKeywords are the schema keywords whose value maps author-chosen names to
-// subschemas. A key directly under one of them is a name, never a schema keyword.
+// subschemas. A key directly under one of them is a name, never a schema keyword. The Draft-07
+// "dependencies" container qualifies for object (schema) values; array values are property-name
+// lists and are never walked as maps by the checks that use this set.
 var schemaNameMapKeywords = map[string]struct{}{
 	"properties":        {},
 	"patternProperties": {},
 	"dependentSchemas":  {},
+	"dependencies":      {},
 	"$defs":             {},
 	"definitions":       {},
 }

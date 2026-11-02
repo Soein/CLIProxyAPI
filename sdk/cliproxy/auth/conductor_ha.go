@@ -1246,7 +1246,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		if !handled {
 			selectorLease := m.acquireSelectorReadLease()
 			selector := selectorLease.selector
-			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(selector, candidateSnapshots, "mixed", model, time.Now())
+			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(selector, candidateSnapshots, "mixed", model, time.Now(), pluginSchedulerWantsAcrossPriorities(pluginScheduler))
 			if errSelectorAvailable != nil {
 				selectorLease.Release()
 				if spillover() {

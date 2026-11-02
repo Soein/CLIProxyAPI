@@ -27,7 +27,9 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	if !gjson.GetBytes(rawJSON, "store").Exists() {
 		rawJSON = setCodexRequiredBool(rawJSON, "store", false)
 	}
-	rawJSON = setCodexRequiredBool(rawJSON, "parallel_tool_calls", true)
+	if gjson.GetBytes(rawJSON, "parallel_tool_calls").Type != gjson.False {
+		rawJSON = setCodexRequiredBool(rawJSON, "parallel_tool_calls", true)
+	}
 	rawJSON = setCodexRequiredInclude(rawJSON)
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.
 	rawJSON = deleteCodexRequestFields(rawJSON, "max_output_tokens", "max_completion_tokens", "temperature", "top_p")

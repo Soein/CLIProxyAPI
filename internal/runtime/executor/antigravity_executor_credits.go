@@ -248,7 +248,7 @@ func decideAntigravity429(body []byte) antigravity429Decision {
 			reason := strings.TrimSpace(detail.Get("reason").String())
 			decision.reason = reason
 			switch {
-			case strings.EqualFold(reason, "QUOTA_EXHAUSTED"):
+			case strings.EqualFold(reason, "QUOTA_EXHAUSTED"), strings.EqualFold(reason, "INSUFFICIENT_G1_CREDITS_BALANCE"):
 				decision.kind = antigravity429DecisionFullQuotaExhausted
 				return decision
 			case strings.EqualFold(reason, "RATE_LIMIT_EXCEEDED"):
@@ -290,7 +290,13 @@ func clearAntigravityCreditsFailureState(auth *cliproxyauth.Auth) {
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
-	antigravityCreditsFailureByAuth.Delete(strings.TrimSpace(auth.ID))
+	authID := strings.TrimSpace(auth.ID)
+	_, hadFailure := antigravityCreditsFailureByAuth.LoadAndDelete(authID)
+	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && hint.Known && !hint.Available {
+		if hadFailure || !cliproxyauth.IsAntigravityCreditsHintFresh(hint, time.Now()) {
+			cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{})
+		}
+	}
 }
 func markAntigravityCreditsPermanentlyDisabled(auth *cliproxyauth.Auth) {
 	if auth == nil || strings.TrimSpace(auth.ID) == "" || antigravityCoolingDisabled(auth, nil) {
@@ -364,7 +370,7 @@ func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Con
 	if authID == "" {
 		return
 	}
-	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && hint.Known {
+	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && cliproxyauth.IsAntigravityCreditsHintFresh(hint, time.Now()) {
 		return
 	}
 	if strings.TrimSpace(accessToken) == "" {
@@ -539,7 +545,7 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalanceForTask(ctx context
 		return
 	}
 
-	userAgent := resolveUserAgent(auth)
+	userAgent := resolveLoadCodeAssistUserAgent(auth)
 	loadReqBody, errMarshal := json.Marshal(map[string]any{
 		"metadata": map[string]string{
 			"ideType": "ANTIGRAVITY",
@@ -557,7 +563,6 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalanceForTask(ctx context
 		return
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
-	httpReq.Header.Set("Accept", "*/*")
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("User-Agent", userAgent)
 

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -29,15 +30,34 @@ func executionResultSeqFromContext(ctx context.Context) uint64 {
 	return seq
 }
 
+type completedExecutionResultContextKey struct{}
+
+// withCompletedExecutionResult records generation completion without changing Result's public layout.
+func withCompletedExecutionResult(ctx context.Context, completed bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, completedExecutionResultContextKey{}, completed)
+}
+
+func completedExecutionResultFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	completed, _ := ctx.Value(completedExecutionResultContextKey{}).(bool)
+	return completed
+}
+
 type executionResultAuthContextKey struct{}
 
 type executionResultAuthSnapshot struct {
 	id                string
+	accessToken       string
 	credentialVersion uint64
 	registrationEpoch uint64
 }
 
-func withExecutionResultAuth(ctx context.Context, auth *Auth) context.Context {
+func withExecutionResultAuth(ctx context.Context, auth *Auth, clientHeaders ...http.Header) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -45,7 +65,7 @@ func withExecutionResultAuth(ctx context.Context, auth *Auth) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, executionResultAuthContextKey{}, executionResultAuthSnapshot{
-		id: auth.ID, credentialVersion: auth.CredentialVersion, registrationEpoch: auth.RegistrationEpoch,
+		id: auth.ID, accessToken: authAccessTokenForRequest(ctx, auth, clientHeaders...), credentialVersion: auth.CredentialVersion, registrationEpoch: auth.RegistrationEpoch,
 	})
 }
 
@@ -320,7 +340,16 @@ func mergeAuthSaveDelta(target, before, after *Auth, preserveConcurrent bool) {
 	next := reflect.ValueOf(after).Elem()
 	for i := 0; i < dst.NumField(); i++ {
 		field := dst.Type().Field(i)
-		if field.PkgPath != "" || field.Name == "ID" || field.Name == "RegistrationEpoch" || field.Name == "CredentialVersion" || field.Name == "Generation" || field.Name == "RejectedAccessToken" {
+		switch field.Name {
+		case "ID", "RegistrationEpoch", "CredentialVersion", "Generation",
+			"RejectedAccessToken", "RejectedSIWCAccessToken",
+			"RejectedRefreshToken", "RejectedSIWCRefreshToken", "RenewalWarnedRefreshToken",
+			"RequiresSignIn", "RefreshError", "RenewalEventAt",
+			"AdoptedAt", "InferenceVerified", "LastInferenceVerifiedAt",
+			"RenewalVerified", "LastRenewalVerifiedAt":
+			continue
+		}
+		if field.PkgPath != "" {
 			continue
 		}
 		d, b, n := dst.Field(i), base.Field(i), next.Field(i)

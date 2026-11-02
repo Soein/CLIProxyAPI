@@ -13,7 +13,8 @@ import (
 
 func TestManager_RefreshRecoveryKeepsAutoRefreshScheduled(t *testing.T) {
 	ctx := context.Background()
-	manager, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, true)
+	manager, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+	executor.refreshErr = &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "refresh temporarily unavailable"}
 	store := newMemoryAuthTestStore()
 	manager.SetStore(store)
 	now := time.Now()
@@ -38,8 +39,11 @@ func TestManager_RefreshRecoveryKeepsAutoRefreshScheduled(t *testing.T) {
 	if !ok || failed == nil {
 		t.Fatal("primary missing after request failure")
 	}
-	if !failed.HasValidAccessToken(now) || authAccessToken(failed) != "stale-access-token" {
-		t.Fatal("failed refresh must retain the unexpired access token")
+	if failed.Metadata["expired"] != expiry.Format(time.RFC3339) || authAccessToken(failed) != "stale-access-token" {
+		t.Fatal("failed refresh must retain the original access token and expiration")
+	}
+	if failed.HasValidAccessToken(now) || failed.RejectedAccessToken != "stale-access-token" {
+		t.Fatal("the request-rejected access token must remain unusable until refresh succeeds")
 	}
 	state := failed.ModelStates[model]
 	if state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusUnauthorized || !state.Unavailable || !state.NextRetryAfter.After(now) {
@@ -56,7 +60,7 @@ func TestManager_RefreshRecoveryKeepsAutoRefreshScheduled(t *testing.T) {
 	}
 
 	executor.mu.Lock()
-	executor.refreshFail = false
+	executor.refreshErr = nil
 	executor.mu.Unlock()
 	// The background worker refreshes the current epoch without a failed request token.
 	if _, errRefresh := manager.refreshAuthForRequestAtEpoch(ctx, primary.ID, "", failed.RegistrationEpoch); errRefresh != nil {
