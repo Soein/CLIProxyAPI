@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"net/http"
 	"reflect"
@@ -311,6 +312,7 @@ const (
 	updateModeReplace updateAuthMode = iota
 	updateModeRefresh
 	updateModePrepare
+	updateModeModify
 )
 
 // UpdatePreparedAuth atomically merges request preparation results into the latest runtime auth
@@ -337,7 +339,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 // applies edit to a clone of that auth, and commits the result through the
 // standard persistence and publication path. Identity and ordering metadata
 // remain manager-owned even when edit replaces the whole snapshot. It returns
-// (nil, false, nil) if the auth is not present when the gate is acquired.
+// (nil, false, nil) if the auth is not present when the gate is acquired. The
+// callback runs once; a concurrent business change returns ErrAuthStoreConflict
+// rather than retrying the callback or silently discarding its result.
 func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, edit func(*Auth) error) (*Auth, bool, error) {
 	id = strings.TrimSpace(id)
 	if m == nil || id == "" || edit == nil {
@@ -367,7 +371,7 @@ func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, e
 	if expectedEpoch != 0 && expectedEpoch < currentEpoch {
 		return nil, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", id, expectedEpoch, currentEpoch)
 	}
-	managerState := *current
+	managerState := current.Clone()
 	if errEdit := edit(current); errEdit != nil {
 		return nil, false, errEdit
 	}
@@ -378,12 +382,90 @@ func (m *Manager) Modify(ctx context.Context, id string, expectedEpoch uint64, e
 	current.revision = managerState.revision
 	current.durableRevision = managerState.durableRevision
 	current.storeGeneration = managerState.storeGeneration
+	current.fileSaveRevision = managerState.fileSaveRevision
 	current.ClearFileSnapshot()
 	if expectedEpoch != 0 {
 		current.RegistrationEpoch = expectedEpoch
 	}
-	committedAuth, didCommit, errUpdate := m.updateInternalWithMutation(ctx, nil, current, updateModeReplace, releaseMutation)
+	committedAuth, didCommit, errUpdate := m.updateInternalWithMutation(ctx, managerState, current, updateModeModify, releaseMutation)
 	return committedAuth, errUpdate == nil && didCommit && committedAuth != nil, errUpdate
+}
+
+// equivalentModifyReplay requires the callback's complete public input to remain
+// unchanged, apart from ordering, timestamps and proven file-synthesis defaults.
+// Private persistence and lifecycle fences are checked separately by the caller.
+func equivalentModifyReplay(before, current *Auth) bool {
+	if before.FileSnapshotPath() == "" || before.FileSnapshotPath() != current.FileSnapshotPath() {
+		return false
+	}
+	if before.fileOrigin != "" && current.fileOrigin != "" && before.fileOrigin != current.fileOrigin {
+		return false
+	}
+	observation := before.fileObservation
+	saved := before.persistedFileSnapshot
+	if saved.digest != "" && saved.path == before.FileSnapshotPath() && saved.origin == before.fileOrigin &&
+		saved.epoch == before.RegistrationEpoch && saved.credentialVersion == before.CredentialVersion && saved.grant == AuthGrantFingerprint(before) {
+		// The latest successful save supersedes an older consumed observation.
+		observation = saved.path + "\x00" + saved.digest
+	}
+	if observation == "" || observation != current.fileObservation {
+		return false
+	}
+	fileDefaults := equivalentModifyFileDefaults(before, current)
+	base, live := reflect.ValueOf(before).Elem(), reflect.ValueOf(current).Elem()
+	for i := 0; i < base.NumField(); i++ {
+		field := base.Type().Field(i)
+		if field.PkgPath != "" || field.Name == "Generation" || field.Name == "CreatedAt" || field.Name == "UpdatedAt" {
+			continue
+		}
+		if fileDefaults && (field.Name == "Label" || field.Name == "Attributes") {
+			continue
+		}
+		if !reflect.DeepEqual(base.Field(i).Interface(), live.Field(i).Interface()) {
+			return false
+		}
+	}
+	return true
+}
+
+func equivalentModifyFileDefaults(before, current *Auth) bool {
+	if before.Label != current.Label {
+		label := current.Provider
+		if email, _ := current.Metadata["email"].(string); email != "" {
+			label = email
+		}
+		if before.Label != "" || current.Label != label {
+			return false
+		}
+	}
+	for key, value := range before.Attributes {
+		currentValue, ok := current.Attributes[key]
+		if !ok || (value != "" && currentValue != value) {
+			return false
+		}
+	}
+	for key, value := range current.Attributes {
+		if previous, ok := before.Attributes[key]; ok && previous == value {
+			continue
+		}
+		switch key {
+		case AttributeAuthKind:
+			if normalizeAuthKind(value) == "" || normalizeAuthKind(value) != before.AuthKind() {
+				return false
+			}
+		case AttributeSource:
+			if value != before.FileSnapshotPath() {
+				return false
+			}
+		case AttributeSourceBackend:
+			if normalizeAuthSourceKind(value) != before.AuthSourceKind() {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
@@ -412,6 +494,10 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Auth, mode updateAuthMode, releaseMutation func()) (*Auth, bool, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, false, nil
+	}
+	var modifyBase *Auth
+	if mode == updateModeModify {
+		modifyBase, base, mode = base, nil, updateModeReplace
 	}
 	NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
@@ -470,6 +556,36 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		m.mu.Unlock()
 		return nil, false, nil
 	}
+	if modifyBase != nil {
+		if existing.RegistrationEpoch != modifyBase.RegistrationEpoch ||
+			existing.CredentialVersion != modifyBase.CredentialVersion ||
+			existing.StoreGeneration() != modifyBase.StoreGeneration() ||
+			existing.fileSaveRevision != modifyBase.fileSaveRevision ||
+			(existing.durableRevision != modifyBase.durableRevision && !equivalentModifyReplay(modifyBase, existing)) {
+			m.mu.Unlock()
+			return nil, false, fmt.Errorf("modify auth %s: concurrent auth change: %w", auth.ID, ErrAuthStoreConflict)
+		}
+		// Equivalent watcher replays advance durable ordering without changing
+		// the snapshot the callback read. Do not rerun the callback or relax the
+		// durable fence for any other Update caller.
+		edited := *auth
+		if auth.CreatedAt.Equal(modifyBase.CreatedAt) {
+			auth.CreatedAt = existing.CreatedAt
+		}
+		if auth.Label == modifyBase.Label {
+			auth.Label = existing.Label
+		}
+		if !reflect.DeepEqual(modifyBase.Attributes, existing.Attributes) {
+			fields := &Auth{Attributes: maps.Clone(existing.Attributes)}
+			mergeAuthSaveDelta(fields, &Auth{Attributes: modifyBase.Attributes}, &Auth{Attributes: auth.Attributes}, false)
+			auth.Attributes = fields.Attributes
+		}
+		if !equivalentModifyFileDefaults(&edited, auth) {
+			m.mu.Unlock()
+			return nil, false, fmt.Errorf("modify auth %s: concurrent file defaults conflict with edit: %w", auth.ID, ErrAuthStoreConflict)
+		}
+		auth.durableRevision = existing.durableRevision
+	}
 	if isFileSnapshot {
 		auth.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
 		if auth.fileSnapshotPersistenceDone != nil || existing.RegistrationEpoch != fileSnapshotEpoch || existing.durableRevision != fileSnapshotRevision || existing.fileSaveRevision != fileSaveRevision {
@@ -477,6 +593,7 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 			m.mu.Unlock()
 			return current, false, nil
 		}
+		auth.fileSaveRevision = existing.fileSaveRevision
 	}
 	// Watcher snapshots may bypass the mutation gate. Check their identity
 	// changes under the same manager lock used for publication.
