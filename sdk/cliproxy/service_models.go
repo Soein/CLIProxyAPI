@@ -43,6 +43,10 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 	// resolution: a registration superseded while it is being computed must
 	// not overwrite or remove the newer registration when it finishes last.
 	fence := newModelRegistrationFence(a, cfg)
+	fence.onPublished, _ = ctx.Value(modelRegistrationPublicationContextKey{}).(func(*coreauth.Auth, modelRegistrationFence))
+	if strings.EqualFold(a.Provider, "antigravity") && !(cfg != nil && cfg.Home.Enabled) && !pluginHostHasAuthModelProvider(s.pluginHost, a.Provider) {
+		fence.antigravityRouteKey = antigravityCapabilityKeyForConfig(a, cfg)
+	}
 	s.cancelStaleAntigravityProbes(a.ID)
 	if a.Disabled {
 		if s != nil && s.coreManager != nil {
@@ -130,14 +134,16 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
 		if !(cfg != nil && cfg.Home.Enabled) {
-			expectedRegEpoch := GlobalModelRegistry().ClientRegistrationEpoch(a.ID)
+			expectedRegEpoch := fence.registryEpoch
 			expectedKey := s.antigravityCapabilityKey(a)
 			hints := s.cachedAntigravityHints(a)
 			if hints.ModelIDs != nil {
 				// Publish known catalogs through the same fenced, state-preserving
 				// path as refreshes. An expired catalog remains usable while HTTP
 				// is pending, including its quota and suspension projections.
-				s.applyAntigravityModelHints(ctx, a, provider, hints, expectedKey, a.RegistrationEpoch, expectedRegEpoch)
+				if s.applyAntigravityModelHints(ctx, a, provider, hints, expectedKey, a.RegistrationEpoch, expectedRegEpoch) {
+					fence.recordPublication(a)
+				}
 				s.asyncProbeAntigravityCapabilities(ctx, a, provider)
 				return true
 			}

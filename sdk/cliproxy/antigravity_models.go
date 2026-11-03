@@ -50,6 +50,7 @@ type antigravityCapabilityCacheEntry struct {
 	probeRevision     uint64
 	appliedRevision   uint64
 	appliedEpoch      uint64
+	appliedFence      modelRegistrationFence
 	persistedRevision uint64
 	pending           bool
 }
@@ -110,6 +111,35 @@ func (s *Service) antigravityCapabilityKey(auth *coreauth.Auth) string {
 		return ""
 	}
 	return antigravityCapabilityKeyForRoute(auth, antigravityModelBaseURLs(auth)[0], s.antigravityModelFetchProxyURL(auth), antigravityModelUserAgent())
+}
+
+func antigravityCapabilityKeyForConfig(auth *coreauth.Auth, cfg *config.Config) string {
+	proxy := strings.TrimSpace(auth.ProxyURL)
+	if proxy == "" && cfg != nil {
+		proxy = strings.TrimSpace(cfg.ProxyURL)
+	}
+	return antigravityCapabilityKeyForRoute(auth, antigravityModelBaseURLs(auth)[0], proxy, antigravityModelUserAgent())
+}
+
+// antigravityModelPublicationCurrent is called under the completion fence's
+// config lock. Cache ownership and the exact registry epoch are checked together
+// so an unrelated publisher cannot be mistaken for a native refresh successor.
+func (s *Service) antigravityModelPublicationCurrent(auth *coreauth.Auth, fence modelRegistrationFence) bool {
+	if fence.antigravityRouteKey == "" || (s.cfg != nil && s.cfg.Home.Enabled) ||
+		antigravityCapabilityKeyForConfig(auth, s.cfg) != fence.antigravityRouteKey {
+		return false
+	}
+	antigravityCapabilityMu.RLock()
+	defer antigravityCapabilityMu.RUnlock()
+	entry := antigravityCapabilityCache[fence.antigravityRouteKey]
+	applied := entry.appliedFence
+	return entry.appliedRevision != 0 && entry.appliedEpoch == GlobalModelRegistry().ClientRegistrationEpoch(auth.ID) &&
+		applied.registryEpoch == entry.appliedEpoch && applied.antigravityRouteKey == fence.antigravityRouteKey &&
+		applied.registrationEpoch == fence.registrationEpoch && applied.provider == fence.provider &&
+		applied.prefix == fence.prefix && applied.disabled == fence.disabled && applied.authKind == fence.authKind &&
+		maps.Equal(applied.attributes, fence.attributes) &&
+		(strings.TrimSpace(fence.attributes["excluded_models"]) != "" ||
+			applied.globalExclusions["antigravity"] == fence.globalExclusions["antigravity"])
 }
 
 func antigravityCapabilityKeyForRoute(auth *coreauth.Auth, endpoint, proxy, userAgent string) string {
@@ -697,17 +727,17 @@ func antigravityAuthModelSettingsEqual(a, b *coreauth.Auth) bool {
 		a.AuthKind() == b.AuthKind() && maps.Equal(a.Attributes, b.Attributes)
 }
 
-func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth.Auth, providerKey string, hints antigravityModelCapabilityHints, expectedKey string, expectedEpoch, expectedRegEpoch uint64) {
+func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth.Auth, providerKey string, hints antigravityModelCapabilityHints, expectedKey string, expectedEpoch, expectedRegEpoch uint64) bool {
 	if ctx.Err() != nil || s.antigravityHomeEnabled() || s.antigravityCapabilityKey(auth) != expectedKey {
-		return
+		return false
 	}
 	if hints.ModelIDs == nil && len(hints.WebSearchModelIDs) == 0 {
-		return
+		return false
 	}
 	if s.coreManager != nil {
 		current, exists := s.coreManager.GetByID(auth.ID)
 		if !exists || current == nil || current.Disabled || current.Provider != auth.Provider || current.RegistrationEpoch != expectedEpoch || !antigravityAuthModelSettingsEqual(current, auth) || s.antigravityCapabilityKey(current) != expectedKey {
-			return
+			return false
 		}
 	}
 	var updated bool
@@ -715,6 +745,8 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 		// Keep the config snapshot stable through publication. Registry CAS must
 		// remain strict: an epoch from another publisher may use newer auth settings.
 		s.cfgMu.RLock()
+		publicationFence := newModelRegistrationFence(auth, s.cfg)
+		publicationFence.antigravityRouteKey = expectedKey
 		models := s.antigravityModelsForHintsWithConfig(auth, hints, s.cfg)
 		// Fence the cache-to-registry publication as well as the network result.
 		// A newer successful catalog must never be replaced by an older caller.
@@ -723,7 +755,7 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 		if entry.hints.revision != hints.revision {
 			antigravityCapabilityMu.Unlock()
 			s.cfgMu.RUnlock()
-			return
+			return false
 		}
 		reg := registry.GetGlobalRegistry()
 		var appliedEpoch uint64
@@ -731,6 +763,8 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 		if updated {
 			entry.appliedRevision = hints.revision
 			entry.appliedEpoch = appliedEpoch
+			publicationFence.registryEpoch = appliedEpoch
+			entry.appliedFence = publicationFence
 			antigravityCapabilityCache[expectedKey] = entry
 		}
 		antigravityCapabilityMu.Unlock()
@@ -748,6 +782,7 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 		s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 		s.coreManager.RefreshSchedulerEntry(auth.ID)
 	}
+	return updated
 }
 
 // refreshAntigravityModels schedules account refreshes without waiting for the batch.

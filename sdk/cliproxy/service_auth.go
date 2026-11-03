@@ -104,13 +104,24 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 type authUpdateState struct {
 	revision uint64
 	result   *authRegistrationResult
+	accepted *authRegistrationResult
 }
 
 type authRegistrationResult struct {
-	accepted bool
-	pending  <-chan struct{}
-	done     <-chan struct{}
-	err      error
+	accepted         bool
+	pending          <-chan struct{}
+	done             <-chan struct{}
+	err              error
+	publishedAuth    *coreauth.Auth
+	publicationFence modelRegistrationFence
+	origin           string
+}
+
+func authRegistrationResultForOrigin(state authUpdateState, origin string) *authRegistrationResult {
+	if state.result != nil && state.result.pending != nil && state.accepted != nil && state.accepted.origin == origin {
+		return state.accepted
+	}
+	return state.result
 }
 
 // syncPersistedFileAuth keeps explicit login completion separate from reentrant
@@ -119,13 +130,19 @@ type authRegistrationResult struct {
 func (s *Service) syncPersistedFileAuth(ctx context.Context, update watcher.AuthUpdate) error {
 	id := authUpdateID(update)
 	expected := update.Auth.Clone()
+	expectedOrigin := expected.FileSnapshotIdentity()
+	if s.coreManager != nil {
+		if current, exists := s.coreManager.GetByID(expected.ID); exists && samePersistedAuthIdentity(current, expected) {
+			expectedOrigin = current.FileSnapshotOrigin(expected)
+		}
+	}
 	s.handleAuthUpdate(ctx, update)
 	for {
 		if errContext := ctx.Err(); errContext != nil {
 			return errContext
 		}
 		s.authUpdateMu.Lock()
-		result := s.authRevisions[id].result
+		result := authRegistrationResultForOrigin(s.authRevisions[id], expectedOrigin)
 		s.authUpdateMu.Unlock()
 		if result == nil || result.done == nil {
 			return fmt.Errorf("activate persisted auth %s: %w", update.ID, coreauth.ErrAuthStoreConflict)
@@ -135,30 +152,34 @@ func (s *Service) syncPersistedFileAuth(ctx context.Context, update watcher.Auth
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		if result.err != nil {
-			return fmt.Errorf("activate persisted auth %s: %w", update.ID, result.err)
+		errResult := result.err
+		if errResult == nil {
+			switch {
+			case result.accepted:
+				if result.origin != expectedOrigin {
+					errResult = fmt.Errorf("file observation was superseded: %w", coreauth.ErrAuthStoreConflict)
+				} else {
+					errResult = s.validatePersistedAuthRegistration(expected, result)
+				}
+			case !expected.FileSnapshotMatchesDisk():
+				errResult = fmt.Errorf("file observation was superseded or removed: %w", coreauth.ErrAuthStoreConflict)
+			case result.pending == nil:
+				errResult = fmt.Errorf("file observation was discarded: %w", coreauth.ErrAuthStoreConflict)
+			}
 		}
-		if !expected.FileSnapshotMatchesDisk() {
-			return fmt.Errorf("activate persisted auth %s: file observation was superseded or removed: %w", update.ID, coreauth.ErrAuthStoreConflict)
+		// A newer handler can replace this result while its disk and publication
+		// checks run. Follow that handler before returning either success or error.
+		s.authUpdateMu.Lock()
+		stillCurrent := authRegistrationResultForOrigin(s.authRevisions[id], expectedOrigin) == result
+		s.authUpdateMu.Unlock()
+		if !stillCurrent {
+			continue
+		}
+		if errResult != nil {
+			return fmt.Errorf("activate persisted auth %s: %w", update.ID, errResult)
 		}
 		if result.accepted {
-			current, exists := s.coreManager.GetByID(expected.ID)
-			if !exists || current == nil || coreauth.CredentialsChanged(current, expected) ||
-				current.Provider != expected.Provider || current.Prefix != expected.Prefix ||
-				(current.Disabled || current.Status == coreauth.StatusDisabled) != (expected.Disabled || expected.Status == coreauth.StatusDisabled) ||
-				!maps.Equal(current.Attributes, expected.Attributes) {
-				return fmt.Errorf("activate persisted auth %s: runtime was superseded: %w", update.ID, coreauth.ErrAuthStoreConflict)
-			}
-			s.authUpdateMu.Lock()
-			stillCurrent := s.authRevisions[id].result == result
-			s.authUpdateMu.Unlock()
-			if !stillCurrent {
-				continue
-			}
 			return nil
-		}
-		if result.pending == nil {
-			return fmt.Errorf("activate persisted auth %s: file observation was discarded: %w", update.ID, coreauth.ErrAuthStoreConflict)
 		}
 		select {
 		case <-result.pending:
@@ -170,6 +191,45 @@ func (s *Service) syncPersistedFileAuth(ctx context.Context, update watcher.Auth
 		update.SetRevision(0)
 		s.handleAuthUpdatesIfResultCurrent(ctx, []watcher.AuthUpdate{update}, result)
 	}
+}
+
+func (s *Service) validatePersistedAuthRegistration(expected *coreauth.Auth, result *authRegistrationResult) error {
+	current, exists := s.coreManager.GetByID(expected.ID)
+	if !exists || !samePersistedAuthIdentity(current, expected) || result.publishedAuth == nil ||
+		current.FileRegistrationOrigin() != result.origin ||
+		current.RegistrationEpoch != result.publishedAuth.RegistrationEpoch ||
+		current.CredentialVersion != result.publishedAuth.CredentialVersion ||
+		!samePersistedAuthIdentity(current, result.publishedAuth) ||
+		!maps.Equal(current.Attributes, result.publishedAuth.Attributes) {
+		return fmt.Errorf("runtime was superseded: %w", coreauth.ErrAuthStoreConflict)
+	}
+	if !expected.FileSnapshotMatchesDisk() && !current.FileRegistrationMatchesDisk() {
+		return fmt.Errorf("file observation was superseded or removed: %w", coreauth.ErrAuthStoreConflict)
+	}
+	if !result.publicationFence.publishIfCurrent(s, expected.ID, func() bool {
+		fence := result.publicationFence
+		if fence.antigravityRouteKey != "" && ((s.cfg != nil && s.cfg.Home.Enabled) ||
+			antigravityCapabilityKeyForConfig(current, s.cfg) != fence.antigravityRouteKey) {
+			return false
+		}
+		return GlobalModelRegistry().ClientRegistrationEpoch(expected.ID) == fence.registryEpoch ||
+			s.antigravityModelPublicationCurrent(current, fence)
+	}) {
+		return fmt.Errorf("model publication was superseded: %w", coreauth.ErrAuthStoreConflict)
+	}
+	return nil
+}
+
+func samePersistedAuthIdentity(current, expected *coreauth.Auth) bool {
+	return current != nil && expected != nil && current.ID == expected.ID &&
+		!coreauth.CredentialsChanged(current, expected) && current.Provider == expected.Provider &&
+		coreauth.AuthGrantFingerprint(current) == coreauth.AuthGrantFingerprint(expected) &&
+		current.Prefix == expected.Prefix && current.ProxyURL == expected.ProxyURL &&
+		current.FileName == expected.FileName &&
+		current.Attributes[coreauth.AttributePath] == expected.Attributes[coreauth.AttributePath] &&
+		current.Attributes[coreauth.AttributeSource] == expected.Attributes[coreauth.AttributeSource] &&
+		current.AuthSourceKind() == expected.AuthSourceKind() &&
+		(current.Disabled || current.Status == coreauth.StatusDisabled) == (expected.Disabled || expected.Status == coreauth.StatusDisabled)
 }
 
 func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthUpdate) {
@@ -271,14 +331,16 @@ func (s *Service) handleAuthUpdatesIfResultCurrent(ctx context.Context, updates 
 			var result *authRegistrationResult
 			state, tracked := s.authRevisions[id]
 			if update.Auth.HasFileSnapshot() && !(versionedStore && authUpdateUsesAuthoritativeStore(update.Auth)) {
-				result = &authRegistrationResult{done: startedWaitByID[id].ch}
-				state.result = result
-				s.authRevisions[id] = state
+				result = &authRegistrationResult{
+					done:   startedWaitByID[id].ch,
+					origin: update.Auth.FileSnapshotIdentity(),
+				}
 			} else if tracked && state.result != nil {
 				if state.revision == 0 {
 					delete(s.authRevisions, id)
 				} else {
 					state.result = nil
+					state.accepted = nil
 					s.authRevisions[id] = state
 				}
 			}
@@ -294,6 +356,22 @@ func (s *Service) handleAuthUpdatesIfResultCurrent(ctx context.Context, updates 
 				continue
 			}
 			auth := s.prepareCoreAuthForModelRegistrationWithResult(registrationCtx, update.Auth, result)
+			if result != nil {
+				if result.accepted {
+					result.origin = auth.FileRegistrationOrigin()
+					state.accepted = result
+				}
+				// A late observation may have a newer dispatch revision even though
+				// its file is obsolete. Only accepted or pending work supersedes a
+				// completed activation; rejected observations also need no models.
+				if result.accepted || result.pending != nil || result.err != nil || state.result == nil {
+					state.result = result
+					s.authRevisions[id] = state
+				}
+				if !result.accepted {
+					continue
+				}
+			}
 			if auth == nil {
 				continue
 			}
@@ -307,6 +385,25 @@ func (s *Service) handleAuthUpdatesIfResultCurrent(ctx context.Context, updates 
 				phase:    modelRegistrationPhase(authForRegistration),
 				category: modelRegistrationCategory(authForRegistration),
 				run: func(compatCache *openAICompatibilityRegistrationCache) {
+					if result != nil {
+						current, exists := s.coreManager.GetByID(authID)
+						if !exists || current.RegistrationEpoch != authForRegistration.RegistrationEpoch ||
+							!samePersistedAuthIdentity(current, authForRegistration) || !maps.Equal(current.Attributes, authForRegistration.Attributes) {
+							result.err = coreauth.ErrAuthStoreConflict
+							return
+						}
+						// Generation also advances for identical credentials. Complete
+						// against the latest matching inputs instead of skipping them.
+						record := func(auth *coreauth.Auth, fence modelRegistrationFence) {
+							result.publishedAuth, result.publicationFence = auth, fence
+						}
+						completionCtx := context.WithValue(registrationCtx, modelRegistrationPublicationContextKey{}, record)
+						s.completeModelRegistrationForAuthWithCache(completionCtx, current, compatCache)
+						if result.publishedAuth == nil {
+							result.err = fmt.Errorf("model registration did not publish: %w", coreauth.ErrAuthStoreConflict)
+						}
+						return
+					}
 					if s.shouldSkipModelRegistration(authID, expectedGeneration, expectedDisabled) {
 						return
 					}
@@ -357,6 +454,7 @@ func (s *Service) handleAuthUpdatesIfResultCurrent(ctx context.Context, updates 
 					delete(s.authRevisions, id)
 				} else {
 					state.result = nil
+					state.accepted = nil
 					s.authRevisions[id] = state
 				}
 			}

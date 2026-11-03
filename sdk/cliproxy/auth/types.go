@@ -149,16 +149,24 @@ type Auth struct {
 	// cooldownRecordedSeq fences successes dispatched before this cooldown.
 	cooldownRecordedSeq uint64 `json:"-"`
 
-	recentRequests     recentRequestRing `json:"-"`
-	indexAssigned      bool              `json:"-"`
-	revision           uint64            `json:"-"`
-	durableRevision    uint64            `json:"-"`
-	storeGeneration    uint64            `json:"-"`
-	fileSaveRevision   uint64            `json:"-"`
-	fileSnapshotPath   string            `json:"-"`
-	fileSnapshotDigest string            `json:"-"`
+	recentRequests        recentRequestRing         `json:"-"`
+	indexAssigned         bool                      `json:"-"`
+	revision              uint64                    `json:"-"`
+	durableRevision       uint64                    `json:"-"`
+	storeGeneration       uint64                    `json:"-"`
+	fileSaveRevision      uint64                    `json:"-"`
+	fileSnapshotPath      string                    `json:"-"`
+	fileSnapshotDigest    string                    `json:"-"`
+	fileObservation       string                    `json:"-"`
+	fileOrigin            string                    `json:"-"`
+	persistedFileSnapshot persistedAuthFileSnapshot `json:"-"`
 
 	fileSnapshotPersistenceDone <-chan struct{} `json:"-"`
+}
+
+type persistedAuthFileSnapshot struct {
+	path, digest, grant, origin string
+	epoch, credentialVersion    uint64
 }
 
 // StoreGeneration returns the generation last observed from a versioned
@@ -269,6 +277,89 @@ func (a *Auth) FileSnapshotPath() string {
 		}
 	}
 	return path
+}
+
+// FileSnapshotIdentity returns an opaque identity for a valid file observation.
+func (a *Auth) FileSnapshotIdentity() string {
+	if !a.HasFileSnapshot() || a.fileSnapshotDigest == invalidatedFileSnapshotDigest {
+		return ""
+	}
+	return a.fileSnapshotPath + "\x00" + a.fileSnapshotDigest
+}
+
+// RecordPersistedFileSnapshot records the exact payload written by a trusted
+// file store. Provider data must not be used to create this persistence witness.
+func (a *Auth) RecordPersistedFileSnapshot(path string, data []byte) {
+	if a == nil {
+		return
+	}
+	a.persistedFileSnapshot = persistedAuthFileSnapshot{}
+	if path != "" && len(data) > 0 {
+		a.persistedFileSnapshot = persistedAuthFileSnapshot{
+			path: strings.TrimSpace(path), digest: canonicalAuthFileDigest(data),
+			origin: a.fileOrigin,
+			epoch:  a.RegistrationEpoch, credentialVersion: a.CredentialVersion, grant: AuthGrantFingerprint(a),
+		}
+	}
+}
+
+// HasPersistedFileSnapshot reports whether an observation matches a successful
+// file save from the current credential lifecycle and original file source.
+func (a *Auth) HasPersistedFileSnapshot(snapshot *Auth) bool {
+	if a == nil || !snapshot.HasFileSnapshot() {
+		return false
+	}
+	saved := a.persistedFileSnapshot
+	return a.hasCurrentPersistedFileSnapshot() && saved.path == snapshot.fileSnapshotPath && saved.digest == snapshot.fileSnapshotDigest
+}
+
+func (a *Auth) hasCurrentPersistedFileSnapshot() bool {
+	if a == nil {
+		return false
+	}
+	saved := a.persistedFileSnapshot
+	return saved.digest != "" && a.fileOrigin != "" && saved.origin == a.fileOrigin && saved.epoch == a.RegistrationEpoch &&
+		saved.credentialVersion == a.CredentialVersion && saved.grant == AuthGrantFingerprint(a) &&
+		a.FileSnapshotPath() == saved.path
+}
+
+// FileRegistrationOrigin identifies the original file observation accepted by
+// the manager. Ordinary business metadata replacements start a new source.
+func (a *Auth) FileRegistrationOrigin() string {
+	if a == nil {
+		return ""
+	}
+	return a.fileOrigin
+}
+
+// FileSnapshotOrigin resolves a snapshot to an existing source only when it is
+// the accepted observation or a proven durable write from that source.
+func (a *Auth) FileSnapshotOrigin(snapshot *Auth) string {
+	observation := snapshot.FileSnapshotIdentity()
+	if a != nil && a.fileOrigin != "" && (observation == a.fileObservation || observation == a.fileOrigin || a.HasPersistedFileSnapshot(snapshot)) {
+		return a.fileOrigin
+	}
+	return observation
+}
+
+// FileRegistrationMatchesDisk verifies a consumed same-source observation or
+// an exact payload from a successful save, without re-parsing provider data.
+func (a *Auth) FileRegistrationMatchesDisk() bool {
+	if a == nil || a.fileOrigin == "" {
+		return false
+	}
+	if path, digest, ok := strings.Cut(a.fileObservation, "\x00"); ok && path == a.FileSnapshotPath() && authFileDigestMatchesDisk(path, digest) {
+		return true
+	}
+	return a.hasCurrentPersistedFileSnapshot() && authFileDigestMatchesDisk(a.persistedFileSnapshot.path, a.persistedFileSnapshot.digest)
+}
+
+func authFileDigestMatchesDisk(path, digest string) bool {
+	if path == "" || digest == "" {
+		return false
+	}
+	data, errRead := readAuthSnapshotFileFunc(path)
+	return errRead == nil && len(data) > 0 && canonicalAuthFileDigest(data) == digest
 }
 
 // SameFileSnapshot reports whether two unversioned file snapshots observed the

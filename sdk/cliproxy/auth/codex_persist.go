@@ -57,6 +57,17 @@ func PersistCodexAuthFileWithIO(ctx context.Context, path string, auth *Auth, fi
 	if fileIO.WithLock == nil || fileIO.ReadFile == nil || fileIO.WriteJSON == nil {
 		return true, fmt.Errorf("auth filestore: incomplete Codex file IO")
 	}
+	auth.RecordPersistedFileSnapshot("", nil)
+	writeJSON := fileIO.WriteJSON
+	fileIO.WriteJSON = func(path string, data map[string]any) error {
+		if errWrite := writeJSON(path, data); errWrite != nil {
+			return errWrite
+		}
+		if raw, errMarshal := json.Marshal(data); errMarshal == nil {
+			auth.RecordPersistedFileSnapshot(path, raw)
+		}
+		return nil
+	}
 
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
@@ -152,6 +163,7 @@ func PersistCodexAuthFileWithIO(ctx context.Context, path string, auth *Auth, fi
 			return true, errSave
 		}
 		if persistedBytes, errReadPersisted := fileIO.ReadFile(path); errReadPersisted == nil && len(persistedBytes) > 0 {
+			auth.RecordPersistedFileSnapshot(path, persistedBytes)
 			var diskMap map[string]any
 			if errUnmarshal := json.Unmarshal(persistedBytes, &diskMap); errUnmarshal == nil && len(diskMap) > 0 {
 				auth.Metadata = codex.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
@@ -173,6 +185,7 @@ func PersistCodexAuthFileWithIO(ctx context.Context, path string, auth *Auth, fi
 					auth.Metadata["disabled"] = auth.Disabled
 					NormalizeCredentialMetadata(auth.Metadata)
 					if raw, errMarshal := json.Marshal(auth.Metadata); errMarshal == nil && !fileIO.WriteUnchanged && string(existing) == string(raw) {
+						auth.RecordPersistedFileSnapshot(path, existing)
 						return nil
 					}
 				}

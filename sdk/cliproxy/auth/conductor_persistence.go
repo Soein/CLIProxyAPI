@@ -77,12 +77,15 @@ func executionResultAuthFromContext(ctx context.Context) (executionResultAuthSna
 	return snapshot, ok
 }
 
-func (m *Manager) mergePublishedSaveDelta(before, saved *Auth) {
+func (m *Manager) mergePublishedSaveDelta(before, saved *Auth, persisted bool) {
 	var snapshot *Auth
 	m.mu.Lock()
 	current := m.auths[saved.ID]
 	if current != nil && current.RegistrationEpoch == before.RegistrationEpoch && current.durableRevision == before.durableRevision {
 		mergeAuthSaveDelta(current, before, saved, true)
+		if persisted && saved.persistedFileSnapshot.origin == current.fileOrigin {
+			current.persistedFileSnapshot = saved.persistedFileSnapshot
+		}
 		snapshot = current.Clone()
 	}
 	m.mu.Unlock()
@@ -520,6 +523,12 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 		return false, false
 	}
 	mergeAuthSaveDelta(published, existingBeforeSave, updated, true)
+	if CredentialsChanged(existingBeforeSave, published) || AuthGrantFingerprint(existingBeforeSave) != AuthGrantFingerprint(published) {
+		published.fileOrigin, published.fileObservation = "", ""
+		published.persistedFileSnapshot = persistedAuthFileSnapshot{}
+	} else if persistenceDone != nil {
+		published.persistedFileSnapshot = updated.persistedFileSnapshot
+	}
 	m.auths[id] = published
 	schedulerSnapshot := published.Clone()
 	m.mu.Unlock()

@@ -480,6 +480,7 @@ func (s *Service) registerResolvedModelsForAuthFenced(a *coreauth.Auth, fence mo
 		log.WithFields(log.Fields{"auth_id": a.ID, "provider": providerKey, "models": len(normalizedModels)}).Warnf("model registration for auth %s was superseded during computation; discarded the stale publication instead of overwriting the latest auth state", a.ID)
 		return false
 	}
+	fence.recordPublication(a)
 	return true
 }
 
@@ -495,6 +496,7 @@ func (s *Service) unregisterModelsForAuthFenced(a *coreauth.Auth, fence modelReg
 		log.WithFields(log.Fields{"auth_id": a.ID}).Warnf("model unregistration for auth %s was superseded during computation; discarded the stale removal instead of deleting the latest auth state", a.ID)
 		return false
 	}
+	fence.recordPublication(a)
 	return true
 }
 

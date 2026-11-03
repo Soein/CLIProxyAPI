@@ -63,6 +63,21 @@ type modelRegistrationFence struct {
 	disabled                  bool
 	authKind                  string
 	attributes                map[string]string
+	antigravityRouteKey       string
+	onPublished               func(*coreauth.Auth, modelRegistrationFence)
+}
+
+type modelRegistrationPublicationContextKey struct{}
+
+func (f modelRegistrationFence) recordPublication(a *coreauth.Auth) {
+	if f.onPublished != nil {
+		record := f.onPublished
+		f.onPublished = nil
+		// Both fenced publication operations advance the client's epoch once,
+		// including an intentional empty catalog or disabled credential.
+		f.registryEpoch++
+		record(a.Clone(), f)
+	}
 }
 
 func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegistrationFence {
@@ -80,6 +95,7 @@ func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegist
 	if _, _, compat := openAICompatInfoFromAuth(a); compat {
 		provider = "openai-compatibility"
 	}
+	attributes := maps.Clone(a.Attributes)
 	return modelRegistrationFence{
 		globalExclusions:  exclusions,
 		exclusionProvider: provider,
@@ -89,7 +105,7 @@ func newModelRegistrationFence(a *coreauth.Auth, cfg *config.Config) modelRegist
 		provider:          a.Provider,
 		disabled:          a.Disabled || a.Status == coreauth.StatusDisabled,
 		authKind:          a.AuthKind(),
-		attributes:        maps.Clone(a.Attributes),
+		attributes:        attributes,
 	}
 }
 
@@ -104,6 +120,8 @@ func (f modelRegistrationFence) withAuth(a *coreauth.Auth) modelRegistrationFenc
 	next.globalExclusions = f.globalExclusions
 	next.fallbackExclusionProvider = f.fallbackExclusionProvider
 	next.registryEpoch = f.registryEpoch
+	next.antigravityRouteKey = f.antigravityRouteKey
+	next.onPublished = f.onPublished
 	return next
 }
 
@@ -121,20 +139,23 @@ func (f modelRegistrationFence) publishUnregister(s *Service, authID string) boo
 
 func (f modelRegistrationFence) publishIfCurrent(s *Service, authID string, publish func() bool) bool {
 	publishWithConfig := func() bool {
-		if s != nil && !f.disabled && f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == "" {
+		checkExclusions := !f.disabled && f.authKind != coreauth.AuthKindAPIKey && strings.TrimSpace(f.attributes["excluded_models"]) == ""
+		if s != nil && (checkExclusions || f.antigravityRouteKey != "") {
 			s.cfgMu.RLock()
 			defer s.cfgMu.RUnlock()
 			// Match the watcher's normalization so no-op and unrelated reloads do not
 			// discard work. A real change always schedules a replacement: the watcher
 			// redispatches affected auths, and applyConfigRuntime re-registers every
 			// auth (which also covers Home mode, where no watcher runs).
-			for _, provider := range [2]string{f.exclusionProvider, f.fallbackExclusionProvider} {
-				if provider == "" {
-					continue
-				}
-				current := oauthExcludedModelsForConfig(s.cfg, provider, f.authKind)
-				if f.globalExclusions[provider] != diff.SummarizeExcludedModels(current) {
-					return false
+			if checkExclusions {
+				for _, provider := range [2]string{f.exclusionProvider, f.fallbackExclusionProvider} {
+					if provider == "" {
+						continue
+					}
+					current := oauthExcludedModelsForConfig(s.cfg, provider, f.authKind)
+					if f.globalExclusions[provider] != diff.SummarizeExcludedModels(current) {
+						return false
+					}
 				}
 			}
 			// Hold cfgMu through registry publication, not just the comparison.

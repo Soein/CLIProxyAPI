@@ -98,6 +98,8 @@ func (m *Manager) beginAuthRegistrationLocked(auth, current *Auth) {
 	m.authEpochs[auth.ID] = epoch
 	auth.RegistrationEpoch = epoch
 	auth.Generation = 1
+	auth.persistedFileSnapshot = persistedAuthFileSnapshot{}
+	auth.fileOrigin, auth.fileObservation = "", ""
 }
 
 // advanceAuthGenerationLocked publishes auth as a newer mutation in the
@@ -251,7 +253,13 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.Generation = 1
 	auth.revision = m.nextAuthRevisionLocked()
+	auth.persistedFileSnapshot = persistedAuthFileSnapshot{}
 	auth.durableRevision = m.nextAuthDurableRevisionLocked()
+	auth.fileOrigin, auth.fileObservation = "", ""
+	if isFileSnapshot {
+		auth.fileObservation = input.FileSnapshotIdentity()
+		auth.fileOrigin = auth.fileObservation
+	}
 	auth.ClearFileSnapshot()
 	if isFileSnapshot {
 		*input = *auth
@@ -425,6 +433,7 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 
 	isFileSnapshot := mode == updateModeReplace && auth.HasFileSnapshot()
 	var fileSnapshotEpoch, fileSnapshotRevision, fileSaveRevision uint64
+	var fileObservation, fileOrigin string
 	if isFileSnapshot {
 		auth.fileSnapshotPersistenceDone = nil
 		m.mu.RLock()
@@ -441,6 +450,8 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		}
 		fileSnapshotEpoch, fileSnapshotRevision = existing.RegistrationEpoch, existing.durableRevision
 		fileSaveRevision = existing.fileSaveRevision
+		fileObservation = auth.FileSnapshotIdentity()
+		fileOrigin = existing.FileSnapshotOrigin(auth)
 		m.mu.RUnlock()
 		// Watchers bypass the mutation gate, so fence the disk observation with
 		// durable state rather than runtime-only result revisions. Never hold m.mu
@@ -469,9 +480,20 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 	}
 	// Watcher snapshots may bypass the mutation gate. Check their identity
 	// changes under the same manager lock used for publication.
-	if mode == updateModeReplace && base != nil && !modelRegistrationInputsMatch(existing, base.RegistrationEpoch, base.Prefix, base.Provider, base.Disabled || base.Status == StatusDisabled, base.AuthKind(), base.Attributes) {
-		m.mu.Unlock()
-		return nil, false, nil
+	conditionalRegistrationUpdate := mode == updateModeReplace && base != nil
+	if conditionalRegistrationUpdate {
+		if !modelRegistrationInputsMatch(existing, base.RegistrationEpoch, base.Prefix, base.Provider, base.Disabled || base.Status == StatusDisabled, base.AuthKind(), base.Attributes) ||
+			existing.fileOrigin != base.fileOrigin || existing.fileObservation != base.fileObservation ||
+			existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing) ||
+			AuthGrantFingerprint(existing) != AuthGrantFingerprint(base) || existing.ProxyURL != base.ProxyURL || existing.FileName != base.FileName {
+			m.mu.Unlock()
+			return nil, false, nil
+		}
+		// Plugin defaults came from base. Apply only its metadata delta so a
+		// completed metadata save during discovery is not rolled back.
+		metadata := &Auth{Metadata: cloneMetadataMap(existing.Metadata)}
+		mergeAuthSaveDelta(metadata, &Auth{Metadata: base.Metadata}, &Auth{Metadata: auth.Metadata}, true)
+		auth.Metadata = metadata.Metadata
 	}
 	if !persistMetaMint && (mode == updateModePrepare || mode == updateModeRefresh) && strings.EqualFold(strings.TrimSpace(existing.Provider), "meta") {
 		persistMetaMint = true
@@ -571,6 +593,19 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		existingVersion = 1
 	}
 	credChanged := CredentialsChanged(existing, auth)
+	auth.persistedFileSnapshot = persistedAuthFileSnapshot{}
+	switch {
+	case isFileSnapshot:
+		auth.fileObservation, auth.fileOrigin = fileObservation, fileOrigin
+	case !credChanged && AuthGrantFingerprint(existing) == AuthGrantFingerprint(auth) &&
+		auth.FileSnapshotPath() == existing.FileSnapshotPath() && auth.Provider == existing.Provider &&
+		auth.Prefix == existing.Prefix && auth.ProxyURL == existing.ProxyURL &&
+		authIsDisabled(auth) == authIsDisabled(existing) && (conditionalRegistrationUpdate || reflect.DeepEqual(existing.Metadata, auth.Metadata)):
+		auth.fileObservation, auth.fileOrigin = existing.fileObservation, existing.fileOrigin
+		auth.persistedFileSnapshot = existing.persistedFileSnapshot
+	default:
+		auth.fileObservation, auth.fileOrigin = "", ""
+	}
 	if credChanged {
 		auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
 	} else {

@@ -1593,7 +1593,7 @@ func (m *Manager) persistPublishedWithModeIfCurrent(ctx context.Context, auth *A
 	} else {
 		errPersist = m.persist(ctx, snapshot)
 	}
-	m.mergePublishedSaveDelta(beforeSave, snapshot)
+	m.mergePublishedSaveDelta(beforeSave, snapshot, errPersist == nil)
 	return errPersist
 }
 

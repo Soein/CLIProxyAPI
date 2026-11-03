@@ -83,6 +83,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	auth.RecordPersistedFileSnapshot("", nil)
 	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
 		return "", fmt.Errorf("auth filestore: %w", errWeight)
@@ -144,6 +145,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 				}
 				if existing, errRead := readAuthFile(baseDir, path); errRead == nil {
 					if jsonEqual(existing, payload) {
+						auth.RecordPersistedFileSnapshot(path, existing)
 						break
 					}
 				} else if !os.IsNotExist(errRead) {
@@ -153,6 +155,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 				if errWrite := writeAuthFile(baseDir, path, payload, 0o600); errWrite != nil {
 					return "", fmt.Errorf("auth filestore: write token payload: %w", errWrite)
 				}
+				auth.RecordPersistedFileSnapshot(path, payload)
 			} else if err = auth.Storage.SaveTokenToFile(path); err != nil {
 				return "", err
 			}
@@ -164,11 +167,13 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			}
 			if existing, errRead := readAuthFile(baseDir, path); errRead == nil {
 				if jsonEqual(existing, raw) {
+					auth.RecordPersistedFileSnapshot(path, existing)
 					break
 				}
 				if errWrite := writeAuthFile(baseDir, path, raw, 0o600); errWrite != nil {
 					return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
 				}
+				auth.RecordPersistedFileSnapshot(path, raw)
 				break
 			} else if !os.IsNotExist(errRead) {
 				return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
@@ -176,6 +181,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if errWrite := writeAuthFile(baseDir, path, raw, 0o600); errWrite != nil {
 				return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 			}
+			auth.RecordPersistedFileSnapshot(path, raw)
 		default:
 			return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 		}
