@@ -624,15 +624,39 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int, int) 
 	return geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, xaiAPIKeyCount, metaAPIKeyCount, openAICompatCount
 }
 
-func (w *Watcher) persistConfigAsync() {
-	if w == nil || w.storePersister == nil {
+func (w *Watcher) persistConfigAsync(snapshot []byte) {
+	if w == nil || w.storePersister == nil || len(snapshot) == 0 {
 		return
 	}
+	persister, ok := w.storePersister.(configSnapshotPersister)
+	if !ok {
+		log.Warn("config mirror skipped: token store does not support accepted config snapshots")
+		return
+	}
+	w.configPersistMu.Lock()
+	w.pendingConfigSnapshot = append([]byte(nil), snapshot...)
+	if w.configPersistRunning {
+		w.configPersistMu.Unlock()
+		return
+	}
+	w.configPersistRunning = true
+	w.configPersistMu.Unlock()
+	// A single writer drains accepted snapshots in order. Coalescing pending
+	// snapshots keeps a slow backend from letting an older write finish last.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := w.storePersister.PersistConfig(ctx); err != nil {
-			log.Errorf("failed to persist config change: %v", err)
+		for {
+			w.configPersistMu.Lock()
+			current := w.pendingConfigSnapshot
+			w.pendingConfigSnapshot = nil
+			if len(current) == 0 {
+				w.configPersistRunning = false
+				w.configPersistMu.Unlock()
+				return
+			}
+			w.configPersistMu.Unlock()
+			if err := persister.PersistConfigSnapshot(context.Background(), current); err != nil {
+				log.Errorf("failed to persist config change: %v", err)
+			}
 		}
 	}()
 }

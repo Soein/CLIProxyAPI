@@ -183,7 +183,7 @@ func updateNestedScalarYAML(data []byte, path []string, value string) ([]byte, e
 	if errClose := enc.Close(); errClose != nil {
 		return nil, errClose
 	}
-	return NormalizeCommentIndentation(buf.Bytes()), nil
+	return buf.Bytes(), nil
 }
 
 // NormalizeCommentIndentation removes indentation from standalone YAML comment lines to keep them left aligned.

@@ -99,6 +99,10 @@ management:
   # Management key. If a plaintext value is provided here, it will be hashed on startup.
   # All management requests (even from localhost) require this key.
   # Leave empty to disable the Management API entirely (404 for /v0/management and /v8/management routes).
+  # External hot reloads that change this key or enabled management's allow-remote
+  # require a final YAML document end line: ...
+  # To disable, also use an explicit quoted empty string; deleting/nulling an active key requires restart.
+  # Startup and Management API saves persist hashes; external reloads never rewrite this file.
   secret-key: ""
 
   # Disable the bundled management control panel asset download and HTTP route when true.

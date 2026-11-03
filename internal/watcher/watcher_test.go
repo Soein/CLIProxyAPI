@@ -751,35 +751,53 @@ func TestSetAuthUpdateQueueNilResetsDispatch(t *testing.T) {
 
 func TestPersistAsyncEarlyReturns(t *testing.T) {
 	var nilWatcher *Watcher
-	nilWatcher.persistConfigAsync()
+	nilWatcher.persistConfigAsync(nil)
 	nilWatcher.persistAuthAsync("msg", "a")
 
 	w := &Watcher{}
-	w.persistConfigAsync()
+	w.persistConfigAsync(nil)
 	w.persistAuthAsync("msg", "   ", "")
 }
 
 type errorPersister struct {
 	configCalls int32
 	authCalls   int32
+	configDone  chan struct{}
+	authDone    chan struct{}
 }
 
 func (p *errorPersister) PersistConfig(context.Context) error {
 	atomic.AddInt32(&p.configCalls, 1)
+	if p.configDone != nil {
+		p.configDone <- struct{}{}
+	}
 	return fmt.Errorf("persist config error")
+}
+
+func (p *errorPersister) PersistConfigSnapshot(ctx context.Context, _ []byte) error {
+	return p.PersistConfig(ctx)
 }
 
 func (p *errorPersister) PersistAuthFiles(context.Context, string, ...string) error {
 	atomic.AddInt32(&p.authCalls, 1)
+	if p.authDone != nil {
+		p.authDone <- struct{}{}
+	}
 	return fmt.Errorf("persist auth error")
 }
 
 func TestPersistAsyncErrorPaths(t *testing.T) {
-	p := &errorPersister{}
+	p := &errorPersister{configDone: make(chan struct{}, 1), authDone: make(chan struct{}, 1)}
 	w := &Watcher{storePersister: p}
-	w.persistConfigAsync()
+	w.persistConfigAsync([]byte("port: 8317\n"))
 	w.persistAuthAsync("msg", "a")
-	time.Sleep(30 * time.Millisecond)
+	for _, done := range []chan struct{}{p.configDone, p.authDone} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("persist worker did not finish")
+		}
+	}
 	if atomic.LoadInt32(&p.configCalls) != 1 {
 		t.Fatalf("expected PersistConfig to be called once, got %d", p.configCalls)
 	}
@@ -1659,6 +1677,9 @@ func (s *stubStore) PersistConfig(context.Context) error {
 	s.signalPersisted()
 	return nil
 }
+func (s *stubStore) PersistConfigSnapshot(ctx context.Context, _ []byte) error {
+	return s.PersistConfig(ctx)
+}
 func (s *stubStore) PersistAuthFiles(_ context.Context, message string, paths ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1711,7 +1732,7 @@ func TestPersistConfigAndAuthAsyncInvokePersister(t *testing.T) {
 		storePersister: store,
 	}
 
-	w.persistConfigAsync()
+	w.persistConfigAsync([]byte("port: 8317\n"))
 	w.persistAuthAsync("msg", " a ", "", "b ")
 
 	for range 2 {

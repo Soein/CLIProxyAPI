@@ -42,6 +42,16 @@ type Config struct {
 	// parsed from, or empty when the config was not loaded from a file.
 	SourceHash string `yaml:"-" json:"-"`
 
+	// ManagementSecretKeyExplicitlyEmpty distinguishes a quoted empty key from
+	// missing/null values that can occur during an in-place configuration write.
+	ManagementSecretKeyExplicitlyEmpty bool `yaml:"-" json:"-"`
+	// SourceHasDocumentEnd is true only for a single YAML document ending in an
+	// explicit "..." line. Sensitive hot-reload transitions require this boundary.
+	SourceHasDocumentEnd bool `yaml:"-" json:"-"`
+	// SourceSnapshot contains the validated source with management secrets hashed
+	// and conflicting layout fields removed, for persistence without another read.
+	SourceSnapshot []byte `yaml:"-" json:"-"`
+
 	// CredentialConcurrency contains Home-authoritative credential lifecycle settings.
 	CredentialConcurrency CredentialConcurrencyConfig `yaml:"credential-concurrency" json:"credential-concurrency"`
 

@@ -110,7 +110,12 @@ func WriteConfig(path string, data []byte) error {
 			return err
 		}
 	}
-	data = config.NormalizeCommentIndentation(data)
+	return writePreparedConfig(path, config.NormalizeCommentIndentation(data))
+}
+
+// writePreparedConfig retains the inode and bytes of a fully prepared payload,
+// including the document-end boundary used for management key changes.
+func writePreparedConfig(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err

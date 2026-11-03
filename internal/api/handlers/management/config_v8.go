@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -85,6 +87,17 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		c.JSON(http.StatusOK, result)
 		return
 	}
+	var sourceConfig config.Config
+	if err = yaml.Unmarshal(raw, &sourceConfig); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "incomplete_config_source"})
+		return
+	}
+	secretChangeRequested := (len(parts) == 0 && c.Request.Method == http.MethodPut) ||
+		(len(parts) == 1 && parts[0] == "management" && c.Request.Method != http.MethodPatch) ||
+		(len(parts) == 2 && parts[0] == "management" && parts[1] == "secret-key")
+	remoteChangeRequested := (len(parts) == 0 && c.Request.Method == http.MethodPut) ||
+		(len(parts) == 1 && parts[0] == "management" && c.Request.Method != http.MethodPatch) ||
+		(len(parts) == 2 && parts[0] == "management" && parts[1] == "allow-remote")
 	before := cloneConfigV8Node(root)
 	config.ProjectV8ConfigAliases(root, strings.Join(parts, "."))
 	if c.Request.Method == http.MethodDelete {
@@ -107,7 +120,13 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			return
 		}
 		var update yaml.Node
-		if err = yaml.Unmarshal(body, &update); err != nil || len(update.Content) == 0 {
+		decoder := yaml.NewDecoder(bytes.NewReader(body))
+		if err = decoder.Decode(&update); err != nil || len(update.Content) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+			return
+		}
+		var trailing yaml.Node
+		if err = decoder.Decode(&trailing); err != io.EOF {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
 			return
 		}
@@ -115,6 +134,15 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		if len(parts) == 0 && update.Content[0].Kind != yaml.MappingNode {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "config_must_be_object"})
 			return
+		}
+		if c.Request.Method == http.MethodPatch && update.Content[0].Kind == yaml.MappingNode {
+			if len(parts) == 0 {
+				secretChangeRequested = configV8Node(update.Content[0], []string{"management", "secret-key"}) != nil
+				remoteChangeRequested = configV8Node(update.Content[0], []string{"management", "allow-remote"}) != nil
+			} else if len(parts) == 1 && parts[0] == "management" {
+				secretChangeRequested = configV8Node(update.Content[0], []string{"secret-key"}) != nil
+				remoteChangeRequested = configV8Node(update.Content[0], []string{"allow-remote"}) != nil
+			}
 		}
 		if len(parts) == 0 {
 			if err = config.NormalizeV8ConfigAliases(update.Content[0]); err != nil {
@@ -146,6 +174,10 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			}
 			*dst = *update.Content[0]
 		}
+	}
+	if !secretChangeRequested && !managementSecretsEqual(h.cfg.RemoteManagement.SecretKey, sourceConfig.RemoteManagement.SecretKey) {
+		c.JSON(http.StatusConflict, gin.H{"error": "incomplete_config_source", "message": "management key differs from the active configuration; retry after the configuration is fully published"})
+		return
 	}
 	if err = config.NormalizeV8ConfigAliases(root); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
@@ -182,6 +214,20 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
+	var submittedConfig config.Config
+	if err = yaml.Unmarshal(data, &submittedConfig); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
+		return
+	}
+	if managementSecretsEqual(h.cfg.RemoteManagement.SecretKey, submittedConfig.RemoteManagement.SecretKey) {
+		next.RemoteManagement.SecretKey = h.cfg.RemoteManagement.SecretKey
+	}
+	if !remoteChangeRequested && !(secretChangeRequested && next.RemoteManagement.SecretKey == "") &&
+		(h.cfg.RemoteManagement.SecretKey != "" || next.RemoteManagement.SecretKey != "") &&
+		h.cfg.RemoteManagement.AllowRemote != sourceConfig.RemoteManagement.AllowRemote {
+		c.JSON(http.StatusConflict, gin.H{"error": "incomplete_config_source", "message": "remote management access differs from the active configuration; retry after the configuration is fully published"})
+		return
+	}
 	if err = config.ValidateV8Config(data); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
@@ -191,10 +237,21 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
+	// This handler owns a complete, validated payload. Persist its hashed key
+	// before writing, and make an authenticated removal explicit so the watcher
+	// can distinguish it from an external writer's unfinished document.
+	if next.RemoteManagement.SecretKey != "" || h.cfg.RemoteManagement.SecretKey != "" || secretChangeRequested {
+		data, err = config.PrepareConfigSnapshot(data, next.RemoteManagement.SecretKey)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
+			return
+		}
+	}
+	data = append(data, []byte("...\n")...)
 	// Save the validated canonical tree directly: projecting runtime defaults
 	// back onto it loses explicit nulls, empty maps, and opaque plugin settings.
-	// WriteConfig retains the inode of a mounted configuration file.
-	if err = WriteConfig(h.configFilePath, data); err != nil {
+	// The prepared writer retains the inode of a mounted configuration file.
+	if err = writePreparedConfig(h.configFilePath, data); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
 		return
 	}
@@ -211,6 +268,10 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	snapshot := h.reloadSnapshotConfigLocked()
 	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": 8})
+}
+
+func managementSecretsEqual(current, candidate string) bool {
+	return current == candidate || (current != "" && candidate != "" && bcrypt.CompareHashAndPassword([]byte(current), []byte(candidate)) == nil)
 }
 
 // configV8ETag renders a config source hash as a strong ETag.

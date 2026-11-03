@@ -17,7 +17,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var loadConfigFileFunc = config.LoadConfig
+var loadConfigFileFunc = config.LoadConfigForReload
+
+type configReloadResult struct {
+	sourceHash     string
+	sourceSnapshot []byte
+}
 
 func (w *Watcher) stopConfigReloadTimer() {
 	w.configReloadMu.Lock()
@@ -77,36 +82,49 @@ func (w *Watcher) reloadConfigIfChanged() {
 		return
 	}
 	log.Infof("config file changed, reloading: %s", w.configPath)
-	if w.reloadConfig() {
+	if applied := w.reloadConfigSnapshot(); applied != nil {
 		// Record the bytes the reload actually parsed, not the change-check read or a
-		// later re-read: a write landing between them must not count as applied. A
-		// write-back during load only costs one extra reload.
+		// later re-read: a write landing between them must not count as applied.
 		w.clientsMutex.Lock()
 		appliedHash := newHash
-		if w.config != nil && w.config.SourceHash != "" {
-			appliedHash = w.config.SourceHash
+		if applied.sourceHash != "" {
+			appliedHash = applied.sourceHash
 		}
 		w.lastConfigHash = appliedHash
 		w.clientsMutex.Unlock()
-		w.persistConfigAsync()
+		w.persistConfigAsync(applied.sourceSnapshot)
 	}
 }
 
 func (w *Watcher) reloadConfig() bool {
+	return w.reloadConfigSnapshot() != nil
+}
+
+func (w *Watcher) reloadConfigSnapshot() *configReloadResult {
 	log.Debug("=========================== CONFIG RELOAD ============================")
 	log.Debugf("starting config reload from: %s", w.configPath)
 
-	newConfig, errLoadConfig := loadConfigFileFunc(w.configPath)
+	w.clientsMutex.RLock()
+	previousSecret := ""
+	if w.config != nil {
+		previousSecret = w.config.RemoteManagement.SecretKey
+	}
+	w.clientsMutex.RUnlock()
+	newConfig, errLoadConfig := loadConfigFileFunc(w.configPath, previousSecret)
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
-		return false
+		return nil
 	}
 	// A save may truncate the file after the change check. Use the bytes the
 	// loader actually parsed, before replacing live config or auth directories.
 	if newConfig.SourceHash == config.ComputeSourceHash(nil) {
 		log.Debug("ignoring config truncated during reload")
-		return false
+		return nil
 	}
+	result := &configReloadResult{sourceHash: newConfig.SourceHash, sourceSnapshot: newConfig.SourceSnapshot}
+	// Source bytes belong to this publication and its one persistence request,
+	// not to long-lived runtime configs and their cloned snapshots.
+	newConfig.SourceSnapshot = nil
 
 	if w.mirroredAuthDir != "" {
 		newConfig.AuthDir = w.mirroredAuthDir
@@ -119,6 +137,25 @@ func (w *Watcher) reloadConfig() bool {
 	}
 
 	w.clientsMutex.Lock()
+	if w.config != nil && w.config.RemoteManagement.SecretKey != "" && newConfig.RemoteManagement.SecretKey == "" && !newConfig.ManagementSecretKeyExplicitlyEmpty {
+		w.clientsMutex.Unlock()
+		log.Warn("ignoring config reload without an explicit empty management key; use secret-key: \"\" followed by a YAML document end to disable management")
+		return nil
+	}
+	currentSecret := ""
+	if w.config != nil {
+		currentSecret = w.config.RemoteManagement.SecretKey
+	}
+	if currentSecret != newConfig.RemoteManagement.SecretKey && !newConfig.SourceHasDocumentEnd {
+		w.clientsMutex.Unlock()
+		log.Warn("ignoring management key change without a final YAML document end (...)")
+		return nil
+	}
+	if w.config != nil && (currentSecret != "" || newConfig.RemoteManagement.SecretKey != "") && w.config.RemoteManagement.AllowRemote != newConfig.RemoteManagement.AllowRemote && !newConfig.SourceHasDocumentEnd {
+		w.clientsMutex.Unlock()
+		log.Warn("ignoring remote management access change without a final YAML document end (...)")
+		return nil
+	}
 	var oldConfig *config.Config
 	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
 	w.oldConfigYaml, _ = yaml.Marshal(newConfig)
@@ -153,5 +190,5 @@ func (w *Watcher) reloadConfig() bool {
 
 	log.Infof("config successfully reloaded, triggering client reload")
 	w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)
-	return true
+	return result
 }

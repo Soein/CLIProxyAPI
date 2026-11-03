@@ -25,6 +25,10 @@ type storePersister interface {
 	PersistAuthFiles(ctx context.Context, message string, paths ...string) error
 }
 
+type configSnapshotPersister interface {
+	PersistConfigSnapshot(ctx context.Context, snapshot []byte) error
+}
+
 type authDirProvider interface {
 	AuthDir() string
 }
@@ -39,6 +43,9 @@ type Watcher struct {
 	configReloadMu             sync.Mutex
 	configReloadTimer          *time.Timer
 	configApplyMu              sync.Mutex // Serializes config file reloads so they apply in file order.
+	configPersistMu            sync.Mutex
+	pendingConfigSnapshot      []byte
+	configPersistRunning       bool
 	serverUpdateMu             sync.Mutex
 	serverUpdateTimer          *time.Timer
 	serverUpdateLast           time.Time

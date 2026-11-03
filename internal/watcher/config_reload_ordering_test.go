@@ -150,13 +150,13 @@ func TestReloadConfigIfChangedReloadsAfterWriteBetweenHashAndLoad_Issue6631(t *t
 	t.Cleanup(func() { loadConfigFileFunc = originalLoad })
 	var errSave error
 	loads := 0
-	loadConfigFileFunc = func(path string) (*config.Config, error) {
+	loadConfigFileFunc = func(path, previousSecret string) (*config.Config, error) {
 		loads++
 		if loads == 1 {
 			// A management save lands after the change check read version 1.
 			errSave = writeIssue6631Config(configPath, authDir, 2)
 		}
-		return originalLoad(path)
+		return originalLoad(path, previousSecret)
 	}
 
 	var applied []int
@@ -200,13 +200,13 @@ func TestReloadConfigIfChangedRejectsTruncatedLoad_Issue6559(t *testing.T) {
 
 	originalLoad := loadConfigFileFunc
 	t.Cleanup(func() { loadConfigFileFunc = originalLoad })
-	loadConfigFileFunc = func(path string) (*config.Config, error) {
+	loadConfigFileFunc = func(path, previousSecret string) (*config.Config, error) {
 		// The change check read a complete document, but a later management
 		// save truncates it before the loader's independent read.
 		if errWrite := os.WriteFile(path, nil, 0o600); errWrite != nil {
 			return nil, errWrite
 		}
-		loaded, errLoad := originalLoad(path)
+		loaded, errLoad := originalLoad(path, previousSecret)
 		if errWrite := writeIssue6631Config(configPath, authDir, 2); errWrite != nil {
 			return nil, errWrite
 		}
