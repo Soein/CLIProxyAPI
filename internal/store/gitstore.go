@@ -427,6 +427,7 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	auth.RecordPersistedFileSnapshot("", nil)
 	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
 		return "", fmt.Errorf("auth filestore: %w", errWeight)
@@ -444,6 +445,9 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	}
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
+	if _, errValidate := validateMirroredCredentialUpdate(ctx, path); errValidate != nil {
+		return "", errValidate
+	}
 
 	// Runtime updates must not recreate a disabled credential whose source file
 	// was deliberately removed. Login and migration callers explicitly mark the
@@ -457,6 +461,9 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if err = s.ensureRepositoryContextLocked(ctx); err != nil {
 		return "", err
 	}
+	if _, errValidate := validateMirroredCredentialUpdate(ctx, path); errValidate != nil {
+		return "", errValidate
+	}
 	relPath, errRel := s.relativeToRepo(path)
 	if errRel != nil {
 		return "", errRel
@@ -465,47 +472,8 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
-	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
-		if errCodex != nil {
-			return "", errCodex
-		}
-	} else {
-		switch {
-		case auth.Storage != nil:
-			if auth.Metadata == nil {
-				auth.Metadata = make(map[string]any)
-			}
-			auth.Metadata["disabled"] = auth.Disabled
-			if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
-				setter.SetMetadata(auth.Metadata)
-			}
-			if err = auth.Storage.SaveTokenToFile(path); err != nil {
-				return "", err
-			}
-		case auth.Metadata != nil:
-			auth.Metadata["disabled"] = auth.Disabled
-			raw, errMarshal := json.Marshal(auth.Metadata)
-			if errMarshal != nil {
-				return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
-			}
-			contentsMatch := false
-			if existing, errRead := os.ReadFile(path); errRead == nil {
-				contentsMatch = jsonEqual(existing, raw)
-			} else if !os.IsNotExist(errRead) {
-				return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
-			}
-			if !contentsMatch {
-				tmp := path + ".tmp"
-				if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-					return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
-				}
-				if errRename := os.Rename(tmp, path); errRename != nil {
-					return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
-				}
-			}
-		default:
-			return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
-		}
+	if errPersist := persistMirroredCredential(ctx, path, auth); errPersist != nil {
+		return "", errPersist
 	}
 
 	if auth.Attributes == nil {
@@ -768,6 +736,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		auth.Disabled = true
 		auth.Status = cliproxyauth.StatusDisabled
 	}
+	auth.RecordAuthFileUpdateSource(path, data)
 	return auth, nil
 }
 

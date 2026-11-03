@@ -85,6 +85,8 @@ func (m *Manager) mergePublishedSaveDelta(before, saved *Auth, persisted bool) {
 		mergeAuthSaveDelta(current, before, saved, true)
 		if persisted && saved.persistedFileSnapshot.origin == current.fileOrigin {
 			current.persistedFileSnapshot = saved.persistedFileSnapshot
+			current.fileUpdatePath = saved.fileUpdatePath
+			current.fileUpdateDigest = saved.fileUpdateDigest
 		}
 		snapshot = current.Clone()
 	}
@@ -523,6 +525,8 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 		return false, false
 	}
 	mergeAuthSaveDelta(published, existingBeforeSave, updated, true)
+	published.fileUpdatePath = updated.fileUpdatePath
+	published.fileUpdateDigest = updated.fileUpdateDigest
 	if CredentialsChanged(existingBeforeSave, published) || AuthGrantFingerprint(existingBeforeSave) != AuthGrantFingerprint(published) {
 		published.fileOrigin, published.fileObservation = "", ""
 		published.persistedFileSnapshot = persistedAuthFileSnapshot{}

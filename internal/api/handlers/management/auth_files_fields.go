@@ -627,6 +627,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": patchErr.message})
 			return
 		}
+		if errors.Is(errModify, coreauth.ErrAuthStoreConflict) || errors.Is(errModify, coreauth.ErrAuthStoreDeleted) {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("failed to update auth: %v", errModify)})
+			return
+		}
+		if errors.Is(errModify, coreauth.ErrAuthStorageEditUnsupported) {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": errModify.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", errModify)})
 		return
 	}

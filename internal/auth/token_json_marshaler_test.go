@@ -10,6 +10,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	kimiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
 	vertexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/vertex"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 )
@@ -19,6 +20,12 @@ func TestBuiltInTokenJSONMarshalersMatchFileOutput(t *testing.T) {
 		name    string
 		storage func() baseauth.TokenStorage
 	}{
+		{
+			name: "meta",
+			storage: func() baseauth.TokenStorage {
+				return &metaauth.MetaTokenStorage{AccessToken: "LLM|access", DCAToken: "dca:token", Metadata: map[string]any{"custom": "meta"}}
+			},
+		},
 		{
 			name: "codex",
 			storage: func() baseauth.TokenStorage {

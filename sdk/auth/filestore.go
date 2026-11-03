@@ -99,6 +99,24 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
 	baseDir := s.baseDirSnapshot()
+	guardedUpdate := false
+	if errValidate := cliproxyauth.ValidateAuthFileUpdate(ctx, path, func() ([]byte, error) {
+		guardedUpdate = true
+		data, errRead := readAuthFile(baseDir, path)
+		if os.IsNotExist(errRead) {
+			return nil, nil
+		}
+		return data, errRead
+	}); errValidate != nil {
+		return "", errValidate
+	}
+	if guardedUpdate && auth.Storage != nil {
+		storage, okClone := CloneTokenStorageForUpdate(auth.Storage)
+		if _, okMarshal := storage.(baseauth.TokenJSONMarshaler); !okClone || !okMarshal {
+			return "", fmt.Errorf("auth filestore: token storage must support private cloning and JSON serialization for edits: %w", cliproxyauth.ErrAuthStorageEditUnsupported)
+		}
+		auth.Storage = storage
+	}
 
 	// Runtime updates must not recreate a disabled credential whose source file
 	// was deliberately removed. Login and migration callers explicitly mark the
@@ -143,7 +161,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 				if !json.Valid(payload) {
 					return "", fmt.Errorf("auth filestore: token payload is not valid JSON")
 				}
-				if existing, errRead := readAuthFile(baseDir, path); errRead == nil {
+				if existing, errRead := readAuthFileForUpdate(ctx, baseDir, path); errRead == nil {
 					if jsonEqual(existing, payload) {
 						auth.RecordPersistedFileSnapshot(path, existing)
 						break
@@ -152,7 +170,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 					return "", fmt.Errorf("auth filestore: read existing token payload: %w", errRead)
 				}
 				misc.LogSavingCredentials(path)
-				if errWrite := writeAuthFile(baseDir, path, payload, 0o600); errWrite != nil {
+				if errWrite := WriteTokenPayload(baseDir, path, payload, auth.Storage); errWrite != nil {
 					return "", fmt.Errorf("auth filestore: write token payload: %w", errWrite)
 				}
 				auth.RecordPersistedFileSnapshot(path, payload)
@@ -165,7 +183,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if errMarshal != nil {
 				return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 			}
-			if existing, errRead := readAuthFile(baseDir, path); errRead == nil {
+			if existing, errRead := readAuthFileForUpdate(ctx, baseDir, path); errRead == nil {
 				if jsonEqual(existing, raw) {
 					auth.RecordPersistedFileSnapshot(path, existing)
 					break
@@ -349,6 +367,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 					}
 				}
 				cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+				auth.RecordAuthFileUpdateSource(path, data)
 			}
 			return auths, nil
 		}
@@ -402,6 +421,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		auth.Attributes["email"] = email
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	auth.RecordAuthFileUpdateSource(path, data)
 	return []*cliproxyauth.Auth{auth}, nil
 }
 
@@ -510,7 +530,11 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 
 func persistCodexAuthFile(ctx context.Context, baseDir, path string, auth *cliproxyauth.Auth) (handled bool, err error) {
 	if !cliproxyauth.IsCodexAuthRecord(auth) || strings.TrimSpace(baseDir) == "" {
-		return cliproxyauth.PersistCodexAuthFile(ctx, path, auth)
+		return cliproxyauth.PersistCodexAuthFileWithIO(ctx, path, auth, cliproxyauth.CodexAuthFileIO{
+			WithLock:  codex.WithFileLock,
+			ReadFile:  func(string) ([]byte, error) { return readAuthFileForUpdate(ctx, baseDir, path) },
+			WriteJSON: codex.WriteJSONFileAtomic,
+		})
 	}
 	absBase, errAbs := filepath.Abs(baseDir)
 	if errAbs != nil {
@@ -530,8 +554,16 @@ func persistCodexAuthFile(ctx context.Context, baseDir, path string, auth *clipr
 		}
 	}()
 	return cliproxyauth.PersistCodexAuthFileWithIO(ctx, path, auth, cliproxyauth.CodexAuthFileIO{
-		WithLock:  func(_ string, fn func() error) error { return codex.WithFileLockRoot(root, name, fn) },
-		ReadFile:  func(string) ([]byte, error) { return root.ReadFile(name) },
+		WithLock: func(_ string, fn func() error) error { return codex.WithFileLockRoot(root, name, fn) },
+		ReadFile: func(string) ([]byte, error) {
+			data, errRead := root.ReadFile(name)
+			if errRead == nil || os.IsNotExist(errRead) {
+				if errValidate := cliproxyauth.ValidateAuthFileUpdate(ctx, path, func() ([]byte, error) { return data, nil }); errValidate != nil {
+					return nil, errValidate
+				}
+			}
+			return data, errRead
+		},
 		WriteJSON: func(_ string, data map[string]any) error { return codex.WriteJSONFileAtomicRoot(root, name, data) },
 	})
 }
@@ -541,6 +573,16 @@ func readAuthFile(baseDir, path string) ([]byte, error) {
 		return os.ReadFile(path)
 	}
 	return cliproxyauth.ReadAuthFile(baseDir, path)
+}
+
+func readAuthFileForUpdate(ctx context.Context, baseDir, path string) ([]byte, error) {
+	data, errRead := readAuthFile(baseDir, path)
+	if errRead == nil || os.IsNotExist(errRead) {
+		if errValidate := cliproxyauth.ValidateAuthFileUpdate(ctx, path, func() ([]byte, error) { return data, nil }); errValidate != nil {
+			return nil, errValidate
+		}
+	}
+	return data, errRead
 }
 
 func statAuthFile(baseDir, path string) (os.FileInfo, error) {

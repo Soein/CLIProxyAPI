@@ -160,8 +160,19 @@ type Auth struct {
 	fileObservation       string                    `json:"-"`
 	fileOrigin            string                    `json:"-"`
 	persistedFileSnapshot persistedAuthFileSnapshot `json:"-"`
+	fileUpdatePath        string                    `json:"-"`
+	fileUpdateDigest      string                    `json:"-"`
 
 	fileSnapshotPersistenceDone <-chan struct{} `json:"-"`
+}
+
+// TokenStorage is the token writer accepted by Auth.Storage.
+type TokenStorage = baseauth.TokenStorage
+
+// TokenStorageCloner lets an SDK token writer opt into private metadata edits.
+// The result must not share values that SetMetadata or serialization mutates.
+type TokenStorageCloner interface {
+	CloneTokenStorage() TokenStorage
 }
 
 type persistedAuthFileSnapshot struct {
@@ -223,6 +234,8 @@ func (a *Auth) BindFileSnapshot(path string, data []byte) {
 	}
 	a.fileSnapshotPath = strings.TrimSpace(path)
 	a.fileSnapshotDigest = digest
+	a.fileUpdatePath = a.fileSnapshotPath
+	a.fileUpdateDigest = digest
 	a.fileSnapshotPersistenceDone = nil
 }
 
@@ -295,12 +308,23 @@ func (a *Auth) RecordPersistedFileSnapshot(path string, data []byte) {
 	}
 	a.persistedFileSnapshot = persistedAuthFileSnapshot{}
 	if path != "" && len(data) > 0 {
+		a.RecordAuthFileUpdateSource(path, data)
 		a.persistedFileSnapshot = persistedAuthFileSnapshot{
-			path: strings.TrimSpace(path), digest: canonicalAuthFileDigest(data),
+			path: a.fileUpdatePath, digest: a.fileUpdateDigest,
 			origin: a.fileOrigin,
 			epoch:  a.RegistrationEpoch, credentialVersion: a.CredentialVersion, grant: AuthGrantFingerprint(a),
 		}
 	}
+}
+
+// RecordAuthFileUpdateSource records bytes read by a trusted file store without
+// turning a loaded credential into an unversioned watcher observation.
+func (a *Auth) RecordAuthFileUpdateSource(path string, data []byte) {
+	if a == nil {
+		return
+	}
+	a.fileUpdatePath = strings.TrimSpace(path)
+	a.fileUpdateDigest = canonicalAuthFileDigest(data)
 }
 
 // HasPersistedFileSnapshot reports whether an observation matches a successful

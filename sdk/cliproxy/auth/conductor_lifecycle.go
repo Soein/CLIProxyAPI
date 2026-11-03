@@ -337,7 +337,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 
 // Modify loads the latest auth for id while holding the per-auth mutation gate,
 // applies edit to a clone of that auth, and commits the result through the
-// standard persistence and publication path. Identity and ordering metadata
+// standard persistence path before publishing. Identity and ordering metadata
 // remain manager-owned even when edit replaces the whole snapshot. It returns
 // (nil, false, nil) if the auth is not present when the gate is acquired. The
 // callback runs once; a concurrent business change returns ErrAuthStoreConflict
@@ -513,7 +513,7 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 			unlockPersistence()
 		}
 	}()
-	if persistMetaMint {
+	if persistMetaMint || modifyBase != nil {
 		unlockPersistence = m.lockAuthPersistence([]string{auth.ID})
 	}
 
@@ -710,6 +710,7 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		existingVersion = 1
 	}
 	credChanged := CredentialsChanged(existing, auth)
+	inheritAuthFileUpdateSource(existing, auth)
 	auth.persistedFileSnapshot = persistedAuthFileSnapshot{}
 	switch {
 	case isFileSnapshot:
@@ -1077,9 +1078,47 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		return committed, true, nil
 	}
 
+	if modifyBase != nil {
+		preSave := existing.Clone()
+		candidate := auth.Clone()
+		m.markPersistenceInFlightLocked(ctx, candidate)
+		m.mu.Unlock()
+		errPersist := m.persistCandidate(withAuthFileUpdateBase(ctx, modifyBase), candidate)
+		if errPersist != nil {
+			m.clearPersistenceInFlight(candidate.ID, candidate.durableRevision)
+			unlockPersistence()
+			unlockPersistence = nil
+			releaseMutation()
+			m.reloadAfterAuthStoreConflict(ctx, candidate.ID, errPersist)
+			return nil, false, fmt.Errorf("persist modified auth %q: %w", candidate.ID, errPersist)
+		}
+		m.mu.Lock()
+		current := m.auths[candidate.ID]
+		if current == nil || current.RegistrationEpoch != preSave.RegistrationEpoch ||
+			(current.durableRevision != preSave.durableRevision && !m.canMergePendingDisableLocked(preSave, current)) {
+			m.clearPersistenceInFlightLocked(candidate.ID, candidate.durableRevision)
+			m.mu.Unlock()
+			return nil, false, fmt.Errorf("modify auth %s: changed during persistence: %w", candidate.ID, ErrAuthStoreConflict)
+		}
+		mergeAuthSaveDelta(candidate, preSave, current, true)
+		applyPreservedRejectedTokens(current, candidate, false)
+		applyPreservedRenewalState(current, candidate, updateModeReplace, time.Now())
+		candidate.Success = current.Success
+		candidate.Failed = current.Failed
+		candidate.recentRequests = current.recentRequests
+		candidate.cooldownRecordedSeq = current.cooldownRecordedSeq
+		candidate.Generation = max(candidate.Generation, current.Generation)
+		candidate.revision = m.nextAuthRevisionLocked()
+		m.clearPersistenceInFlightLocked(candidate.ID, candidate.durableRevision)
+		candidate.durableRevision = max(candidate.durableRevision, current.durableRevision)
+		auth = candidate
+	}
+
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
-	m.markPersistenceInFlightLocked(ctx, authClone)
+	if modifyBase == nil {
+		m.markPersistenceInFlightLocked(ctx, authClone)
+	}
 	m.notifyAuthChangeLocked(auth.ID)
 	// Snapshot before unlocking: MarkResult mutates the published auth in place.
 	var schedulerSnapshot *Auth
@@ -1087,6 +1126,10 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		schedulerSnapshot = authClone.Clone()
 	}
 	m.mu.Unlock()
+	if unlockPersistence != nil {
+		unlockPersistence()
+		unlockPersistence = nil
+	}
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -1095,7 +1138,11 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 	}
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
-	if errPersist := m.persistPublishedIfCurrent(ctx, authClone); errPersist != nil {
+	var errPersist error
+	if modifyBase == nil {
+		errPersist = m.persistPublishedIfCurrent(ctx, authClone)
+	}
+	if errPersist != nil {
 		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("failed to persist updated auth %s (%s): %v", auth.Provider, auth.ID, errPersist)
 		releaseMutation()
 		m.reloadAfterAuthStoreConflict(ctx, auth.ID, errPersist)

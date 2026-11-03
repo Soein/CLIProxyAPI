@@ -163,6 +163,7 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	if auth == nil {
 		return "", fmt.Errorf("object store: auth is nil")
 	}
+	auth.RecordPersistedFileSnapshot("", nil)
 	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
 		return "", fmt.Errorf("object store: %w", errWeight)
@@ -177,6 +178,9 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	}
 	unlockPath := authfilelock.Lock(path)
 	defer unlockPath()
+	if _, errValidate := validateMirroredCredentialUpdate(ctx, path); errValidate != nil {
+		return "", errValidate
+	}
 
 	// Runtime updates must not recreate a disabled credential whose source file
 	// was deliberately removed. Login and migration callers explicitly mark the
@@ -194,47 +198,8 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		return "", fmt.Errorf("object store: create auth directory: %w", err)
 	}
 
-	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
-		if errCodex != nil {
-			return "", errCodex
-		}
-	} else {
-		switch {
-		case auth.Storage != nil:
-			if auth.Metadata == nil {
-				auth.Metadata = make(map[string]any)
-			}
-			auth.Metadata["disabled"] = auth.Disabled
-			if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
-				setter.SetMetadata(auth.Metadata)
-			}
-			if err = auth.Storage.SaveTokenToFile(path); err != nil {
-				return "", err
-			}
-		case auth.Metadata != nil:
-			auth.Metadata["disabled"] = auth.Disabled
-			raw, errMarshal := json.Marshal(auth.Metadata)
-			if errMarshal != nil {
-				return "", fmt.Errorf("object store: marshal metadata: %w", errMarshal)
-			}
-			contentsMatch := false
-			if existing, errRead := os.ReadFile(path); errRead == nil {
-				contentsMatch = jsonEqual(existing, raw)
-			} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
-				return "", fmt.Errorf("object store: read existing metadata: %w", errRead)
-			}
-			if !contentsMatch {
-				tmp := path + ".tmp"
-				if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-					return "", fmt.Errorf("object store: write temp auth file: %w", errWrite)
-				}
-				if errRename := os.Rename(tmp, path); errRename != nil {
-					return "", fmt.Errorf("object store: rename auth file: %w", errRename)
-				}
-			}
-		default:
-			return "", fmt.Errorf("object store: nothing to persist for %s", auth.ID)
-		}
+	if errPersist := persistMirroredCredential(ctx, path, auth); errPersist != nil {
+		return "", errPersist
 	}
 
 	if auth.Attributes == nil {
@@ -647,6 +612,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		auth.Disabled = true
 		auth.Status = cliproxyauth.StatusDisabled
 	}
+	auth.RecordAuthFileUpdateSource(path, data)
 	return auth, nil
 }
 

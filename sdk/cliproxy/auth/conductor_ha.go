@@ -693,7 +693,10 @@ func mergePersistedAuthRuntime(persisted, current *Auth) *Auth {
 	} else {
 		merged.EnsureIndex()
 	}
-	if merged.Storage == nil {
+	// A file reload can replace the grant before its watcher event is replayed.
+	// Retaining token storage from the old grant would write those secrets back
+	// on the next metadata edit.
+	if merged.Storage == nil && !(merged.fileUpdateDigest != "" && (merged.fileUpdatePath != local.fileUpdatePath || merged.fileUpdateDigest != local.fileUpdateDigest)) {
 		merged.Storage = local.Storage
 	}
 	if strings.TrimSpace(merged.FileName) == "" {
@@ -1618,7 +1621,12 @@ func (m *Manager) persistPendingDisabled(ctx context.Context, authID string) err
 	}
 	snapshot := current.Clone()
 	m.mu.RUnlock()
-	return m.persist(ctx, snapshot)
+	beforeSave := snapshot.Clone()
+	if errPersist := m.persist(ctx, snapshot); errPersist != nil {
+		return errPersist
+	}
+	m.mergePublishedSaveDelta(beforeSave, snapshot, true)
+	return nil
 }
 
 func isExplicitlyNonPersistentAuth(auth *Auth) bool {
@@ -1727,6 +1735,10 @@ func (m *Manager) reloadAfterAuthStoreConflict(ctx context.Context, authID strin
 }
 
 func (m *Manager) reloadAfterAuthStoreConflicts(ctx context.Context, authIDs []string, persistErr error) {
+	if errors.Is(persistErr, ErrAuthFileSourceUnavailable) {
+		m.failCloseAuthStoreConflicts(authIDs)
+		return
+	}
 	m.convergeAuthStoreConflicts(ctx, authIDs, persistErr, nil, nil)
 }
 

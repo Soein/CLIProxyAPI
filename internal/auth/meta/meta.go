@@ -127,14 +127,15 @@ var metaCredentialFields = map[string]struct{}{
 	"last_refresh":   {},
 }
 
-// SaveTokenToFile writes Meta credentials to a JSON auth file.
-func (ts *MetaTokenStorage) SaveTokenToFile(authFilePath string) error {
-	ts.Type = "meta"
-	ts.AuthKind = "oauth"
-	if errMkdirAll := os.MkdirAll(filepath.Dir(authFilePath), 0o700); errMkdirAll != nil {
-		return fmt.Errorf("meta token storage: create directory: %w", errMkdirAll)
+// MarshalTokenJSON serializes the complete Meta auth-file payload without IO.
+func (ts *MetaTokenStorage) MarshalTokenJSON() ([]byte, error) {
+	if ts == nil {
+		return nil, fmt.Errorf("meta token storage is nil")
 	}
+	return ts.marshalTokenJSON(ts.Metadata, ts.Metadata != nil)
+}
 
+func (ts *MetaTokenStorage) marshalTokenJSON(metadata map[string]any, supplied bool) ([]byte, error) {
 	data := map[string]any{
 		"type":         "meta",
 		"auth_kind":    "oauth",
@@ -173,7 +174,30 @@ func (ts *MetaTokenStorage) SaveTokenToFile(authFilePath string) error {
 	if ts.Name != "" {
 		data["name"] = ts.Name
 	}
-	// Managed saves supply the current metadata, including deliberate deletions.
+	for k, v := range metadata {
+		if _, isCred := metaCredentialFields[k]; isCred {
+			continue
+		}
+		// Supplied settings take precedence over storage's older snapshot.
+		if _, exists := data[k]; !exists || supplied {
+			data[k] = v
+		}
+	}
+
+	raw, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("meta token storage: encode token file: %w", err)
+	}
+	return append(raw, '\n'), nil
+}
+
+// SaveTokenToFile writes Meta credentials to a JSON auth file.
+func (ts *MetaTokenStorage) SaveTokenToFile(authFilePath string) error {
+	ts.Type = "meta"
+	ts.AuthKind = "oauth"
+	if errMkdirAll := os.MkdirAll(filepath.Dir(authFilePath), 0o700); errMkdirAll != nil {
+		return fmt.Errorf("meta token storage: create directory: %w", errMkdirAll)
+	}
 	// Only login callers without a metadata snapshot inherit settings from disk.
 	metadata := ts.Metadata
 	if metadata == nil {
@@ -181,26 +205,16 @@ func (ts *MetaTokenStorage) SaveTokenToFile(authFilePath string) error {
 			_ = json.Unmarshal(raw, &metadata)
 		}
 	}
-	for k, v := range metadata {
-		if _, isCred := metaCredentialFields[k]; isCred {
-			continue
-		}
-		// Supplied settings take precedence over storage's older snapshot.
-		if _, exists := data[k]; !exists || ts.Metadata != nil {
-			data[k] = v
-		}
-	}
-
-	raw, err := json.MarshalIndent(data, "", "  ")
+	raw, err := ts.marshalTokenJSON(metadata, ts.Metadata != nil)
 	if err != nil {
-		return fmt.Errorf("meta token storage: encode token file: %w", err)
+		return err
 	}
 	file, err := os.CreateTemp(filepath.Dir(authFilePath), ".meta-token-*")
 	if err != nil {
 		return fmt.Errorf("meta token storage: create token file: %w", err)
 	}
 	defer func() { _ = os.Remove(file.Name()) }()
-	if _, errWrite := file.Write(append(raw, '\n')); errWrite != nil {
+	if _, errWrite := file.Write(raw); errWrite != nil {
 		_ = file.Close()
 		return fmt.Errorf("meta token storage: write token file: %w", errWrite)
 	}

@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -209,12 +210,33 @@ func runDelayedLoginAfterDisable(t *testing.T, reload string) {
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(loggedIn.ID) })
 
 	current, _ := manager.GetByID(loggedIn.ID)
-	disabled, committed, errModify := manager.Modify(context.Background(), current.ID, current.RegistrationEpoch, func(a *coreauth.Auth) error {
+	disable := func(a *coreauth.Auth) error {
 		a.Disabled, a.Status = true, coreauth.StatusDisabled
 		return nil
-	})
+	}
+	disabled, committed, errModify := manager.Modify(context.Background(), current.ID, current.RegistrationEpoch, disable)
+	if !committed && errors.Is(errModify, coreauth.ErrAuthStoreConflict) {
+		raw, errRead := os.ReadFile(path)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		var metadata map[string]any
+		if errDecode := json.Unmarshal(raw, &metadata); errDecode != nil || metadata["access_token"] != "t1" {
+			t.Fatalf("conflicting disable overwrote the newly persisted login: %s err=%v", raw, errDecode)
+		}
+		current, _ = manager.GetByID(loggedIn.ID)
+		disabled, committed, errModify = manager.Modify(context.Background(), current.ID, current.RegistrationEpoch, disable)
+	}
 	if errModify != nil || !committed {
 		t.Fatalf("operator disable: committed=%v err=%v", committed, errModify)
+	}
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var metadata map[string]any
+	if errDecode := json.Unmarshal(raw, &metadata); errDecode != nil || metadata["access_token"] != "t1" {
+		t.Fatalf("operator disable lost the newly persisted login: %s err=%v", raw, errDecode)
 	}
 	if errHook := hook(context.Background(), disabled); errHook != nil {
 		t.Fatal(errHook)

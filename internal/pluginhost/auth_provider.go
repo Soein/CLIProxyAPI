@@ -1093,6 +1093,11 @@ type pluginTokenStorage struct {
 	meta     map[string]any
 }
 
+// CloneTokenStorage isolates mutable plugin serialization state for an auth edit.
+func (s *pluginTokenStorage) CloneTokenStorage() coreauth.TokenStorage {
+	return &pluginTokenStorage{provider: s.provider, rawJSON: bytes.Clone(s.rawJSON), meta: cloneAnyMap(s.meta)}
+}
+
 func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 	if s == nil {
 		return

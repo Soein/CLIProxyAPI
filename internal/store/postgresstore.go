@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -1008,6 +1009,13 @@ type postgresAuthMetadataSetter interface {
 }
 
 func (s *PostgresStore) prepareAuthTemp(ctx context.Context, auth *cliproxyauth.Auth, path, relID string) (tempPath string, data []byte, err error) {
+	if cliproxyauth.IsAuthModification(ctx) && auth.Storage != nil {
+		storage, okClone := sdkauth.CloneTokenStorageForUpdate(auth.Storage)
+		if !okClone {
+			return "", nil, fmt.Errorf("postgres store: token storage must support private cloning for edits: %w", cliproxyauth.ErrAuthStorageEditUnsupported)
+		}
+		auth.Storage = storage
+	}
 	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
 		return "", nil, fmt.Errorf("postgres store: create auth directory: %w", errMkdir)
 	}
