@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"runtime"
 	"strings"
@@ -100,7 +101,82 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 	s.handleAuthUpdates(ctx, []watcher.AuthUpdate{update})
 }
 
+type authUpdateState struct {
+	revision uint64
+	result   *authRegistrationResult
+}
+
+type authRegistrationResult struct {
+	accepted bool
+	pending  <-chan struct{}
+	done     <-chan struct{}
+	err      error
+}
+
+// syncPersistedFileAuth keeps explicit login completion separate from reentrant
+// watcher delivery. Every retry follows a persistence notification and validates
+// the original file observation; a consumed revision alone does not prove activation.
+func (s *Service) syncPersistedFileAuth(ctx context.Context, update watcher.AuthUpdate) error {
+	id := authUpdateID(update)
+	expected := update.Auth.Clone()
+	s.handleAuthUpdate(ctx, update)
+	for {
+		if errContext := ctx.Err(); errContext != nil {
+			return errContext
+		}
+		s.authUpdateMu.Lock()
+		result := s.authRevisions[id].result
+		s.authUpdateMu.Unlock()
+		if result == nil || result.done == nil {
+			return fmt.Errorf("activate persisted auth %s: %w", update.ID, coreauth.ErrAuthStoreConflict)
+		}
+		select {
+		case <-result.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if result.err != nil {
+			return fmt.Errorf("activate persisted auth %s: %w", update.ID, result.err)
+		}
+		if !expected.FileSnapshotMatchesDisk() {
+			return fmt.Errorf("activate persisted auth %s: file observation was superseded or removed: %w", update.ID, coreauth.ErrAuthStoreConflict)
+		}
+		if result.accepted {
+			current, exists := s.coreManager.GetByID(expected.ID)
+			if !exists || current == nil || coreauth.CredentialsChanged(current, expected) ||
+				current.Provider != expected.Provider || current.Prefix != expected.Prefix ||
+				(current.Disabled || current.Status == coreauth.StatusDisabled) != (expected.Disabled || expected.Status == coreauth.StatusDisabled) ||
+				!maps.Equal(current.Attributes, expected.Attributes) {
+				return fmt.Errorf("activate persisted auth %s: runtime was superseded: %w", update.ID, coreauth.ErrAuthStoreConflict)
+			}
+			s.authUpdateMu.Lock()
+			stillCurrent := s.authRevisions[id].result == result
+			s.authUpdateMu.Unlock()
+			if !stillCurrent {
+				continue
+			}
+			return nil
+		}
+		if result.pending == nil {
+			return fmt.Errorf("activate persisted auth %s: file observation was discarded: %w", update.ID, coreauth.ErrAuthStoreConflict)
+		}
+		select {
+		case <-result.pending:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		// Retry only if this is still the latest result when the handler owns
+		// authUpdateMu. A watcher reread may already have activated the same file.
+		update.SetRevision(0)
+		s.handleAuthUpdatesIfResultCurrent(ctx, []watcher.AuthUpdate{update}, result)
+	}
+}
+
 func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthUpdate) {
+	s.handleAuthUpdatesIfResultCurrent(ctx, updates, nil)
+}
+
+func (s *Service) handleAuthUpdatesIfResultCurrent(ctx context.Context, updates []watcher.AuthUpdate, expected *authRegistrationResult) {
 	if s == nil {
 		return
 	}
@@ -122,9 +198,12 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			s.authUpdateMu.Unlock()
 		}
 	}()
+	if expected != nil && (len(updates) != 1 || s.authRevisions[authUpdateID(updates[0])].result != expected) {
+		return
+	}
 
 	if s.authRevisions == nil {
-		s.authRevisions = make(map[string]uint64)
+		s.authRevisions = make(map[string]authUpdateState)
 	}
 
 	filtered := make([]watcher.AuthUpdate, 0, len(updates))
@@ -139,14 +218,16 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 		}
 		rev := update.Revision()
 		if rev > 0 {
-			if prevRev, exists := s.authRevisions[id]; exists && rev <= prevRev {
-				log.Debugf("skipping stale auth update for %s: rev %d <= processed %d", id, rev, prevRev)
+			if prev, exists := s.authRevisions[id]; exists && rev <= prev.revision {
+				log.Debugf("skipping stale auth update for %s: rev %d <= processed %d", id, rev, prev.revision)
 				if ch := s.authRegistrationWaitCh(id); ch != nil {
 					skippedWaits = append(skippedWaits, ch)
 				}
 				continue
 			}
-			s.authRevisions[id] = rev
+			state := s.authRevisions[id]
+			state.revision = rev
+			s.authRevisions[id] = state
 		}
 		wait := s.beginAuthRegistration(id)
 		startedRegs = append(startedRegs, wait)
@@ -162,7 +243,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	if len(filtered) == 0 {
 		locked = false
 		s.authUpdateMu.Unlock()
-		waitAuthRegistrations(skippedWaits)
+		waitAuthRegistrations(ctx, skippedWaits)
 		return
 	}
 	updates = coalesceAuthUpdates(filtered)
@@ -172,7 +253,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	if cfg == nil || s.coreManager == nil {
 		locked = false
 		s.authUpdateMu.Unlock()
-		waitAuthRegistrations(skippedWaits)
+		waitAuthRegistrations(ctx, skippedWaits)
 		return
 	}
 
@@ -186,6 +267,21 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			if update.Auth == nil || update.Auth.ID == "" {
 				continue
 			}
+			id := authUpdateID(update)
+			var result *authRegistrationResult
+			state, tracked := s.authRevisions[id]
+			if update.Auth.HasFileSnapshot() && !(versionedStore && authUpdateUsesAuthoritativeStore(update.Auth)) {
+				result = &authRegistrationResult{done: startedWaitByID[id].ch}
+				state.result = result
+				s.authRevisions[id] = state
+			} else if tracked && state.result != nil {
+				if state.revision == 0 {
+					delete(s.authRevisions, id)
+				} else {
+					state.result = nil
+					s.authRevisions[id] = state
+				}
+			}
 			if versionedStore && authUpdateUsesAuthoritativeStore(update.Auth) {
 				// A file snapshot is only a persistence proposal for a CAS-backed
 				// store. Reload the authoritative row so an older snapshot cannot
@@ -197,7 +293,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 				needsAliasRebuild = true
 				continue
 			}
-			auth := s.prepareCoreAuthForModelRegistration(registrationCtx, update.Auth)
+			auth := s.prepareCoreAuthForModelRegistrationWithResult(registrationCtx, update.Auth, result)
 			if auth == nil {
 				continue
 			}
@@ -206,7 +302,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			expectedGeneration := authForRegistration.Generation
 			expectedDisabled := authForRegistration.Disabled
 			authID := authForRegistration.ID
-			wait := startedWaitByID[authID]
+			wait := startedWaitByID[id]
 			tasks = append(tasks, modelRegistrationTask{
 				phase:    modelRegistrationPhase(authForRegistration),
 				category: modelRegistrationCategory(authForRegistration),
@@ -256,6 +352,14 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 				}
 			}
 			s.applyCoreAuthRemoval(registrationCtx, id)
+			if state, tracked := s.authRevisions[id]; tracked && state.result != nil {
+				if state.revision == 0 {
+					delete(s.authRevisions, id)
+				} else {
+					state.result = nil
+					s.authRevisions[id] = state
+				}
+			}
 			needsAliasRebuild = true
 		default:
 			log.Debugf("received unknown auth update action: %v", update.Action)
@@ -270,7 +374,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	s.runModelRegistrationTasks(registrationCtx, tasks)
 	finishAuthRegistrations(s, startedRegs)
 	registrationsFinished = true
-	waitAuthRegistrations(skippedWaits)
+	waitAuthRegistrations(ctx, skippedWaits)
 }
 
 func authUpdateUsesAuthoritativeStore(auth *coreauth.Auth) bool {
@@ -622,21 +726,32 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 }
 
 func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth *coreauth.Auth) *coreauth.Auth {
+	return s.prepareCoreAuthForModelRegistrationWithResult(ctx, auth, nil)
+}
+
+func (s *Service) prepareCoreAuthForModelRegistrationWithResult(ctx context.Context, auth *coreauth.Auth, result *authRegistrationResult) (prepared *coreauth.Auth) {
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return nil
 	}
 	authID := auth.ID
 	auth = auth.Clone()
+	var (
+		res *coreauth.Auth
+		err error
+	)
+	if result != nil {
+		defer func() {
+			result.pending = auth.FileSnapshotPersistenceDone()
+			result.accepted = err == nil && prepared != nil && !auth.HasFileSnapshot()
+			result.err = err
+		}()
+	}
 	s.ensureExecutorsForAuthWithContext(ctx, auth, false)
 
 	// IMPORTANT: Update coreManager FIRST, before model registration.
 	// This ensures that configuration changes (proxy_url, prefix, etc.) take effect
 	// immediately for API calls, rather than waiting for model registration to complete.
 	op := "register"
-	var (
-		res *coreauth.Auth
-		err error
-	)
 	if existing, ok := s.coreManager.GetByID(authID); ok {
 		if isStaleCoreAuth(existing, auth) {
 			log.Debugf("skipping stale auth update for %s: incoming gen=%d, existing gen=%d", authID, auth.Generation, existing.Generation)
@@ -680,6 +795,15 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		}
 	} else {
 		res, err = s.coreManager.Register(ctx, auth)
+		if err == nil && auth.HasFileSnapshot() {
+			if w := s.currentWatcher(); w != nil {
+				w.RereadDiscardedFileSnapshot(auth)
+			}
+			return nil
+		}
+	}
+	if err == nil && res == nil && auth.HasFileSnapshot() {
+		return nil
 	}
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, authID, err)
@@ -757,12 +881,16 @@ func finishAuthRegistrations(s *Service, waits []authRegistrationWait) {
 	}
 }
 
-func waitAuthRegistrations(waits []chan struct{}) {
+func waitAuthRegistrations(ctx context.Context, waits []chan struct{}) {
 	for _, ch := range waits {
 		if ch == nil {
 			continue
 		}
-		<-ch
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

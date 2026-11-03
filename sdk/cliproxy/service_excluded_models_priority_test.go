@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +28,9 @@ func TestCodexExcludedModelsCredentialPriorityAfterPatchAndReload(t *testing.T) 
 	sctx := &synthesizer.SynthesisContext{Config: cfg, AuthDir: cfg.AuthDir, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()}
 	load := func(raw string) *coreauth.Auth {
 		t.Helper()
+		if errWrite := os.WriteFile(path, []byte(raw), 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
 		auths, err := synthesizer.SynthesizeAuthFile(sctx, path, []byte(raw))
 		if err != nil || len(auths) != 1 {
 			t.Fatalf("synthesis: %v, count=%d", err, len(auths))

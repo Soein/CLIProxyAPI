@@ -625,6 +625,7 @@ func (m *Manager) removeAuthsLocked(ids []string) []removedAuthState {
 
 		existing := m.auths[id]
 		if existing == nil {
+			m.advanceAuthRemovalEpochLocked(id, nil)
 			continue
 		}
 		delete(m.auths, id)

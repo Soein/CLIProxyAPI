@@ -142,9 +142,18 @@ func (m *Manager) advanceAuthRemovalEpochLocked(id string, current *Auth) uint64
 }
 
 // Register inserts a new auth entry into the manager.
+// When persistence is skipped, bound file snapshots for existing IDs reconcile
+// through Update. Discarded observations retain their binding and return the
+// current auth (nil if absent) without an error; FileSnapshotPersistenceDone may
+// defer their next file read. Ordinary registrations may create or replace files.
 func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
+	}
+	input := auth
+	isFileSnapshot := shouldSkipPersist(ctx) && auth.HasFileSnapshot()
+	if isFileSnapshot {
+		auth = auth.Clone()
 	}
 	NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
@@ -159,6 +168,31 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, errMutation
 	}
 	defer releaseMutation()
+	var fileSnapshotEpoch uint64
+	if isFileSnapshot {
+		m.mu.RLock()
+		existing := m.auths[auth.ID]
+		fileSnapshotEpoch = m.authEpochs[auth.ID]
+		input.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
+		if existing != nil {
+			m.mu.RUnlock()
+			releaseMutation()
+			return m.Update(ctx, input)
+		}
+		m.mu.RUnlock()
+		if input.fileSnapshotPersistenceDone != nil {
+			return nil, nil
+		}
+		// Validate without m.mu or a persistence lock: Store.Save may deliver
+		// watcher snapshots reentrantly. Fence the observation before publishing.
+		if !auth.FileSnapshotMatchesDisk() {
+			m.mu.RLock()
+			current := m.auths[auth.ID].Clone()
+			input.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
+			m.mu.RUnlock()
+			return current, nil
+		}
+	}
 	now := time.Now()
 	if auth.Generation == 0 {
 		auth.Generation = 1
@@ -180,6 +214,14 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	m.mu.Lock()
 	existing := m.auths[auth.ID]
+	if isFileSnapshot {
+		input.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
+		if existing != nil || m.authEpochs[auth.ID] != fileSnapshotEpoch || input.fileSnapshotPersistenceDone != nil {
+			current := existing.Clone()
+			m.mu.Unlock()
+			return current, nil
+		}
+	}
 	registeringNew := existing == nil
 	if existing != nil && auth.StoreGeneration() == 0 {
 		auth.SetStoreGeneration(existing.StoreGeneration())
@@ -211,6 +253,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.revision = m.nextAuthRevisionLocked()
 	auth.durableRevision = m.nextAuthDurableRevisionLocked()
 	auth.ClearFileSnapshot()
+	if isFileSnapshot {
+		*input = *auth
+	}
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.markPersistenceInFlightLocked(ctx, authClone)
@@ -379,7 +424,7 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 	}
 
 	isFileSnapshot := mode == updateModeReplace && auth.HasFileSnapshot()
-	var fileSnapshotEpoch, fileSnapshotRevision uint64
+	var fileSnapshotEpoch, fileSnapshotRevision, fileSaveRevision uint64
 	if isFileSnapshot {
 		auth.fileSnapshotPersistenceDone = nil
 		m.mu.RLock()
@@ -388,13 +433,14 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 			m.mu.RUnlock()
 			return nil, false, nil
 		}
-		auth.fileSnapshotPersistenceDone = m.persistenceInFlightDone[auth.ID]
+		auth.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
 		if auth.fileSnapshotPersistenceDone != nil {
 			current := existing.Clone()
 			m.mu.RUnlock()
 			return current, false, nil
 		}
 		fileSnapshotEpoch, fileSnapshotRevision = existing.RegistrationEpoch, existing.durableRevision
+		fileSaveRevision = existing.fileSaveRevision
 		m.mu.RUnlock()
 		// Watchers bypass the mutation gate, so fence the disk observation with
 		// durable state rather than runtime-only result revisions. Never hold m.mu
@@ -402,7 +448,7 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		if !auth.FileSnapshotMatchesDisk() {
 			m.mu.RLock()
 			current := m.auths[auth.ID].Clone()
-			auth.fileSnapshotPersistenceDone = m.persistenceInFlightDone[auth.ID]
+			auth.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
 			m.mu.RUnlock()
 			return current, false, nil
 		}
@@ -414,8 +460,8 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 		return nil, false, nil
 	}
 	if isFileSnapshot {
-		auth.fileSnapshotPersistenceDone = m.persistenceInFlightDone[auth.ID]
-		if auth.fileSnapshotPersistenceDone != nil || existing.RegistrationEpoch != fileSnapshotEpoch || existing.durableRevision != fileSnapshotRevision {
+		auth.fileSnapshotPersistenceDone = m.pendingFileSnapshotPersistenceLocked(auth.ID)
+		if auth.fileSnapshotPersistenceDone != nil || existing.RegistrationEpoch != fileSnapshotEpoch || existing.durableRevision != fileSnapshotRevision || existing.fileSaveRevision != fileSaveRevision {
 			current := existing.Clone()
 			m.mu.Unlock()
 			return current, false, nil

@@ -154,6 +154,7 @@ type Auth struct {
 	revision           uint64            `json:"-"`
 	durableRevision    uint64            `json:"-"`
 	storeGeneration    uint64            `json:"-"`
+	fileSaveRevision   uint64            `json:"-"`
 	fileSnapshotPath   string            `json:"-"`
 	fileSnapshotDigest string            `json:"-"`
 

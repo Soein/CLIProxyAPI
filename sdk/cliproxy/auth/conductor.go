@@ -185,6 +185,7 @@ type Manager struct {
 	authDurableRevision          uint64
 	persistenceInFlightRevisions map[string]uint64
 	persistenceInFlightDone      map[string]chan struct{}
+	metadataPersistenceDone      map[string]chan struct{}
 	pendingDisabledPersistence   map[string]struct{}
 	enablingTransitions          map[string]int
 	syncSchedulerMu              sync.Mutex

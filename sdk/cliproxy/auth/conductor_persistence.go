@@ -393,6 +393,16 @@ func equalSaveValue(a, b reflect.Value) bool {
 	return reflect.DeepEqual(a.Interface(), b.Interface())
 }
 
+// pendingFileSnapshotPersistenceLocked fences file observations without making
+// metadata saves part of lifecycle persistence or its reentrant store reloads.
+// The caller must hold m.mu.
+func (m *Manager) pendingFileSnapshotPersistenceLocked(authID string) <-chan struct{} {
+	if done := m.metadataPersistenceDone[authID]; done != nil {
+		return done
+	}
+	return m.persistenceInFlightDone[authID]
+}
+
 // PersistMetadataEntry updates a single metadata entry on the runtime auth for
 // the given registration epoch and persists it to the backing store without
 // advancing Generation or firing credential-lifecycle hooks. It reports whether
@@ -458,9 +468,21 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 		updated.Metadata = make(map[string]any)
 	}
 	updated.Metadata[key] = value
+	var persistenceDone chan struct{}
+	if m.shouldPersistAuthLocked(persistCtx, updated) {
+		if m.metadataPersistenceDone == nil {
+			m.metadataPersistenceDone = make(map[string]chan struct{})
+		}
+		persistenceDone = make(chan struct{})
+		m.metadataPersistenceDone[id] = persistenceDone
+	}
 	m.mu.Unlock()
 	errPersist := m.persistCandidate(persistCtx, updated)
 	m.mu.Lock()
+	if persistenceDone != nil {
+		delete(m.metadataPersistenceDone, id)
+		close(persistenceDone)
+	}
 	if errPersist != nil {
 		if !preempted.Load() {
 			log.WithFields(log.Fields{"auth_id": updated.ID, "credential": updated.ID, "provider": updated.Provider}).Warnf("failed to persist metadata for auth %s (%s): %v", updated.Provider, updated.ID, errPersist)
@@ -478,24 +500,25 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 		m.mu.Unlock()
 		return false, false
 	}
-	if current.StoreGeneration() == existingBeforeSave.StoreGeneration() && updated.StoreGeneration() > current.StoreGeneration() {
-		current = current.Clone()
-		current.SetStoreGeneration(updated.StoreGeneration())
+	published := current.Clone()
+	if persistenceDone != nil {
+		published.fileSaveRevision++
 	}
-	if validate != nil && !validate(current) {
-		invalidated := current.Clone()
-		if invalidated.Metadata != nil {
-			delete(invalidated.Metadata, key)
+	if current.StoreGeneration() == existingBeforeSave.StoreGeneration() && updated.StoreGeneration() > current.StoreGeneration() {
+		published.SetStoreGeneration(updated.StoreGeneration())
+	}
+	if validate != nil && !validate(published) {
+		if published.Metadata != nil {
+			delete(published.Metadata, key)
 		}
-		m.auths[id] = invalidated
-		schedulerSnapshot := invalidated.Clone()
+		m.auths[id] = published
+		schedulerSnapshot := published.Clone()
 		m.mu.Unlock()
 		if m.scheduler != nil {
 			m.schedulerUpsert(schedulerSnapshot)
 		}
 		return false, false
 	}
-	published := current.Clone()
 	mergeAuthSaveDelta(published, existingBeforeSave, updated, true)
 	m.auths[id] = published
 	schedulerSnapshot := published.Clone()

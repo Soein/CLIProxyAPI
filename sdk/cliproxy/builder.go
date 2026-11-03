@@ -337,6 +337,19 @@ func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {
 		// once the credential has been persisted to disk. If the watcher consumer already
 		// claimed this revision, handleAuthUpdate waits for that registration to finish.
 		syncCtx := coreauth.WithSkipPersist(context.Background())
+		versionedStore := false
+		if s.coreManager != nil {
+			_, versionedStore = s.coreManager.GetStore().(coreauth.VersionedAuthStore)
+		}
+		if auth.HasFileSnapshot() && !(versionedStore && authUpdateUsesAuthoritativeStore(auth)) {
+			s.cfgMu.RLock()
+			lifetime := s.antigravityContext
+			s.cfgMu.RUnlock()
+			if lifetime != nil {
+				syncCtx = coreauth.WithSkipPersist(lifetime)
+			}
+			return s.syncPersistedFileAuth(syncCtx, update)
+		}
 		s.handleAuthUpdate(syncCtx, update)
 		return nil
 	}

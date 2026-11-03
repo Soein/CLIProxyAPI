@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -218,8 +219,8 @@ func runDelayedLoginAfterDisable(t *testing.T, reload string) {
 	if errHook := hook(context.Background(), disabled); errHook != nil {
 		t.Fatal(errHook)
 	}
-	if errHook := hook(context.Background(), loggedIn); errHook != nil {
-		t.Fatal(errHook)
+	if errHook := hook(context.Background(), loggedIn); !errors.Is(errHook, coreauth.ErrAuthStoreConflict) {
+		t.Fatalf("login superseded by operator disable: err=%v, want conflict", errHook)
 	}
 	drain()
 	if got, _ := manager.GetByID(loggedIn.ID); !got.Disabled {
