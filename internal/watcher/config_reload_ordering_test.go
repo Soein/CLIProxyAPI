@@ -180,3 +180,50 @@ func TestReloadConfigIfChangedReloadsAfterWriteBetweenHashAndLoad_Issue6631(t *t
 		t.Fatalf("applied request-retry values = %v, want %v", applied, want)
 	}
 }
+
+func TestReloadConfigIfChangedRejectsTruncatedLoad_Issue6559(t *testing.T) {
+	configPath, authDir := newIssue6631ConfigFile(t)
+	if errWrite := writeIssue6631Config(configPath, authDir, 1); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	var applied []int
+	w := &Watcher{
+		configPath:     configPath,
+		authDir:        authDir,
+		reloadCallback: func(cfg *config.Config) { applied = append(applied, cfg.RequestRetry) },
+	}
+	w.ReloadConfigIfChanged()
+	previousConfig, previousHash := w.config, w.lastConfigHash
+	if errWrite := writeIssue6631Config(configPath, authDir, 2); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+
+	originalLoad := loadConfigFileFunc
+	t.Cleanup(func() { loadConfigFileFunc = originalLoad })
+	loadConfigFileFunc = func(path string) (*config.Config, error) {
+		// The change check read a complete document, but a later management
+		// save truncates it before the loader's independent read.
+		if errWrite := os.WriteFile(path, nil, 0o600); errWrite != nil {
+			return nil, errWrite
+		}
+		loaded, errLoad := originalLoad(path)
+		if errWrite := writeIssue6631Config(configPath, authDir, 2); errWrite != nil {
+			return nil, errWrite
+		}
+		if errLoad == nil && loaded.SourceHash != config.ComputeSourceHash(nil) {
+			t.Fatal("loader did not observe the truncated file")
+		}
+		return loaded, errLoad
+	}
+	w.ReloadConfigIfChanged()
+	if w.config != previousConfig || w.lastConfigHash != previousHash || w.authDir != authDir || !reflect.DeepEqual(applied, []int{1}) {
+		t.Fatalf("truncated load changed live state: config changed=%v, hash changed=%v, auth-dir changed=%v, applied=%v",
+			w.config != previousConfig, w.lastConfigHash != previousHash, w.authDir != authDir, applied)
+	}
+
+	loadConfigFileFunc = originalLoad
+	w.ReloadConfigIfChanged()
+	if w.config == previousConfig || w.config.RequestRetry != 2 || w.lastConfigHash == previousHash || !reflect.DeepEqual(applied, []int{1, 2}) {
+		t.Fatalf("valid write was not reloaded after the truncated read: request-retry=%d, applied=%v", w.config.RequestRetry, applied)
+	}
+}

@@ -101,6 +101,12 @@ func (w *Watcher) reloadConfig() bool {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
 		return false
 	}
+	// A save may truncate the file after the change check. Use the bytes the
+	// loader actually parsed, before replacing live config or auth directories.
+	if newConfig.SourceHash == config.ComputeSourceHash(nil) {
+		log.Debug("ignoring config truncated during reload")
+		return false
+	}
 
 	if w.mirroredAuthDir != "" {
 		newConfig.AuthDir = w.mirroredAuthDir
