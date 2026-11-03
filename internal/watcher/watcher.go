@@ -68,6 +68,10 @@ type Watcher struct {
 	pluginAuthParser           synthesizer.PluginAuthParser
 	mirroredAuthDir            string
 	oldConfigYaml              []byte
+
+	deferredFileSnapshotRereads map[string]*coreauth.Auth // Guarded by clientsMutex; coalesced by source path.
+	fileSnapshotRereadStop      chan struct{}
+	fileSnapshotRereadWG        sync.WaitGroup
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
@@ -159,6 +163,14 @@ func (w *Watcher) Start(ctx context.Context) error {
 // Stop stops the file watcher
 func (w *Watcher) Stop() error {
 	w.stopped.Store(true)
+	w.clientsMutex.Lock()
+	if w.fileSnapshotRereadStop != nil {
+		close(w.fileSnapshotRereadStop)
+		w.fileSnapshotRereadStop = nil
+	}
+	w.deferredFileSnapshotRereads = nil
+	w.clientsMutex.Unlock()
+	w.fileSnapshotRereadWG.Wait()
 	w.stopDispatch()
 	w.stopConfigReloadTimer()
 	w.stopServerUpdateTimer()
@@ -206,7 +218,8 @@ func (w *Watcher) DispatchPersistedAuthUpdateWithRevision(update *AuthUpdate) (b
 }
 
 // RereadDiscardedFileSnapshot invalidates watcher caches for a file snapshot
-// discarded by the manager's digest fence and re-reads the backing file.
+// discarded by the manager's freshness fence and re-reads the backing file.
+// Pending saves defer the re-read until completion without blocking the caller.
 func (w *Watcher) RereadDiscardedFileSnapshot(auth *coreauth.Auth) {
 	w.rereadDiscardedFileSnapshot(auth)
 }

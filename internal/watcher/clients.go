@@ -242,7 +242,7 @@ func (w *Watcher) addOrUpdateClient(path string) {
 }
 
 func (w *Watcher) rereadDiscardedFileSnapshot(auth *coreauth.Auth) {
-	if w == nil || auth == nil || !auth.HasFileSnapshot() {
+	if w == nil || auth == nil || !auth.HasFileSnapshot() || w.stopped.Load() {
 		return
 	}
 	path := auth.FileSnapshotPath()
@@ -254,9 +254,18 @@ func (w *Watcher) rereadDiscardedFileSnapshot(auth *coreauth.Auth) {
 
 	w.clientsMutex.Lock()
 	existing := w.currentAuths[auth.ID]
-	if existing == nil || !existing.SameFileSnapshot(auth) {
+	if w.stopped.Load() || existing == nil || !existing.SameFileSnapshot(auth) {
 		w.clientsMutex.Unlock()
 		return
+	}
+	if done := auth.FileSnapshotPersistenceDone(); done != nil {
+		select {
+		case <-done:
+		default:
+			w.deferFileSnapshotRereadLocked(path, auth, done)
+			w.clientsMutex.Unlock()
+			return
+		}
 	}
 	normalized := w.invalidateAuthFileHashLocked(path)
 	if normalized == "" {
@@ -272,6 +281,39 @@ func (w *Watcher) rereadDiscardedFileSnapshot(auth *coreauth.Auth) {
 	w.clientsMutex.Unlock()
 
 	w.addOrUpdateClientLocked(path)
+}
+
+// deferFileSnapshotRereadLocked coalesces pending retries by file while keeping
+// Store.Save callbacks reentrant. The caller holds clientsMutex.
+func (w *Watcher) deferFileSnapshotRereadLocked(path string, auth *coreauth.Auth, done <-chan struct{}) {
+	path = w.normalizeAuthPath(path)
+	if w.deferredFileSnapshotRereads == nil {
+		w.deferredFileSnapshotRereads = make(map[string]*coreauth.Auth)
+	}
+	_, pending := w.deferredFileSnapshotRereads[path]
+	w.deferredFileSnapshotRereads[path] = auth.Clone()
+	if pending {
+		return
+	}
+	if w.fileSnapshotRereadStop == nil {
+		w.fileSnapshotRereadStop = make(chan struct{})
+	}
+	stop := w.fileSnapshotRereadStop
+	w.fileSnapshotRereadWG.Add(1)
+	go func() {
+		defer w.fileSnapshotRereadWG.Done()
+		select {
+		case <-done:
+		case <-stop:
+			return
+		}
+		w.clientsMutex.Lock()
+		snapshot := w.deferredFileSnapshotRereads[path]
+		delete(w.deferredFileSnapshotRereads, path)
+		w.clientsMutex.Unlock()
+		// Recheck the current snapshot and any newer pending save before I/O.
+		w.rereadDiscardedFileSnapshot(snapshot)
+	}()
 }
 
 func (w *Watcher) sameNormalizedAuthPath(pathA, pathB string) bool {

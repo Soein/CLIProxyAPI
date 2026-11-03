@@ -156,6 +156,8 @@ type Auth struct {
 	storeGeneration    uint64            `json:"-"`
 	fileSnapshotPath   string            `json:"-"`
 	fileSnapshotDigest string            `json:"-"`
+
+	fileSnapshotPersistenceDone <-chan struct{} `json:"-"`
 }
 
 // StoreGeneration returns the generation last observed from a versioned
@@ -212,6 +214,7 @@ func (a *Auth) BindFileSnapshot(path string, data []byte) {
 	}
 	a.fileSnapshotPath = strings.TrimSpace(path)
 	a.fileSnapshotDigest = digest
+	a.fileSnapshotPersistenceDone = nil
 }
 
 const invalidatedFileSnapshotDigest = "invalidated"
@@ -224,6 +227,17 @@ func (a *Auth) ClearFileSnapshot() {
 	}
 	a.fileSnapshotPath = ""
 	a.fileSnapshotDigest = ""
+	a.fileSnapshotPersistenceDone = nil
+}
+
+// FileSnapshotPersistenceDone returns the completion notification for a save
+// that deferred this file snapshot. Callers must re-read and validate the file
+// after it closes; completion does not imply that the save succeeded.
+func (a *Auth) FileSnapshotPersistenceDone() <-chan struct{} {
+	if !a.HasFileSnapshot() {
+		return nil
+	}
+	return a.fileSnapshotPersistenceDone
 }
 
 // InvalidateFileSnapshot marks an unversioned file snapshot as discarded so a

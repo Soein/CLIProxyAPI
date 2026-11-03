@@ -669,6 +669,11 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 					if w := s.currentWatcher(); w != nil {
 						w.RereadDiscardedFileSnapshot(auth)
 					}
+					if auth.FileSnapshotPersistenceDone() != nil {
+						// A Store.Save callback must not wait on the same auth's
+						// model-registration gate. The deferred reread owns this retry.
+						return nil
+					}
 				}
 				return res
 			}

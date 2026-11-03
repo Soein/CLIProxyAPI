@@ -347,6 +347,8 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	committed, didCommit, errUpdate := m.updateInternalWithMutation(ctx, base, auth, mode, releaseMutation)
 	if didCommit {
 		input.ClearFileSnapshot()
+	} else if input.HasFileSnapshot() {
+		input.fileSnapshotPersistenceDone = auth.fileSnapshotPersistenceDone
 	}
 	return committed, errUpdate
 }
@@ -377,18 +379,30 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 	}
 
 	isFileSnapshot := mode == updateModeReplace && auth.HasFileSnapshot()
+	var fileSnapshotEpoch, fileSnapshotRevision uint64
 	if isFileSnapshot {
+		auth.fileSnapshotPersistenceDone = nil
 		m.mu.RLock()
 		existing, ok := m.auths[auth.ID]
-		m.mu.RUnlock()
 		if !ok || existing == nil {
+			m.mu.RUnlock()
 			return nil, false, nil
 		}
-		// Validate file snapshot freshness under the per-auth mutation gate
-		// without holding m.mu across filesystem I/O.
+		auth.fileSnapshotPersistenceDone = m.persistenceInFlightDone[auth.ID]
+		if auth.fileSnapshotPersistenceDone != nil {
+			current := existing.Clone()
+			m.mu.RUnlock()
+			return current, false, nil
+		}
+		fileSnapshotEpoch, fileSnapshotRevision = existing.RegistrationEpoch, existing.durableRevision
+		m.mu.RUnlock()
+		// Watchers bypass the mutation gate, so fence the disk observation with
+		// durable state rather than runtime-only result revisions. Never hold m.mu
+		// across filesystem I/O or wait here: Store.Save may reenter this path.
 		if !auth.FileSnapshotMatchesDisk() {
 			m.mu.RLock()
 			current := m.auths[auth.ID].Clone()
+			auth.fileSnapshotPersistenceDone = m.persistenceInFlightDone[auth.ID]
 			m.mu.RUnlock()
 			return current, false, nil
 		}
@@ -398,6 +412,14 @@ func (m *Manager) updateInternalWithMutation(ctx context.Context, base, auth *Au
 	if !ok || existing == nil {
 		m.mu.Unlock()
 		return nil, false, nil
+	}
+	if isFileSnapshot {
+		auth.fileSnapshotPersistenceDone = m.persistenceInFlightDone[auth.ID]
+		if auth.fileSnapshotPersistenceDone != nil || existing.RegistrationEpoch != fileSnapshotEpoch || existing.durableRevision != fileSnapshotRevision {
+			current := existing.Clone()
+			m.mu.Unlock()
+			return current, false, nil
+		}
 	}
 	// Watcher snapshots may bypass the mutation gate. Check their identity
 	// changes under the same manager lock used for publication.
