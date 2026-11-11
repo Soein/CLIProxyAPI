@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -92,16 +93,55 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		return resp, xaiStatusErr(httpResp.StatusCode, data)
 	}
 
-	var responseData bytes.Buffer
-	defer func() { helps.AppendAPIResponseChunk(ctx, e.cfg, responseData.Bytes()) }()
-
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 	phaseMarker := xaiResponsePhaseMarker{reporter: reporter}
 	namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 	var upstreamUsage helps.StreamUsageBuffer
-	events := helps.NewCodexSSEScanner(ctx, io.TeeReader(httpResp.Body, &responseData), 52_428_800)
+	events := helps.NewCodexSSEScanner(ctx, httpResp.Body, 52_428_800)
+	var bareJSONBody []byte
+	bareJSONDisabled := false
+	bareJSONOverflow := false
+	events.SetOnLine(func(line []byte) {
+		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+		if bareJSONDisabled {
+			return
+		}
+		if bytes.HasPrefix(line, []byte(":")) || bytes.HasPrefix(line, xaiDataTag) || bytes.HasPrefix(line, xaiEventTag) ||
+			bytes.HasPrefix(line, []byte("id:")) || bytes.HasPrefix(line, []byte("retry:")) {
+			bareJSONBody = nil
+			bareJSONDisabled = true
+			return
+		}
+		if bareJSONBody == nil {
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) == 0 {
+				return
+			}
+			if trimmed[0] != '{' {
+				bareJSONDisabled = true
+				return
+			}
+			// Bare JSON is only an error fallback. Reuse the existing per-attempt
+			// diagnostic budget without imposing a total size limit on valid SSE.
+			bareJSONBody = make([]byte, 0, logging.MaxDeferredAPIResponseBodyBytes)
+		}
+		separator := 0
+		if len(bareJSONBody) > 0 {
+			separator = 1
+		}
+		if len(line)+separator > logging.MaxDeferredAPIResponseBodyBytes-len(bareJSONBody) {
+			bareJSONBody = nil
+			bareJSONDisabled = true
+			bareJSONOverflow = true
+			return
+		}
+		if separator != 0 {
+			bareJSONBody = append(bareJSONBody, '\n')
+		}
+		bareJSONBody = append(bareJSONBody, line...)
+	})
 	sawSSEData := false
 	var pendingEventName string
 	var pendingData []byte
@@ -204,6 +244,15 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	}
 
 	for events.Scan() {
+		if bareJSONOverflow {
+			errSize := xaiRequestScopedStreamError{statusErr: statusErr{
+				code: http.StatusBadGateway,
+				msg:  fmt.Sprintf("xai response error: non-SSE JSON body exceeds %d bytes", logging.MaxDeferredAPIResponseBodyBytes),
+			}}
+			helps.RecordAPIResponseError(ctx, e.cfg, errSize)
+			upstreamUsage.PublishFailure(ctx, reporter, errSize)
+			return resp, errSize
+		}
 		line := bytes.TrimRight(events.Bytes(), "\r")
 		if len(bytes.TrimSpace(line)) == 0 {
 			if outResp, done, errDispatch := flushPendingEvent(); done {
@@ -243,7 +292,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	}
 
 	if !sawSSEData {
-		if trimmed := bytes.TrimSpace(responseData.Bytes()); len(trimmed) > 0 {
+		if trimmed := bytes.TrimSpace(bareJSONBody); len(trimmed) > 0 {
 			if errTerminal, ok := xaiTerminalFailureErr("", trimmed); ok {
 				upstreamUsage.PublishFailure(ctx, reporter, errTerminal)
 				return resp, errTerminal
