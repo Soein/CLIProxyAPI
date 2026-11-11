@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -115,7 +115,7 @@ func ExtractCanonicalTurns(format sdktranslator.Format, payload []byte) []Canoni
 	return normalizeCanonicalTurns(turns)
 }
 
-func inferCanonicalFormat(root gjson.Result) sdktranslator.Format {
+func inferCanonicalFormat(root ojson.Result) sdktranslator.Format {
 	if req := root.Get("request"); req.Exists() && !root.Get("contents").Exists() {
 		root = req
 	}
@@ -126,7 +126,7 @@ func inferCanonicalFormat(root gjson.Result) sdktranslator.Format {
 		return sdktranslator.FormatOpenAIResponse
 	}
 	if input := root.Get("input"); input.Exists() {
-		if input.Type == gjson.String {
+		if input.Type == ojson.String {
 			return sdktranslator.FormatInteractions
 		}
 		for _, item := range input.Array() {
@@ -143,13 +143,13 @@ func inferCanonicalFormat(root gjson.Result) sdktranslator.Format {
 	return sdktranslator.FormatOpenAI
 }
 
-func appendMessagesTurns(turns *[]CanonicalTurn, root gjson.Result, includeTopLevelSystem bool) {
+func appendMessagesTurns(turns *[]CanonicalTurn, root ojson.Result, includeTopLevelSystem bool) {
 	if includeTopLevelSystem {
 		if system := root.Get("system"); system.Exists() {
 			appendTurn(turns, "system", canonicalPartsFromJSON(system))
 		}
 	}
-	root.Get("messages").ForEach(func(_, message gjson.Result) bool {
+	root.Get("messages").ForEach(func(_, message ojson.Result) bool {
 		if !hasCanonicalTurnCapacity(turns) {
 			return false
 		}
@@ -172,7 +172,7 @@ func appendMessagesTurns(turns *[]CanonicalTurn, root gjson.Result, includeTopLe
 	})
 }
 
-func appendResponsesTurns(turns *[]CanonicalTurn, root gjson.Result) {
+func appendResponsesTurns(turns *[]CanonicalTurn, root ojson.Result) {
 	if instructions := root.Get("instructions"); instructions.Exists() {
 		appendTurn(turns, "system", canonicalPartsFromJSON(instructions))
 	}
@@ -183,11 +183,11 @@ func appendResponsesTurns(turns *[]CanonicalTurn, root gjson.Result) {
 	if !input.Exists() {
 		return
 	}
-	if input.Type == gjson.String {
+	if input.Type == ojson.String {
 		appendTurn(turns, "user", canonicalPartsFromJSON(input))
 		return
 	}
-	input.ForEach(func(_, item gjson.Result) bool {
+	input.ForEach(func(_, item ojson.Result) bool {
 		if !hasCanonicalTurnCapacity(turns) {
 			return false
 		}
@@ -217,7 +217,7 @@ func appendResponsesTurns(turns *[]CanonicalTurn, root gjson.Result) {
 	})
 }
 
-func appendGeminiTurns(turns *[]CanonicalTurn, root gjson.Result) {
+func appendGeminiTurns(turns *[]CanonicalTurn, root ojson.Result) {
 	if req := root.Get("request"); req.Exists() && !root.Get("contents").Exists() {
 		root = req
 	}
@@ -233,7 +233,7 @@ func appendGeminiTurns(turns *[]CanonicalTurn, root gjson.Result) {
 	} else if system := root.Get("system_instruction"); system.Exists() {
 		appendTurn(turns, "system", canonicalPartsFromJSON(system))
 	}
-	root.Get("contents").ForEach(func(_, content gjson.Result) bool {
+	root.Get("contents").ForEach(func(_, content ojson.Result) bool {
 		if !hasCanonicalTurnCapacity(turns) {
 			return false
 		}
@@ -251,7 +251,7 @@ func appendGeminiTurns(turns *[]CanonicalTurn, root gjson.Result) {
 	})
 }
 
-func appendInteractionTurns(turns *[]CanonicalTurn, root gjson.Result) {
+func appendInteractionTurns(turns *[]CanonicalTurn, root ojson.Result) {
 	if system := root.Get("system_instruction"); system.Exists() {
 		appendTurn(turns, "system", canonicalPartsFromJSON(system))
 	} else if system := root.Get("systemInstruction"); system.Exists() {
@@ -260,11 +260,11 @@ func appendInteractionTurns(turns *[]CanonicalTurn, root gjson.Result) {
 	appendInteractionValue(turns, root.Get("input"), "")
 }
 
-func appendInteractionValue(turns *[]CanonicalTurn, value gjson.Result, inheritedRole string) bool {
+func appendInteractionValue(turns *[]CanonicalTurn, value ojson.Result, inheritedRole string) bool {
 	return appendInteractionValueAtDepth(turns, value, inheritedRole, 0)
 }
 
-func appendInteractionValueAtDepth(turns *[]CanonicalTurn, value gjson.Result, inheritedRole string, depth int) bool {
+func appendInteractionValueAtDepth(turns *[]CanonicalTurn, value ojson.Result, inheritedRole string, depth int) bool {
 	if !value.Exists() {
 		return true
 	}
@@ -275,13 +275,13 @@ func appendInteractionValueAtDepth(turns *[]CanonicalTurn, value gjson.Result, i
 		appendTurn(turns, defaultInteractionRole(inheritedRole), []CanonicalPart{canonicalDepthLimitPart(value)})
 		return hasCanonicalTurnCapacity(turns)
 	}
-	if value.Type == gjson.JSON && value.IsArray() {
-		value.ForEach(func(_, child gjson.Result) bool {
+	if value.Type == ojson.JSON && value.IsArray() {
+		value.ForEach(func(_, child ojson.Result) bool {
 			return appendInteractionValueAtDepth(turns, child, inheritedRole, depth+1)
 		})
 		return hasCanonicalTurnCapacity(turns)
 	}
-	if value.Type != gjson.JSON {
+	if value.Type != ojson.JSON {
 		appendTurn(turns, defaultInteractionRole(inheritedRole), canonicalPartsFromJSONAtDepth(value, depth+1))
 		return hasCanonicalTurnCapacity(turns)
 	}
@@ -290,7 +290,7 @@ func appendInteractionValueAtDepth(turns *[]CanonicalTurn, value gjson.Result, i
 		if role == "" {
 			role = inheritedRole
 		}
-		steps.ForEach(func(_, child gjson.Result) bool {
+		steps.ForEach(func(_, child ojson.Result) bool {
 			return appendInteractionValueAtDepth(turns, child, role, depth+1)
 		})
 		return hasCanonicalTurnCapacity(turns)
@@ -331,18 +331,18 @@ func appendTurn(turns *[]CanonicalTurn, role string, parts []CanonicalPart) {
 	if !hasCanonicalTurnCapacity(turns) || len(parts) == 0 {
 		return
 	}
-	*turns = append(*turns, CanonicalTurn{Role: role, Parts: limitCanonicalParts(nil, parts)})
+	*turns = append(*turns, CanonicalTurn{Role: strings.Clone(role), Parts: limitCanonicalParts(nil, parts)})
 }
 
 func hasCanonicalTurnCapacity(turns *[]CanonicalTurn) bool {
 	return turns != nil && len(*turns) < maxCanonicalTurns
 }
 
-func canonicalPartsFromJSON(value gjson.Result) []CanonicalPart {
+func canonicalPartsFromJSON(value ojson.Result) []CanonicalPart {
 	return canonicalPartsFromJSONAtDepth(value, 0)
 }
 
-func canonicalPartsFromJSONAtDepth(value gjson.Result, depth int) []CanonicalPart {
+func canonicalPartsFromJSONAtDepth(value ojson.Result, depth int) []CanonicalPart {
 	if !value.Exists() {
 		return nil
 	}
@@ -350,18 +350,18 @@ func canonicalPartsFromJSONAtDepth(value gjson.Result, depth int) []CanonicalPar
 		return []CanonicalPart{canonicalDepthLimitPart(value)}
 	}
 	switch value.Type {
-	case gjson.String:
+	case ojson.String:
 		return []CanonicalPart{canonicalTextPart(value)}
-	case gjson.Number, gjson.True, gjson.False:
-		return []CanonicalPart{{Kind: "value", Value: value.Raw, OriginalSize: len(value.Raw)}}
-	case gjson.JSON:
+	case ojson.Number, ojson.True, ojson.False:
+		return []CanonicalPart{{Kind: "value", Value: strings.Clone(value.Raw), OriginalSize: len(value.Raw)}}
+	case ojson.JSON:
 		if isReasoningJSONPart(value) {
 			return nil
 		}
 		if value.IsArray() {
 			parts := make([]CanonicalPart, 0, maxCanonicalPartsPerTurn+1)
 			var droppedCount int
-			value.ForEach(func(_, child gjson.Result) bool {
+			value.ForEach(func(_, child ojson.Result) bool {
 				if len(parts) >= maxCanonicalPartsPerTurn {
 					droppedCount++
 					return true
@@ -375,7 +375,7 @@ func canonicalPartsFromJSONAtDepth(value gjson.Result, depth int) []CanonicalPar
 			}
 			return parts
 		}
-		if text := value.Get("text"); text.Type == gjson.String {
+		if text := value.Get("text"); text.Type == ojson.String {
 			return []CanonicalPart{canonicalTextPart(text)}
 		}
 		if content := value.Get("content"); content.Exists() {
@@ -405,32 +405,33 @@ func canonicalPartsFromJSONAtDepth(value gjson.Result, depth int) []CanonicalPar
 	}
 }
 
-func canonicalTextPart(value gjson.Result) CanonicalPart {
+func canonicalTextPart(value ojson.Result) CanonicalPart {
 	text := normalizeText(value.String(), false)
 	if len(text) > largePartThreshold {
 		return CanonicalPart{
 			Kind:         "text",
-			Value:        sparseSample(text, sparseFingerprintBytes),
+			Value:        strings.Clone(sparseSample(text, sparseFingerprintBytes)),
 			Digest:       computeHexSHA256(text),
 			OriginalSize: len(text),
 			Sampled:      true,
 		}
 	}
-	return CanonicalPart{Kind: "text", Value: text, OriginalSize: len(text)}
+	return CanonicalPart{Kind: "text", Value: strings.Clone(text), OriginalSize: len(text)}
 }
 
-func canonicalResourcePart(value gjson.Result) CanonicalPart {
+func canonicalResourcePart(value ojson.Result) CanonicalPart {
 	part := canonicalTextPart(value)
 	part.Kind = "resource"
 	return part
 }
 
-func canonicalJSONPart(kind string, value gjson.Result) CanonicalPart {
+func canonicalJSONPart(kind string, value ojson.Result) CanonicalPart {
 	raw := value.Raw
+	clonedKind := strings.Clone(kind)
 	if len(raw) > largePartThreshold {
 		return CanonicalPart{
-			Kind:         kind,
-			Value:        sparseSample(raw, sparseFingerprintBytes),
+			Kind:         clonedKind,
+			Value:        strings.Clone(sparseSample(raw, sparseFingerprintBytes)),
 			Digest:       computeHexSHA256(raw),
 			OriginalSize: len(raw),
 			Sampled:      true,
@@ -443,12 +444,13 @@ func canonicalJSONPart(kind string, value gjson.Result) CanonicalPart {
 	if errUnmarshal := json.Unmarshal([]byte(raw), &decoded); errUnmarshal == nil {
 		if encoded, errMarshal := json.Marshal(decoded); errMarshal == nil {
 			raw = string(encoded)
+			return CanonicalPart{Kind: clonedKind, Value: raw, OriginalSize: len(raw)}
 		}
 	}
-	return CanonicalPart{Kind: kind, Value: raw, OriginalSize: len(raw)}
+	return CanonicalPart{Kind: clonedKind, Value: strings.Clone(raw), OriginalSize: len(raw)}
 }
 
-func canonicalDepthLimitPart(value gjson.Result) CanonicalPart {
+func canonicalDepthLimitPart(value ojson.Result) CanonicalPart {
 	raw := value.Raw
 	if len(raw) > largePartThreshold {
 		return CanonicalPart{
@@ -555,22 +557,22 @@ func limitCanonicalPartsCount(parts []CanonicalPart, dropped int) []CanonicalPar
 	return parts
 }
 
-func isReasoningJSONPart(value gjson.Result) bool {
-	if value.Type != gjson.JSON || value.IsArray() {
+func isReasoningJSONPart(value ojson.Result) bool {
+	if value.Type != ojson.JSON || value.IsArray() {
 		return false
 	}
 	typ := strings.ToLower(strings.TrimSpace(value.Get("type").String()))
 	if typ == "thinking" || typ == "reasoning" || typ == "thought" || strings.Contains(typ, "reasoning") {
 		return true
 	}
-	return value.Get("thought").Type == gjson.True && value.Get("thought").Bool()
+	return value.Get("thought").Type == ojson.True && value.Get("thought").Bool()
 }
 
 func isToolPartType(value string) bool {
 	return strings.Contains(value, "tool") || strings.Contains(value, "function_call") || value == "function"
 }
 
-func geminiToolPartKind(value gjson.Result) string {
+func geminiToolPartKind(value ojson.Result) string {
 	for _, field := range []string{"functionCall", "function_call"} {
 		if value.Get(field).Exists() {
 			return "tool:function_call"

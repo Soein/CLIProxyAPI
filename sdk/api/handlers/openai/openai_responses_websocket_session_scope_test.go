@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
-	"github.com/tidwall/gjson"
 )
 
 func TestResponsesWebsocketNativeToolCacheUsesCallerScopedSessionKey(t *testing.T) {
@@ -148,7 +148,7 @@ func assertResponsesWebsocketFallbackRestoresNativeToolCall(t *testing.T, sessio
 		callID,
 	))
 	repaired, _ := prepareResponsesWebsocketFallbackTurn(sessionKey, payload)
-	input := gjson.GetBytes(repaired, "input").Array()
+	input := ojson.GetBytes(repaired, "input").Array()
 	if len(input) != 2 {
 		t.Fatalf("fallback input len = %d, want 2: %s", len(input), repaired)
 	}

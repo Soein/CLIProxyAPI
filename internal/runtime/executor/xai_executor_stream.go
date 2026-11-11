@@ -8,13 +8,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -38,7 +38,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	logXAIResolvedBaseURL(ctx, baseURL)
 	req, opts, continuity := prepareXAIHTTPResponseContinuity(ctx, auth, req, opts, baseURL)
 
-	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
+	prepared, err := e.prepareResponsesRequestDoc(ctx, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
@@ -52,8 +52,10 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		reporter.TrackFailure(ctx, &err)
 	}()
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	prepared.body = sanitizeXAIInputEncryptedContentForBaseURL(prepared.body, baseURL)
-	prepared.body = prepared.finalizePayload(prepared.body)
+	doc := prepared.ensureDoc()
+	sanitizeXAIInputEncryptedContentForBaseURLDoc(doc, baseURL)
+	helps.FinalizePayloadDoc(helps.WithPayloadFinalizer(ctx, prepared.finalizePayload), doc)
+	prepared.body = doc.Bytes()
 	reporter.SetTranslatedReasoningEffort(prepared.body, e.Identifier())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(prepared.body))
 	if err != nil {
@@ -75,11 +77,11 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("xai executor: close response body error: %v", errClose)
 		}
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		if errRead != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 			return nil, errRead
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		return nil, xaiStatusErr(httpResp.StatusCode, data)
 	}
@@ -120,14 +122,14 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 			for _, line := range lines {
 				if bytes.HasPrefix(line, xaiDataTag) {
 					eventData := bytes.TrimSpace(line[len(xaiDataTag):])
-					switch gjson.GetBytes(eventData, "type").String() {
+					switch ojson.GetBytesNoCopy(eventData, "type").String() {
 					case "response.output_item.done":
 						xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 					case "response.completed", "response.incomplete":
 						// Reconstruct only after the bridge has restored dispatcher children.
 						eventData = xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 						eventData = xaiNormalizeReasoningSummaryData(eventData)
-						if replayableTerminal && gjson.GetBytes(eventData, "type").String() == "response.completed" {
+						if replayableTerminal && ojson.GetBytes(eventData, "type").String() == "response.completed" {
 							// Only completed responses carry replayable terminal state.
 							cacheXAIHTTPResponseContinuity(ctx, continuity, prepared, eventData)
 							cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, eventData)
@@ -176,7 +178,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				eventDataList := xaiNormalizeReasoningSummaryDataEvents(bytes.TrimSpace(line[len(xaiDataTag):]))
 				hasPendingEventLine := pendingEventLine != nil
 				for i, eventData := range eventDataList {
-					if rawEventType := gjson.GetBytes(eventData, "type").String(); rawEventType == "response.output_item.done" || rawEventType == "response.completed" || rawEventType == "response.incomplete" || rawEventType == "response.done" {
+					if rawEventType := ojson.GetBytesNoCopy(eventData, "type").String(); rawEventType == "response.output_item.done" || rawEventType == "response.completed" || rawEventType == "response.incomplete" || rawEventType == "response.done" {
 						streamUsage.ObserveResponsesStream(eventData)
 					}
 					prepared.applyPatch.RememberDispatcherEvent(eventData)
@@ -192,13 +194,13 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						continue
 					}
 					reporter.ObserveResponseModel(eventData)
-					upstreamEventType := gjson.GetBytes(eventData, "type").String()
+					upstreamEventType := ojson.GetBytes(eventData, "type").String()
 					phaseMarker.mark(upstreamEventType, eventData, false)
 					if terminalKind := xaiTerminalKind(upstreamEventType); terminalKind != "" {
 						reporter.MarkTerminal(terminalKind)
 					}
 					eventData = xaiNormalizeTerminalResponseData(eventData)
-					if terminalErr, ok := xaiTerminalFailureErr(eventData); ok {
+					if terminalErr, ok := xaiTerminalFailureErr("", eventData); ok {
 						helps.RecordAPIResponseError(ctx, e.cfg, terminalErr)
 						reporter.PublishFailure(ctx, terminalErr)
 						select {
@@ -207,7 +209,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						}
 						return
 					}
-					normalizedEventName := gjson.GetBytes(eventData, "type").String()
+					normalizedEventName := ojson.GetBytes(eventData, "type").String()
 					terminalEvent := isXAITerminalResponseEvent(normalizedEventName)
 					replayableTerminal = upstreamEventType == "response.completed"
 

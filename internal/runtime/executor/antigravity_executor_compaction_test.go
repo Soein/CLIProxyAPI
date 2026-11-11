@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestAntigravityCompactionRequiresCompleteSummary(t *testing.T) {
@@ -93,7 +93,7 @@ func TestAntigravityCompactionRequiresCompleteSummary(t *testing.T) {
 					if !bytes.Contains(result, []byte("cpa-ag-compact-v1:")) {
 						t.Fatalf("missing successful compaction capsule: %s", result)
 					}
-					if !stream && gjson.GetBytes(result, "usage.total_tokens").Int() != 15 {
+					if !stream && ojson.GetBytesNoCopy(result, "usage.total_tokens").Int() != 15 {
 						t.Fatalf("usage was lost: %s", result)
 					}
 				})
@@ -105,7 +105,7 @@ func TestAntigravityCompactionRequiresCompleteSummary(t *testing.T) {
 func TestAntigravityCompactionTriggerStreamGemini(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		contents := gjson.GetBytes(body, "request.contents").Array()
+		contents := ojson.GetBytes(body, "request.contents").Array()
 		if len(contents) > 0 {
 			lastRole := contents[len(contents)-1].Get("role").String()
 			if lastRole == "model" || lastRole == "assistant" {
@@ -185,7 +185,7 @@ func TestAntigravityCompactionTriggerStreamGemini(t *testing.T) {
 func TestAntigravityCompactionTriggerStreamClaude(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		contents := gjson.GetBytes(body, "request.contents").Array()
+		contents := ojson.GetBytes(body, "request.contents").Array()
 		if len(contents) > 0 {
 			lastRole := contents[len(contents)-1].Get("role").String()
 			if lastRole == "assistant" || lastRole == "model" {
@@ -259,7 +259,7 @@ func TestAntigravityCompactionTriggerStreamClaude(t *testing.T) {
 func TestAntigravityCompactionAltResponsesCompact(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		contents := gjson.GetBytes(body, "request.contents").Array()
+		contents := ojson.GetBytes(body, "request.contents").Array()
 		if len(contents) > 0 {
 			lastRole := contents[len(contents)-1].Get("role").String()
 			if lastRole == "model" || lastRole == "assistant" {
@@ -312,22 +312,22 @@ func TestAntigravityCompactionAltResponsesCompact(t *testing.T) {
 		t.Fatalf("Execute with Alt responses/compact failed: %v", err)
 	}
 
-	if !gjson.GetBytes(resp.Payload, "output.0.type").Exists() || gjson.GetBytes(resp.Payload, "output.0.type").String() != "compaction" {
+	if !ojson.GetBytes(resp.Payload, "output.0.type").Exists() || ojson.GetBytes(resp.Payload, "output.0.type").String() != "compaction" {
 		t.Fatalf("expected output.0.type to be compaction, got: %s", string(resp.Payload))
 	}
-	if !strings.HasPrefix(gjson.GetBytes(resp.Payload, "output.0.encrypted_content").String(), "cpa-ag-compact-v1:") {
+	if !strings.HasPrefix(ojson.GetBytes(resp.Payload, "output.0.encrypted_content").String(), "cpa-ag-compact-v1:") {
 		t.Fatalf("expected sealed encrypted_content, got: %s", string(resp.Payload))
 	}
 }
 
 func TestAntigravityCompactionReplayNextTurn(t *testing.T) {
-	var gotContents []gjson.Result
+	var gotContents []ojson.Result
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if strings.Contains(r.URL.Path, "generateContent") {
 			gotBody = body
-			gotContents = gjson.GetBytes(body, "request.contents").Array()
+			gotContents = ojson.GetBytes(body, "request.contents").Array()
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -373,7 +373,7 @@ func TestAntigravityCompactionReplayNextTurn(t *testing.T) {
 		t.Fatalf("compaction failed: %v", errCompact)
 	}
 
-	capsule := gjson.GetBytes(compactResp.Payload, "output.0.encrypted_content").String()
+	capsule := ojson.GetBytes(compactResp.Payload, "output.0.encrypted_content").String()
 	if capsule == "" {
 		t.Fatalf("empty capsule: %s", string(compactResp.Payload))
 	}
@@ -412,7 +412,7 @@ func TestAntigravityCompactionReplayNextTurn(t *testing.T) {
 		}
 	}
 	if !foundContext {
-		systemText := gjson.GetBytes(gotBody, "request.systemInstruction.parts.0.text").String()
+		systemText := ojson.GetBytes(gotBody, "request.systemInstruction.parts.0.text").String()
 		if strings.Contains(systemText, "Context summary from previous turns") {
 			foundContext = true
 		}
@@ -491,7 +491,7 @@ func TestAntigravityCompactionSequentialCompactionPreservesContext(t *testing.T)
 	if err1 != nil {
 		t.Fatalf("first compaction: %v", err1)
 	}
-	capsule1 := gjson.GetBytes(resp1.Payload, "output.0.encrypted_content").String()
+	capsule1 := ojson.GetBytes(resp1.Payload, "output.0.encrypted_content").String()
 
 	// 2. Second compaction triggered when input contains: old capsule + new conversation + compaction_trigger
 	compactPayload2 := []byte(fmt.Sprintf(`{

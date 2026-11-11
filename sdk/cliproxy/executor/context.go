@@ -8,6 +8,7 @@ import (
 type downstreamWebsocketContextKey struct{}
 type requireUpstreamWebsocketContextKey struct{}
 type upstreamAttemptTrackerContextKey struct{}
+type localWebsocketTurnTrackerContextKey struct{}
 
 type upstreamAttemptTracker struct {
 	attempted atomic.Bool
@@ -19,6 +20,10 @@ type dispatchAdmissionContextKey struct{}
 // release function must be held until that work can no longer start upstream
 // network activity.
 type DispatchAdmissionFunc func(authID string) (release func(), ok bool)
+
+type localWebsocketTurnTracker struct {
+	executed atomic.Bool
+}
 
 // WithDownstreamWebsocket marks the current request as coming from a downstream websocket connection.
 func WithDownstreamWebsocket(ctx context.Context) context.Context {
@@ -115,4 +120,49 @@ func UpstreamAttempted(ctx context.Context) bool {
 	}
 	tracker, ok := ctx.Value(upstreamAttemptTrackerContextKey{}).(*upstreamAttemptTracker)
 	return ok && tracker != nil && tracker.attempted.Load()
+}
+
+// WithLocalWebsocketTurnTracker installs a tracker that records when a downstream
+// websocket turn was fulfilled locally over HTTP rather than establishing or
+// owning an upstream websocket response.
+func WithLocalWebsocketTurnTracker(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, localWebsocketTurnTrackerContextKey{}, &localWebsocketTurnTracker{})
+}
+
+// MarkLocalWebsocketTurn records that the current downstream websocket turn was
+// answered locally without creating an upstream websocket response.
+func MarkLocalWebsocketTurn(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	tracker, ok := ctx.Value(localWebsocketTurnTrackerContextKey{}).(*localWebsocketTurnTracker)
+	if !ok || tracker == nil {
+		return
+	}
+	tracker.executed.Store(true)
+}
+
+// ResetLocalWebsocketTurn clears the local websocket turn marker before a new auth attempt.
+func ResetLocalWebsocketTurn(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	tracker, ok := ctx.Value(localWebsocketTurnTrackerContextKey{}).(*localWebsocketTurnTracker)
+	if !ok || tracker == nil {
+		return
+	}
+	tracker.executed.Store(false)
+}
+
+// LocalWebsocketTurnExecuted reports whether the current downstream websocket turn
+// was fulfilled locally rather than on an upstream websocket.
+func LocalWebsocketTurnExecuted(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	tracker, ok := ctx.Value(localWebsocketTurnTrackerContextKey{}).(*localWebsocketTurnTracker)
+	return ok && tracker != nil && tracker.executed.Load()
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -18,7 +19,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestXAIHTTPPayloadBarrierAfterResponseContinuity(t *testing.T) {
@@ -67,7 +67,7 @@ func TestXAIHTTPPayloadBarrierAfterResponseContinuity(t *testing.T) {
 				t.Fatal(errExecute)
 			}
 			body := <-captured
-			if gjson.GetBytes(body, "instructions").String() != "configured" || gjson.GetBytes(body, "previous_response_id").Exists() || gjson.GetBytes(body, "prompt_cache_key").Exists() || gjson.GetBytes(body, "input.#").Int() != 2 {
+			if ojson.GetBytes(body, "instructions").String() != "configured" || ojson.GetBytes(body, "previous_response_id").Exists() || ojson.GetBytes(body, "prompt_cache_key").Exists() || ojson.GetBytes(body, "input.#").Int() != 2 {
 				t.Fatalf("continuity changed final payload rules: %s", body)
 			}
 		})
@@ -128,7 +128,7 @@ func TestXAIWebsocketsPayloadBarrierOnReconnect(t *testing.T) {
 		t.Fatalf("send attempts = %d, want 2", got)
 	}
 	body := <-captured
-	if !bytes.Equal(body, firstPayload) || gjson.GetBytes(body, "store").Bool() || gjson.GetBytes(body, "instructions").String() != "configured" || gjson.GetBytes(body, "previous_response_id").Exists() || gjson.GetBytes(body, "prompt_cache_key").Exists() || gjson.GetBytes(body, "input.#").Int() != 2 {
+	if !bytes.Equal(body, firstPayload) || ojson.GetBytes(body, "store").Bool() || ojson.GetBytes(body, "instructions").String() != "configured" || ojson.GetBytes(body, "previous_response_id").Exists() || ojson.GetBytes(body, "prompt_cache_key").Exists() || ojson.GetBytes(body, "input.#").Int() != 2 {
 		t.Fatalf("reconnect changed final payload rules: first=%s retry=%s", firstPayload, body)
 	}
 }
@@ -207,7 +207,7 @@ func TestXAICompactUsageReflectsFinalPayloadReasoning(t *testing.T) {
 		t.Fatal(errExecute)
 	}
 	body := <-captured
-	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "xhigh" {
+	if got := ojson.GetBytes(body, "reasoning.effort").String(); got != "xhigh" {
 		t.Fatalf("upstream effort = %q, want xhigh", got)
 	}
 	record := waitForXAIUsageRecord(t, plugin.records)
@@ -291,7 +291,7 @@ func TestXAIApplyPatchTerminalClosesKeepOpenUpstream(t *testing.T) {
 					output = append(output, chunk.Payload...)
 					for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
 						data := bytes.TrimSpace(bytes.TrimPrefix(line, xaiDataTag))
-						completed = completed || gjson.GetBytes(data, "type").String() == "response.completed"
+						completed = completed || ojson.GetBytes(data, "type").String() == "response.completed"
 					}
 				case <-deadline:
 					t.Fatalf("stream still open after flushed terminal: completed=%t done=%d", completed, bytes.Count(output, []byte("[DONE]")))

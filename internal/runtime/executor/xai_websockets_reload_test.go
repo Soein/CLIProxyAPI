@@ -7,13 +7,12 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 func TestXAIWebsocketReloadPreservesConnectionContinuityAndFinalPayloadRules(t *testing.T) {
@@ -84,19 +83,21 @@ func TestXAIWebsocketReloadPreservesConnectionContinuityAndFinalPayloadRules(t *
 	reloaded.idStore = initial.idStore
 	encrypted := testValidGrokEncryptedContentForSeed(82)
 	followup := []byte(`{"model":"grok-4.5","previous_response_id":"resp-1","input":[{"type":"reasoning","summary":[],"encrypted_content":""},{"role":"user","content":"next"}]}`)
-	followup, _ = sjson.SetBytes(followup, "input.0.encrypted_content", encrypted)
+	followupDoc := ojson.NewDoc(followup)
+	_ = followupDoc.Set("input.0.encrypted_content", encrypted)
+	followup = followupDoc.Bytes()
 	run(reloaded, true, followup)
 	body := <-captured
 	if got := connections.Load(); got != 1 {
 		t.Fatalf("connections = %d, want 1", got)
 	}
-	if got := gjson.GetBytes(body, "previous_response_id").String(); got != "resp-1" {
+	if got := ojson.GetBytes(body, "previous_response_id").String(); got != "resp-1" {
 		t.Fatalf("previous_response_id = %q, want resp-1; payload=%s", got, body)
 	}
 	if !xaiInputHasEncryptedValue(body, encrypted) {
 		t.Fatalf("configuration reload removed same-target opaque continuity: %s", body)
 	}
-	if gjson.GetBytes(body, "store").Bool() || gjson.GetBytes(body, "instructions").String() != "reloaded payload rule" {
+	if ojson.GetBytes(body, "store").Bool() || ojson.GetBytes(body, "instructions").String() != "reloaded payload rule" {
 		t.Fatalf("reloaded payload rules were overwritten: %s", body)
 	}
 }

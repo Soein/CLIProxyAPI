@@ -2,9 +2,9 @@ package auth
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/MoeForge/moego/base64"
 	"os"
 	"path/filepath"
 	"strings"

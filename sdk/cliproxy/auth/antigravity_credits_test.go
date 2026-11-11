@@ -15,6 +15,50 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+func TestCompareAndSwapLocalAntigravityCreditsHint(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replaced=%t", replaced), func(t *testing.T) {
+			authID := t.Name()
+			t.Cleanup(func() { antigravityCreditsHintByAuth.Delete(authID) })
+			negative := AntigravityCreditsHint{
+				Known:           true,
+				CreditAmount:    0,
+				MinCreditAmount: 50,
+				UpdatedAt:       time.Now().Add(-AntigravityCreditsHintRefreshInterval - time.Second),
+			}
+			antigravityCreditsHintByAuth.Store(authID, negative)
+			observed, _ := antigravityCreditsHintByAuth.Load(authID)
+			positive := AntigravityCreditsHint{
+				Known:           true,
+				Available:       true,
+				CreditAmount:    2516,
+				MinCreditAmount: 50,
+				UpdatedAt:       time.Now(),
+			}
+			if replaced {
+				// A refresh publishes after the successful request reads the negative hint.
+				antigravityCreditsHintByAuth.Store(authID, positive)
+			}
+			wantSwap := !replaced
+			if swapped := CompareAndSwapLocalAntigravityCreditsHint(authID, observed.(AntigravityCreditsHint), AntigravityCreditsHint{}); swapped != wantSwap {
+				t.Fatalf("swapped = %t, want %t", swapped, wantSwap)
+			}
+			value, ok := antigravityCreditsHintByAuth.Load(authID)
+			if !ok {
+				t.Fatal("hint disappeared")
+			}
+			hint := value.(AntigravityCreditsHint)
+			if replaced {
+				if hint != positive {
+					t.Fatalf("stale invalidation overwrote refreshed hint: got %#v, want %#v", hint, positive)
+				}
+			} else if hint.Known || hint.UpdatedAt.IsZero() {
+				t.Fatalf("unchanged negative hint was not invalidated with a timestamp: %#v", hint)
+			}
+		})
+	}
+}
+
 type antigravityCreditsFallbackExecutor struct {
 	executeCreditsRequested []bool
 	streamCreditsRequested  []bool

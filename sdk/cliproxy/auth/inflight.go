@@ -5,10 +5,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/MoeForge/moego/ojson"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 // authLease tracks one active xAI execution. It is intentionally private and
@@ -133,9 +133,9 @@ func xaiContinuityPreferredAuth(ctx context.Context, model string, opts cliproxy
 		return ""
 	}
 	modelKey := canonicalModelKey(model)
-	previousResponseID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String())
+	previousResponseID := strings.TrimSpace(ojson.GetBytes(payload, "previous_response_id").String())
 	if previousResponseID == "" && len(fallbackPayload) > 0 {
-		previousResponseID = strings.TrimSpace(gjson.GetBytes(fallbackPayload, "previous_response_id").String())
+		previousResponseID = strings.TrimSpace(ojson.GetBytes(fallbackPayload, "previous_response_id").String())
 	}
 	if previousResponseID != "" {
 		continuity, found, errGet := getXAIResponseContinuityForRouting(ctx, callerScope, "xai", modelKey, previousResponseID)
@@ -147,9 +147,9 @@ func xaiContinuityPreferredAuth(ctx context.Context, model string, opts cliproxy
 		}
 	}
 
-	promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
+	promptCacheKey := strings.TrimSpace(ojson.GetBytes(payload, "prompt_cache_key").String())
 	if promptCacheKey == "" && len(fallbackPayload) > 0 {
-		promptCacheKey = strings.TrimSpace(gjson.GetBytes(fallbackPayload, "prompt_cache_key").String())
+		promptCacheKey = strings.TrimSpace(ojson.GetBytes(fallbackPayload, "prompt_cache_key").String())
 	}
 	bindingID := internalcache.XAIResponseContinuitySessionBindingID(promptCacheKey, executionSessionID)
 	if bindingID == "" {

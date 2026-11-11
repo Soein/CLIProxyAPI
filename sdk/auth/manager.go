@@ -12,6 +12,7 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 // Manager aggregates authenticators and coordinates persistence via a token store.
@@ -59,6 +60,17 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 	ctx, errFence = coreauth.BeginExplicitAuthOperation(ctx, m.store)
 	if errFence != nil {
 		return nil, "", errFence
+	}
+
+	loginProxyURL := ""
+	if opts != nil {
+		loginProxyURL = strings.TrimSpace(opts.ProxyURL)
+	}
+	if loginProxyURL != "" {
+		if !proxyutil.ValidRequestProxy(loginProxyURL) {
+			return nil, "", fmt.Errorf("cliproxy auth: invalid login proxy URL %q", proxyutil.Redact(loginProxyURL))
+		}
+		cfg = configWithLoginProxy(cfg, loginProxyURL)
 	}
 
 	record, err := auth.Login(ctx, cfg, opts)
@@ -135,6 +147,7 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 	if adoptXAICredential {
 		adoptLegacyXAIFileName(record, legacyXAICredential)
 	}
+	applyLoginProxyToRecord(record, loginProxyURL)
 
 	savedPath, err := coreauth.PersistExplicitAuth(coreauth.WithAuthCreationIntent(ctx), m.store, record)
 	if err != nil {
@@ -165,6 +178,33 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		}
 	}
 	return record, savedPath, nil
+}
+
+func configWithLoginProxy(cfg *config.Config, proxyURL string) *config.Config {
+	if cfg == nil {
+		return &config.Config{SDKConfig: config.SDKConfig{ProxyURL: proxyURL}}
+	}
+	cloned := cfg.CloneForRuntime()
+	if cloned == nil {
+		copied := *cfg
+		cloned = &copied
+	}
+	cloned.ProxyURL = proxyURL
+	return cloned
+}
+
+func applyLoginProxyToRecord(record *coreauth.Auth, proxyURL string) {
+	if record == nil || proxyURL == "" {
+		return
+	}
+	record.ProxyURL = proxyURL
+	if record.Metadata == nil {
+		record.Metadata = make(map[string]any)
+	}
+	record.Metadata["proxy_url"] = proxyURL
+	if setter, ok := record.Storage.(interface{ SetMetadata(map[string]any) }); ok {
+		setter.SetMetadata(record.Metadata)
+	}
 }
 
 func metadataStringValue(metadata map[string]any, key string) string {

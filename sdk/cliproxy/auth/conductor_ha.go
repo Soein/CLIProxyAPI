@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -717,6 +718,9 @@ func mergePersistedAuthRuntime(persisted, current *Auth) *Auth {
 		merged.LastError = local.LastError
 		merged.NextRetryAfter = local.NextRetryAfter
 		merged.cooldownRecordedSeq = local.cooldownRecordedSeq
+		merged.forceCooldownUntil = local.forceCooldownUntil
+		merged.credQuotaForceUntil = local.credQuotaForceUntil
+		merged.forceCooldownSeeded = local.forceCooldownSeeded
 		merged.ModelStates = local.ModelStates
 	}
 	return merged
@@ -739,6 +743,9 @@ func applyDisabledRuntimeState(snapshot, current *Auth) {
 		snapshot.LastError = current.LastError
 		snapshot.NextRetryAfter = current.NextRetryAfter
 		snapshot.cooldownRecordedSeq = current.cooldownRecordedSeq
+		snapshot.forceCooldownUntil = current.forceCooldownUntil
+		snapshot.credQuotaForceUntil = current.credQuotaForceUntil
+		snapshot.forceCooldownSeeded = current.forceCooldownSeeded
 		snapshot.ModelStates = current.ModelStates
 		snapshot.Runtime = current.Runtime
 	}
@@ -861,7 +868,15 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 		return err
 	}
 
+	var reloadWeighted *WeightedRoundRobinSelector
+	var selectorLease selectorReadLease
+	if releaseLoadGate != nil {
+		selectorLease = m.acquireSelectorReadLease()
+		defer selectorLease.Release()
+		reloadWeighted = UnwrapWeightedRoundRobinSelector(selectorLease.selector)
+	}
 	m.mu.Lock()
+	now := time.Now()
 	previous := m.auths
 	next := make(map[string]*Auth, len(items))
 	if m.authEpochs == nil {
@@ -906,6 +921,11 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 			merged.durableRevision = m.nextAuthDurableRevisionLocked()
 		}
 		merged.EnsureIndex()
+		aliasStatesChanged := m.migrateAuthAliasModelStatesLocked(merged, nil, now, false)
+		seedInitialForceCooldownDeadlines(merged)
+		if len(merged.ModelStates) > 0 && (current == nil || aliasStatesChanged) {
+			updateAggregatedAvailability(merged, now)
+		}
 		// Periodic resync must keep in-flight results valid for the current registration.
 		if current != nil {
 			m.advanceAuthGenerationLocked(merged, current)
@@ -967,6 +987,14 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 			}
 		}
 	}
+	if reloadWeighted != nil {
+		// Explicit reloads reset weighted reservations without invalidating in-flight auth results.
+		for id, auth := range previous {
+			if auth != nil {
+				reloadWeighted.ForgetAuthUpTo(id, auth.RegistrationEpoch, auth.Generation)
+			}
+		}
+	}
 	m.auths = next
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
@@ -977,10 +1005,14 @@ func (m *Manager) load(ctx context.Context, authoritative bool, releaseLoadGate 
 		m.notifyAuthChangeLocked(id)
 	}
 	m.mu.Unlock()
+	selectorLease.Release()
 	if m.scheduler != nil {
 		for id, epoch := range removedEpochs {
 			m.scheduler.RecordRemovalTombstone(id, epoch)
 		}
+	}
+	for id, epoch := range removedEpochs {
+		m.forgetWeightedAuthUpTo(id, epoch, ^uint64(0))
 	}
 	// Reloads can change scheduling fields within the same registration lifecycle.
 	// Snapshot after taking the sync lock so newer runtime updates are retained.
@@ -1051,7 +1083,7 @@ func (m *Manager) pickWithShardFilterAndInflight(ctx context.Context, provider, 
 	return selected, errPick
 }
 
-func (m *Manager) admitScheduledAuth(selected *Auth, provider, model string) *Auth {
+func (m *Manager) admitScheduledAuth(ctx context.Context, selected *Auth, provider, model string, clientHeaders ...http.Header) *Auth {
 	if m == nil || selected == nil || strings.TrimSpace(selected.ID) == "" {
 		return nil
 	}
@@ -1063,7 +1095,7 @@ func (m *Manager) admitScheduledAuth(selected *Auth, provider, model string) *Au
 
 	m.mu.RLock()
 	current := m.auths[selected.ID]
-	if !m.authAdmissibleLocked(current, provider, model) {
+	if !m.authAdmissibleLocked(ctx, current, provider, model, clientHeaders...) {
 		m.mu.RUnlock()
 		return nil
 	}
@@ -1082,7 +1114,7 @@ func (m *Manager) admitScheduledAuth(selected *Auth, provider, model string) *Au
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current = m.auths[selected.ID]
-	if !m.authAdmissibleLocked(current, provider, model) {
+	if !m.authAdmissibleLocked(ctx, current, provider, model, clientHeaders...) {
 		return nil
 	}
 	current.EnsureIndex()
@@ -1106,7 +1138,7 @@ func (m *Manager) lockAuthAdmissionOwnership(authID string) (bool, func()) {
 	return true, m.clusterMu.RUnlock
 }
 
-func (m *Manager) authAdmissibleLocked(current *Auth, provider, model string) bool {
+func (m *Manager) authAdmissibleLocked(ctx context.Context, current *Auth, provider, model string, clientHeaders ...http.Header) bool {
 	if current == nil || canonicalSchedulingProvider(executorKeyFromAuth(current)) != canonicalSchedulingProvider(provider) || current.Disabled || current.Status == StatusDisabled {
 		return false
 	}
@@ -1114,7 +1146,7 @@ func (m *Manager) authAdmissibleLocked(current *Auth, provider, model string) bo
 	if strings.TrimSpace(model) != "" {
 		checkModel = m.selectionModelForAuth(current, model)
 	}
-	blocked, _, _ := isAuthBlockedForModel(current, checkModel, time.Now())
+	blocked, _, _ := isAuthBlockedForModelForRequest(ctx, current, checkModel, time.Now(), clientHeaders...)
 	return !blocked
 }
 
@@ -1173,13 +1205,15 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		ownership = nil
 		return true
 	}
-	affinitySelector, hasAffinity := m.Selector().(*SessionAffinitySelector)
-	trackTransientAffinity := hasAffinity && affinitySelector != nil && affinitySelector.rebindOnQuotaOnly
+	initialSelector := m.Selector()
+	affinitySelector, hasAffinity := initialSelector.(*SessionAffinitySelector)
+	trackTransientAffinity := hasAffinity && affinitySelector != nil && (affinitySelector.rebindOnQuotaOnly || affinitySelector.rebindOnNever)
+	trackPinnedAccounting := pinnedAuthID != "" && UnwrapWeightedRoundRobinSelector(initialSelector) != nil
 	for {
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
 		candidates := make([]*Auth, 0, len(m.auths))
-		var affinityCandidates []*Auth
+		var accountingCandidates, affinityCandidates []*Auth
 		if trackTransientAffinity {
 			affinityCandidates = make([]*Auth, 0, len(m.auths))
 		}
@@ -1190,7 +1224,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if ownership != nil && !ownership(candidate.ID) {
 				continue
 			}
-			if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			if !trackPinnedAccounting && pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 				continue
 			}
 			if !eligibility.allows(candidate) {
@@ -1209,15 +1243,23 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 				continue
 			}
+			_, used := tried[candidate.ID]
+			if trackPinnedAccounting && !used {
+				accountingCandidates = append(accountingCandidates, candidate)
+			}
+			if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+				continue
+			}
 			if trackTransientAffinity {
 				affinityCandidates = append(affinityCandidates, candidate)
 			}
-			if _, used := tried[candidate.ID]; used {
+			if used {
 				continue
 			}
 			candidates = append(candidates, candidate)
 		}
-		if len(candidates) == 0 {
+		canInspectUnavailableAffinity := hasAffinity && affinitySelector != nil && affinitySelector.rebindOnNever && pluginScheduler == nil
+		if len(candidates) == 0 && !canInspectUnavailableAffinity {
 			m.mu.RUnlock()
 			if spillover() {
 				continue
@@ -1226,16 +1268,13 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		}
 		candidateSnapshots := cloneAuthSlice(candidates)
 		affinitySnapshots := cloneAuthSlice(affinityCandidates)
+		accountingSnapshots := cloneAuthSlice(accountingCandidates)
 		m.mu.RUnlock()
 
 		var priorityAuths []*Auth
 		var errAvailable error
-		if m.PluginSchedulerWantsAcrossPriorities() {
-			priorityAuths, errAvailable = m.availableAuthsForRouteModelAcrossPriorities(candidateSnapshots, "mixed", model, time.Now())
-		} else {
-			priorityAuths, errAvailable = m.availableAuthsForRouteModel(candidateSnapshots, "mixed", model, time.Now())
-		}
-		if errAvailable != nil {
+		priorityAuths, errAvailable = m.availableAuthsForRouteModelForRequest(ctx, candidateSnapshots, "mixed", model, time.Now(), pluginSchedulerWantsAcrossPriorities(pluginScheduler), opts.Headers)
+		if errAvailable != nil && !canInspectUnavailableAffinity {
 			if spillover() {
 				continue
 			}
@@ -1250,8 +1289,8 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		if !handled {
 			selectorLease := m.acquireSelectorReadLease()
 			selector := selectorLease.selector
-			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(selector, candidateSnapshots, "mixed", model, time.Now(), pluginSchedulerWantsAcrossPriorities(pluginScheduler))
-			if errSelectorAvailable != nil {
+			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(ctx, selector, candidateSnapshots, "mixed", model, time.Now(), pluginSchedulerWantsAcrossPriorities(pluginScheduler), opts.Headers)
+			if errSelectorAvailable != nil && !canInspectUnavailableAffinity {
 				selectorLease.Release()
 				if spillover() {
 					continue
@@ -1265,8 +1304,32 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 				}
 			}
 			selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-			transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(selector, affinitySnapshots, model, time.Now())
+			transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinitySnapshots, model, time.Now(), opts.Headers)
 			selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+			if trackPinnedAccounting && len(candidateSnapshots) > 0 && errSelectorAvailable == nil {
+				accountingAuths, _, errAccounting := m.availableAuthsForSelector(ctx, selector, accountingSnapshots, "mixed", model, time.Now(), true, opts.Headers)
+				if errAccounting != nil {
+					selectorLease.Release()
+					return nil, nil, "", errAccounting
+				}
+				selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
+			}
+			if _, bareWeighted := selector.(*WeightedRoundRobinSelector); bareWeighted {
+				singleProvider := ""
+				for providerKey := range providerSet {
+					if _, okExecutor := m.Executor(providerKey); !okExecutor {
+						continue
+					}
+					if singleProvider != "" {
+						singleProvider = ""
+						break
+					}
+					singleProvider = providerKey
+				}
+				if singleProvider != "" {
+					selectorCtx = context.WithValue(selectorCtx, weightedTransportProviderKey{}, singleProvider)
+				}
+			}
 			if sessionAffinity, okSession := selector.(*SessionAffinitySelector); okSession && inflight != nil && selectorProvider == "xai" {
 				selected, errPick = sessionAffinity.pickForExecution(selectorCtx, selectorProvider, model, opts, selectorAuths, inflight, preferredAuthID)
 			} else {
@@ -1282,6 +1345,9 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 				selected, errPick = selector.Pick(selectorCtx, selectorProvider, selectionArgForSelector(selector, model), opts, selectionAuths)
 			}
 			if errPick != nil {
+				if isAuthNotFoundError(errPick) && errSelectorAvailable != nil {
+					errPick = errSelectorAvailable
+				}
 				if isBuiltInSelector(selector) {
 					errPick = restoreModelCooldownErrorModel(errPick, model)
 				}
@@ -1294,7 +1360,7 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
 		providerKey := executorKeyFromAuth(selected)
-		authCopy := m.admitScheduledAuth(selected, providerKey, model)
+		authCopy := m.admitScheduledAuth(ctx, selected, providerKey, model, opts.Headers)
 		if authCopy == nil {
 			if !markRejectedAuthTried(tried, selected) {
 				return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector repeatedly returned an ineligible auth"}
@@ -1342,11 +1408,12 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 		selectorLease.Release()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if strings.TrimSpace(model) != "" {
-		providerSet := make(map[string]struct{}, len(eligibleProviders))
-		for _, providerKey := range eligibleProviders {
-			providerSet[providerKey] = struct{}{}
-		}
+	providerSet := make(map[string]struct{}, len(eligibleProviders))
+	for _, providerKey := range eligibleProviders {
+		providerSet[providerKey] = struct{}{}
+	}
+	_, hasCodex := providerSet["codex"]
+	if strings.TrimSpace(model) != "" || hasCodex {
 		m.mu.RLock()
 		for _, candidate := range m.auths {
 			if candidate == nil || candidate.Disabled {
@@ -1358,7 +1425,7 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
-			if m.routeAwareSelectionRequired(candidate, model) {
+			if m.routeAwareSelectionRequired(candidate, model) || requestAwareCredSelectionRequired(ctx, candidate, opts.Headers) {
 				m.mu.RUnlock()
 				selectorLease.Release()
 				return m.pickNextMixedLegacyWithInflight(ctx, providers, model, opts, tried, inflight, preferredAuthID)
@@ -1387,7 +1454,7 @@ func (m *Manager) pickNextMixedWithInflight(ctx context.Context, providers []str
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
-		authCopy := m.admitScheduledAuth(selected, providerKey, model)
+		authCopy := m.admitScheduledAuth(ctx, selected, providerKey, model, opts.Headers)
 		if authCopy == nil {
 			if tried == nil {
 				tried = make(map[string]struct{})

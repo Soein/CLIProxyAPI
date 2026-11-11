@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -141,6 +142,12 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
+	}
+	if authHasUnchangedRejectedRefreshToken(a) {
+		if a.HasValidAccessToken(now) {
+			return false
+		}
+		return !a.Disabled && a.Status != StatusDisabled
 	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return evaluator.ShouldRefresh(now, a)
@@ -1009,13 +1016,34 @@ func applyDevinQuotaRestoration(auth, existing *Auth, now time.Time) bool {
 		}
 		resetModelState(state, now)
 	}
-	auth.Status = StatusActive
-	auth.StatusMessage = ""
-	auth.LastError = nil
-	auth.Unavailable = false
-	auth.NextRetryAfter = time.Time{}
+	independentForce := effectiveAuthForceUntil(existing)
+	auth.credQuotaForceUntil = time.Time{}
+	auth.forceCooldownSeeded = true
+	if independentForce.After(now) {
+		auth.forceCooldownUntil = independentForce
+		auth.Unavailable = true
+		auth.NextRetryAfter = independentForce
+		auth.Status = StatusError
+		if isForceCooldownError(existing.LastError) {
+			auth.LastError = cloneError(existing.LastError)
+			auth.StatusMessage = existing.StatusMessage
+		} else {
+			auth.LastError = nil
+			auth.StatusMessage = ErrorCodeForceCooldown
+		}
+	} else {
+		auth.forceCooldownUntil = time.Time{}
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+		auth.LastError = nil
+		auth.Unavailable = false
+		auth.NextRetryAfter = time.Time{}
+	}
 	if len(auth.ModelStates) > 0 {
 		updateAggregatedAvailability(auth, now)
+		if auth.Unavailable && auth.Status == StatusActive {
+			auth.Status = StatusError
+		}
 	}
 	return true
 }
@@ -1130,7 +1158,7 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 		return auth, false, nil
 	}
 	// A 401 matched by a configured request-scoped rule is the rule's to handle: no rejection, no refresh.
-	if _, ruleMatched := matchRequestScopedErrorAction(auth, execErr, m.runtimeConfigSnapshot()); ruleMatched {
+	if _, ruleMatched := matchRequestScopedErrorAction(auth, execErr, m.requestScopedErrorConfig(ctx)); ruleMatched {
 		return auth, false, nil
 	}
 	failedToken := authAccessTokenForRequest(ctx, auth, clientHeaders...)
@@ -1291,6 +1319,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	m.mu.RLock()
 	auth := m.auths[id].Clone()
 	var exec ProviderExecutor
+	store := m.store
 	if auth != nil {
 		// Use the same effective provider key as request execution so OpenAI-compat
 		// auths registered under namespaced keys still resolve for refresh.
@@ -1299,6 +1328,19 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
 		return nil, errors.New("auth or executor not found")
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if resolver, okResolver := store.(interface {
+			RefreshJournalFor(*Auth) (codex.RefreshJournal, error)
+		}); okResolver {
+			journal, errJournal := resolver.RefreshJournalFor(auth)
+			if errJournal != nil {
+				return nil, fmt.Errorf("resolve credential refresh journal: %w", errJournal)
+			}
+			ctx = codex.WithRefreshJournal(ctx, journal)
+		} else if journal, okJournal := store.(codex.RefreshJournal); okJournal {
+			ctx = codex.WithRefreshJournal(ctx, journal)
+		}
 	}
 	if registrationEpoch != 0 && auth.RegistrationEpoch != registrationEpoch {
 		return nil, errors.New("auth registration changed before refresh")
@@ -1322,6 +1364,33 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 		checkNow := time.Now()
 		accessTokenRejected := failedAccessToken != "" && authMatchesTokenPartition(auth, failedAccessToken)
 		if !accessTokenRejected && auth.HasValidAccessToken(checkNow) {
+			shouldReschedule := false
+			shouldUnschedule := false
+			m.mu.Lock()
+			if current := m.auths[id]; current != nil &&
+				current.RegistrationEpoch == auth.RegistrationEpoch &&
+				current.CredentialVersion == auth.CredentialVersion &&
+				authHasUnchangedRejectedRefreshToken(current) {
+				if exp, ok := current.AccessTokenExpirationTime(); ok && !exp.IsZero() && exp.After(checkNow) {
+					if !current.NextRefreshAfter.Equal(exp) {
+						current.NextRefreshAfter = exp
+						shouldReschedule = true
+					}
+				} else if !current.NextRefreshAfter.IsZero() {
+					current.NextRefreshAfter = time.Time{}
+					shouldUnschedule = true
+				}
+				m.auths[id] = current
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(current.Clone())
+				}
+			}
+			m.mu.Unlock()
+			if shouldReschedule {
+				m.queueRefreshReschedule(id)
+			} else if shouldUnschedule {
+				m.queueRefreshUnschedule(id)
+			}
 			if auth.RefreshError != nil {
 				return nil, auth.RefreshError
 			}
@@ -1336,10 +1405,19 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			current.RegistrationEpoch == auth.RegistrationEpoch &&
 			current.CredentialVersion == auth.CredentialVersion &&
 			authHasUnchangedRejectedRefreshToken(current) {
+			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
 			current.Generation++
 			current.UpdatedAt = checkNow
 			current.Unavailable = true
-			current.Status = StatusError
+			if current.Disabled || current.Status == StatusDisabled {
+				current.Status = StatusDisabled
+				if current.StatusMessage == "" {
+					current.StatusMessage = "disabled"
+				}
+			} else {
+				current.Status = StatusError
+				current.StatusMessage = "unauthorized (refresh token invalid)"
+			}
 			current.NextRefreshAfter = time.Time{}
 			current.NextRetryAfter = time.Time{}
 			current.RefreshFailures = 0
@@ -1348,8 +1426,10 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			if current.RefreshError != nil && strings.TrimSpace(current.RefreshError.Message) != "" {
 				msg = current.RefreshError.Message
 			}
-			current.LastError = &Error{Code: "unauthorized", Message: msg, HTTPStatus: http.StatusUnauthorized}
-			current.StatusMessage = "unauthorized (refresh token invalid)"
+			current.LastError = refreshAccessError(current, msg, accessTokenRejected, wasTerminalUnauthorized)
+			if current.LastError.Code == "refresh_outcome_unknown" {
+				current.StatusMessage = current.LastError.Message
+			}
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.schedulerUpsert(current.Clone())
@@ -1369,7 +1449,22 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 		return nil, err
 	}
 	now := time.Now()
-	if err != nil && errors.Is(err, context.Canceled) {
+	refreshCanceled := (errors.Is(err, context.Canceled) || errors.Is(err, codex.ErrSIWCRefreshDeferred)) && !codex.IsRefreshOutcomeUnknown(err)
+	if refreshCanceled {
+		var partitions interface {
+			OuterRefreshError() error
+			SIWCRefreshError() error
+		}
+		if errors.As(err, &partitions) {
+			for _, partitionErr := range []error{partitions.OuterRefreshError(), partitions.SIWCRefreshError()} {
+				if partitionErr != nil && !errors.Is(partitionErr, context.Canceled) && !errors.Is(partitionErr, codex.ErrSIWCRefreshDeferred) {
+					refreshCanceled = false
+					break
+				}
+			}
+		}
+	}
+	if refreshCanceled {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil && current.RegistrationEpoch == base.RegistrationEpoch && current.CredentialVersion == base.CredentialVersion && !CredentialsChanged(base, current) {
@@ -1489,6 +1584,28 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 				current.RefreshFailures = 0
 				current.StatusMessage = "disabled (invalid grant)"
 				shouldUnschedule = true
+			} else if isDisabled && terminalRefresh {
+				current.Unavailable = true
+				current.Status = StatusDisabled
+				current.RefreshFailures = 0
+				if current.StatusMessage == "" {
+					current.StatusMessage = "disabled"
+				}
+				if !authHasUnchangedRejectedRefreshToken(current) {
+					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+					shouldReschedule = true
+				} else if hasValidAccessToken && !accessTokenRejected {
+					if exp, ok := current.AccessTokenExpirationTime(); ok && !exp.IsZero() && exp.After(now) {
+						current.NextRefreshAfter = exp
+						shouldReschedule = true
+					} else {
+						current.NextRefreshAfter = time.Time{}
+						shouldUnschedule = true
+					}
+				} else {
+					current.NextRefreshAfter = time.Time{}
+					shouldUnschedule = true
+				}
 			} else if isDisabled {
 				current.Unavailable = true
 				current.Status = StatusDisabled
@@ -1520,8 +1637,10 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 					current.NextRefreshAfter = time.Time{}
 					current.NextRetryAfter = time.Time{}
 					current.RefreshFailures = 0
-					current.LastError = &Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized}
-					if unauthorized {
+					current.LastError = refreshAccessError(current, sanitizedRefreshErr.Message, accessTokenRejected, wasTerminalUnauthorized)
+					if current.LastError.Code == "refresh_outcome_unknown" {
+						current.StatusMessage = current.LastError.Message
+					} else if unauthorized {
 						current.StatusMessage = "unauthorized"
 					} else {
 						current.StatusMessage = "unauthorized (refresh token invalid)"
@@ -1627,7 +1746,10 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			updated.StatusMessage = "unauthorized (refresh token invalid)"
 		}
 		if updated.LastError == nil && updated.RefreshError != nil {
-			updated.LastError = &Error{Code: "unauthorized", Message: updated.RefreshError.Message, HTTPStatus: http.StatusUnauthorized}
+			updated.LastError = refreshAccessError(updated, updated.RefreshError.Message, failedAccessToken != "" && authMatchesTokenPartition(updated, failedAccessToken), hasUnauthorizedAuthFailure(base))
+			if updated.LastError.Code == "refresh_outcome_unknown" {
+				updated.StatusMessage = updated.LastError.Message
+			}
 		}
 	}
 	updated.UpdatedAt = now

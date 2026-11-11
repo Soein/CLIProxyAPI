@@ -68,6 +68,10 @@ func TestReloadConfigPreservesActiveManagementDuringPartialWrites(t *testing.T) 
 				}
 				// Re-reading an unchanged prefix is not evidence that its writer finished.
 				w.ReloadConfigIfChanged()
+				if !w.authRescanMu.TryLock() {
+					t.Fatalf("partial %q retained the auth rescan lock", stage)
+				}
+				w.authRescanMu.Unlock()
 				w.ReloadConfigIfChanged()
 				if w.config != previous || w.lastConfigHash != previousHash || *calls != 0 {
 					t.Fatalf("partial %q changed live configuration: same config=%v, same hash=%v, callbacks=%d", stage, w.config == previous, w.lastConfigHash == previousHash, *calls)
@@ -172,6 +176,10 @@ func TestReloadConfigRequiresDocumentEndToEnableManagement(t *testing.T) {
 			t.Fatal(errWrite)
 		}
 		w.ReloadConfigIfChanged()
+		if !w.authRescanMu.TryLock() {
+			t.Fatal("unfinished management key change retained the auth rescan lock")
+		}
+		w.authRescanMu.Unlock()
 		if calls != 0 || w.config.RemoteManagement.SecretKey != "" {
 			t.Fatalf("unfinished document enabled management for %q", scalar)
 		}
@@ -233,6 +241,10 @@ func TestReloadConfigRequiresDocumentEndForManagementRemoteAccessChange(t *testi
 			t.Fatal(errWrite)
 		}
 		w.ReloadConfigIfChanged()
+		if !w.authRescanMu.TryLock() {
+			t.Fatal("unfinished remote management access change retained the auth rescan lock")
+		}
+		w.authRescanMu.Unlock()
 		if *calls != 0 || w.config != previous {
 			t.Fatal("unfinished document changed remote management access")
 		}

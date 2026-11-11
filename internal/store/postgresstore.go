@@ -212,6 +212,8 @@ type PostgresStore struct {
 	// must retain the generation of the mirror that actually disappeared.
 	authGenerations       map[string]uint64
 	persistAuthExpectedFn func(context.Context, string, []byte, uint64) (uint64, bool, error)
+	refreshSchemaMu       sync.Mutex
+	refreshSchemaReady    bool
 }
 
 var (
@@ -828,7 +830,7 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`, cooldownTable)); err != nil {
 		return fmt.Errorf("postgres store: create cooldown table: %w", err)
 	}
-	return nil
+	return s.ensureRefreshSchema(ctx)
 }
 
 // Bootstrap synchronizes configuration and auth records between PostgreSQL and the local workspace.

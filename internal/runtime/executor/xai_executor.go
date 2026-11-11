@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 var (
@@ -30,36 +29,14 @@ func isXAITerminalResponseEvent(eventType string) bool {
 }
 
 func xaiNormalizeTerminalResponseData(eventData []byte) []byte {
-	if gjson.GetBytes(eventData, "type").String() != "response.done" {
+	if ojson.GetBytes(eventData, "type").String() != "response.done" {
 		return eventData
 	}
-	normalized, errSet := sjson.SetBytes(eventData, "type", "response.completed")
-	if errSet != nil {
+	doc := ojson.NewDoc(eventData)
+	if errSet := doc.Set("type", "response.completed"); errSet != nil {
 		return eventData
 	}
-	return normalized
-}
-
-func xaiTerminalFailureErr(eventData []byte) (statusErr, bool) {
-	body, ok := codexTerminalFailureBody(eventData)
-	if !ok {
-		return statusErr{}, false
-	}
-	status := int(gjson.GetBytes(eventData, "status").Int())
-	if status < 400 || status > 599 {
-		status = int(gjson.GetBytes(eventData, "status_code").Int())
-	}
-	if status < 400 || status > 599 {
-		status = codexTerminalFailureStatus(body)
-	}
-	terminalErr := xaiStatusErr(status, body)
-	if status == http.StatusBadGateway {
-		freeUsageErr := xaiStatusErr(http.StatusTooManyRequests, body)
-		if freeUsageErr.RetryAfter() != nil {
-			terminalErr = freeUsageErr
-		}
-	}
-	return terminalErr, true
+	return doc.Bytes()
 }
 
 func xaiTerminalKind(eventType string) string {
@@ -116,11 +93,11 @@ func xaiResponseEventHasSemanticContent(eventType string, eventData []byte) bool
 		"response.reasoning_summary_text.delta",
 		"response.function_call_arguments.delta",
 		"response.custom_tool_call_input.delta":
-		return gjson.GetBytes(eventData, "delta").String() != ""
+		return ojson.GetBytes(eventData, "delta").String() != ""
 	case "response.output_item.done":
-		return xaiOutputItemHasSemanticContent(gjson.GetBytes(eventData, "item"))
+		return xaiOutputItemHasSemanticContent(ojson.GetBytes(eventData, "item"))
 	case "response.completed", "response.incomplete", "response.done":
-		for _, item := range gjson.GetBytes(eventData, "response.output").Array() {
+		for _, item := range ojson.GetBytes(eventData, "response.output").Array() {
 			if xaiOutputItemHasSemanticContent(item) {
 				return true
 			}
@@ -129,7 +106,7 @@ func xaiResponseEventHasSemanticContent(eventType string, eventData []byte) bool
 	return false
 }
 
-func xaiOutputItemHasSemanticContent(item gjson.Result) bool {
+func xaiOutputItemHasSemanticContent(item ojson.Result) bool {
 	switch item.Get("type").String() {
 	case "message":
 		for _, content := range item.Get("content").Array() {

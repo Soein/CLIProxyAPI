@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -22,7 +23,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
-	"github.com/tidwall/gjson"
 )
 
 func isTeardownErr(err error) bool {
@@ -263,7 +263,7 @@ func TestResponsesSteeringDispatchRejectNewGenerationAfterCompletion(t *testing.
 			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
 			_, msg, errRead := c.ReadMessage()
 			if errRead == nil {
-				msgType := gjson.GetBytes(msg, "type").String()
+				msgType := ojson.GetBytes(msg, "type").String()
 				if msgType != "error" && !strings.Contains(msgType, "fail") && !strings.Contains(msgType, "reject") {
 					t.Fatalf("expected rejection or close, got message type %s: %s", msgType, msg)
 				}
@@ -327,11 +327,11 @@ func TestResponsesSteeringDispatchAllowsInFlightSteer(t *testing.T) {
 			return
 		}
 		frames.Add(1)
-		if gjson.GetBytes(b, "type").String() != "response.steer" {
+		if ojson.GetBytes(b, "type").String() != "response.steer" {
 			t.Errorf("expected response.steer, got: %s", b)
 			return
 		}
-		if gjson.GetBytes(b, "previous_response_id").String() != "r1" {
+		if ojson.GetBytes(b, "previous_response_id").String() != "r1" {
 			t.Errorf("expected previous_response_id r1, got: %s", b)
 			return
 		}
@@ -394,7 +394,7 @@ func TestResponsesSteeringDispatchAllowsInFlightSteer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read created: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r1" {
+	if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r1" {
 		t.Fatalf("unexpected first message: %s", b)
 	}
 
@@ -414,7 +414,7 @@ func TestResponsesSteeringDispatchAllowsInFlightSteer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read after steer (%d): %v", i, err)
 		}
-		switch gjson.GetBytes(b, "type").String() {
+		switch ojson.GetBytes(b, "type").String() {
 		case "response.steer.accepted":
 			acceptedSeen = true
 		case "response.completed":
@@ -560,7 +560,7 @@ func TestResponsesSteeringDispatchReleaseLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read r2 created: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2: %s", b)
 	}
 
@@ -583,7 +583,7 @@ func TestResponsesSteeringDispatchReleaseLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read r2 completed: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.completed" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.completed" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2 terminal: %s", b)
 	}
 
@@ -734,7 +734,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorRetainsOwnedLease(t *testing
 	if err != nil {
 		t.Fatalf("read steer.accepted: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+	if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 		t.Fatalf("expected response.steer.accepted, got: %s", b)
 	}
 
@@ -743,7 +743,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorRetainsOwnedLease(t *testing
 	if err != nil {
 		t.Fatalf("read r2 created: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2: %s", b)
 	}
 
@@ -763,7 +763,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorRetainsOwnedLease(t *testing
 	if err != nil {
 		t.Fatalf("read r2 completed: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.completed" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.completed" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2 terminal: %s", b)
 	}
 
@@ -908,7 +908,7 @@ func TestResponsesSteeringDispatchRequiredInputRefusesContinuationWhenDenied(t *
 	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, msg, errRead := c.ReadMessage()
 	if errRead == nil {
-		msgType := gjson.GetBytes(msg, "type").String()
+		msgType := ojson.GetBytes(msg, "type").String()
 		if msgType != "error" && !strings.Contains(msgType, "fail") && !strings.Contains(msgType, "reject") {
 			t.Fatalf("expected rejection or close, got message type %s: %s", msgType, msg)
 		}
@@ -1223,7 +1223,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorGroupLifecycle(t *testing.T)
 	if err != nil {
 		t.Fatalf("read r2 created: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2 created: %s", b)
 	}
 	if !authority.successorAdmitted.Load() {
@@ -1240,7 +1240,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorGroupLifecycle(t *testing.T)
 		if err != nil {
 			t.Fatalf("read after s1 (%d): %v", i, err)
 		}
-		switch gjson.GetBytes(b, "type").String() {
+		switch ojson.GetBytes(b, "type").String() {
 		case "response.steer.accepted":
 		case "response.completed":
 		default:
@@ -1263,7 +1263,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorGroupLifecycle(t *testing.T)
 	if err != nil {
 		t.Fatalf("read s2 accepted: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+	if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 		t.Fatalf("expected response.steer.accepted for s2, got: %s", b)
 	}
 	if !authority.thirdAdmitted.Load() {
@@ -1278,7 +1278,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorGroupLifecycle(t *testing.T)
 	if err != nil {
 		t.Fatalf("read r3 created: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r3" {
+	if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r3" {
 		t.Fatalf("unexpected message for r3 created: %s", b)
 	}
 
@@ -1301,7 +1301,7 @@ func TestResponsesSteeringDispatchAutomaticSuccessorGroupLifecycle(t *testing.T)
 	if err != nil {
 		t.Fatalf("read r3 completed: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.completed" || gjson.GetBytes(b, "response.id").String() != "r3" {
+	if ojson.GetBytes(b, "type").String() != "response.completed" || ojson.GetBytes(b, "response.id").String() != "r3" {
 		t.Fatalf("unexpected message for r3 completed: %s", b)
 	}
 
@@ -1558,7 +1558,7 @@ func TestResponsesSteeringDispatchDelayedAckAndRequiredInputCorrelation(t *testi
 			if err != nil {
 				t.Fatalf("read s1 accepted: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+			if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 				t.Fatalf("expected s1 accepted, got: %s", b)
 			}
 			if !authority.successorAdmitted.Load() {
@@ -1575,7 +1575,7 @@ func TestResponsesSteeringDispatchDelayedAckAndRequiredInputCorrelation(t *testi
 			if err != nil {
 				t.Fatalf("read steer.pending: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.steer.pending" {
+			if ojson.GetBytes(b, "type").String() != "response.steer.pending" {
 				t.Fatalf("expected response.steer.pending, got: %s", b)
 			}
 
@@ -1604,7 +1604,7 @@ func TestResponsesSteeringDispatchDelayedAckAndRequiredInputCorrelation(t *testi
 			if err != nil {
 				t.Fatalf("read delayed s2 event: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != tc.delayedType {
+			if ojson.GetBytes(b, "type").String() != tc.delayedType {
 				t.Fatalf("expected %s, got: %s", tc.delayedType, b)
 			}
 
@@ -1630,7 +1630,7 @@ func TestResponsesSteeringDispatchDelayedAckAndRequiredInputCorrelation(t *testi
 			if err != nil {
 				t.Fatalf("read r2 created: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+			if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 				t.Fatalf("unexpected message for r2: %s", b)
 			}
 
@@ -1659,7 +1659,7 @@ func TestResponsesSteeringDispatchDelayedAckAndRequiredInputCorrelation(t *testi
 			if err != nil {
 				t.Fatalf("read r2 completed: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.completed" || gjson.GetBytes(b, "response.id").String() != "r2" {
+			if ojson.GetBytes(b, "type").String() != "response.completed" || ojson.GetBytes(b, "response.id").String() != "r2" {
 				t.Fatalf("unexpected message for r2 completed: %s", b)
 			}
 
@@ -1929,7 +1929,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read r2 created: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+				if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 					t.Fatalf("unexpected message for r2: %s", b)
 				}
 				if !authority.successorAdmitted.Load() {
@@ -1944,7 +1944,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read s1 accepted: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 					t.Fatalf("expected s1 accepted, got: %s", b)
 				}
 
@@ -1972,7 +1972,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 					if err != nil {
 						t.Fatalf("read after s2 paused (%d): %v", i, err)
 					}
-					switch gjson.GetBytes(b, "type").String() {
+					switch ojson.GetBytes(b, "type").String() {
 					case "response.completed":
 					case "response.steer.pending":
 					default:
@@ -1993,7 +1993,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read s2 accepted: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 					t.Fatalf("expected s2 accepted, got: %s", b)
 				}
 
@@ -2013,7 +2013,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read s1 accepted: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 					t.Fatalf("expected s1 accepted, got: %s", b)
 				}
 				if !authority.successorAdmitted.Load() {
@@ -2046,7 +2046,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read s1 pending: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.pending" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.pending" {
 					t.Fatalf("expected response.steer.pending for s1, got: %s", b)
 				}
 
@@ -2070,7 +2070,7 @@ func TestResponsesSteeringDispatchPendingBeforeWrite(t *testing.T) {
 				if err != nil {
 					t.Fatalf("read s2 accepted: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 					t.Fatalf("expected s2 accepted, got: %s", b)
 				}
 
@@ -2275,7 +2275,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 					if err != nil {
 						t.Fatalf("read s1 pending/accepted (%d): %v", i, err)
 					}
-					tStr := gjson.GetBytes(b, "type").String()
+					tStr := ojson.GetBytes(b, "type").String()
 					if tStr != "response.steer.pending" && tStr != "response.steer.accepted" {
 						t.Fatalf("unexpected message: %s", b)
 					}
@@ -2286,7 +2286,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 				if err != nil {
 					t.Fatalf("read s1 accepted: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 					t.Fatalf("expected s1 accepted, got: %s", b)
 				}
 			}
@@ -2305,7 +2305,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 				if err != nil {
 					t.Fatalf("read s1 pending: %v", err)
 				}
-				if gjson.GetBytes(b, "type").String() != "response.steer.pending" {
+				if ojson.GetBytes(b, "type").String() != "response.steer.pending" {
 					t.Fatalf("expected s1 pending, got: %s", b)
 				}
 			}
@@ -2322,7 +2322,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 			if err != nil {
 				t.Fatalf("read s1 failed: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.steer.failed" {
+			if ojson.GetBytes(b, "type").String() != "response.steer.failed" {
 				t.Fatalf("expected s1 failed, got: %s", b)
 			}
 
@@ -2339,7 +2339,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 			if err != nil {
 				t.Fatalf("read s2 accepted: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+			if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 				t.Fatalf("expected s2 accepted, got: %s", b)
 			}
 
@@ -2348,7 +2348,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 			if err != nil {
 				t.Fatalf("read r2 created: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+			if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 				t.Fatalf("unexpected message for r2 created: %s", b)
 			}
 
@@ -2365,7 +2365,7 @@ func TestResponsesSteeringDispatchPendingFailedWithUnacknowledgedSuccessor(t *te
 			if err != nil {
 				t.Fatalf("read r2 completed: %v", err)
 			}
-			if gjson.GetBytes(b, "type").String() != "response.completed" || gjson.GetBytes(b, "response.id").String() != "r2" {
+			if ojson.GetBytes(b, "type").String() != "response.completed" || ojson.GetBytes(b, "response.id").String() != "r2" {
 				t.Fatalf("unexpected message for r2 completed: %s", b)
 			}
 
@@ -2518,7 +2518,7 @@ func TestResponsesSteeringDispatchExplicitCreateAllowsSubsequentFramesWhileActiv
 	if err != nil {
 		t.Fatalf("read r2 created: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.created" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.created" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2 created: %s", b)
 	}
 
@@ -2532,7 +2532,7 @@ func TestResponsesSteeringDispatchExplicitCreateAllowsSubsequentFramesWhileActiv
 	if err != nil {
 		t.Fatalf("read s1 accepted: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.steer.accepted" {
+	if ojson.GetBytes(b, "type").String() != "response.steer.accepted" {
 		t.Fatalf("expected s1 accepted, got: %s", b)
 	}
 
@@ -2544,7 +2544,7 @@ func TestResponsesSteeringDispatchExplicitCreateAllowsSubsequentFramesWhileActiv
 	if err != nil {
 		t.Fatalf("read r2 completed: %v", err)
 	}
-	if gjson.GetBytes(b, "type").String() != "response.completed" || gjson.GetBytes(b, "response.id").String() != "r2" {
+	if ojson.GetBytes(b, "type").String() != "response.completed" || ojson.GetBytes(b, "response.id").String() != "r2" {
 		t.Fatalf("unexpected message for r2 completed: %s", b)
 	}
 }

@@ -64,6 +64,20 @@ func SetAntigravityCreditsHint(authID string, hint AntigravityCreditsHint) {
 	antigravityCreditsHintByAuth.Store(authID, hint)
 }
 
+// CompareAndSwapLocalAntigravityCreditsHint atomically replaces an unchanged hint
+// in the in-memory hint map. It does not read or write Home or configured KV storage.
+// old must retain the observed timestamp; a zero next timestamp is set to now.
+func CompareAndSwapLocalAntigravityCreditsHint(authID string, old, next AntigravityCreditsHint) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	if next.UpdatedAt.IsZero() {
+		next.UpdatedAt = time.Now()
+	}
+	return antigravityCreditsHintByAuth.CompareAndSwap(authID, old, next)
+}
+
 // GetAntigravityCreditsHint returns the latest known AI credits state for an auth.
 func GetAntigravityCreditsHint(authID string) (AntigravityCreditsHint, bool) {
 	hint, ok, err := GetAntigravityCreditsHintRequired(context.Background(), authID)
