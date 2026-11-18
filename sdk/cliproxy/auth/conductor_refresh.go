@@ -453,6 +453,14 @@ func authMatchesTokenPartition(auth *Auth, token string) bool {
 	return authAccessToken(auth) == token || authOuterAccessToken(auth) == token
 }
 
+func authMatchesExecutionToken(auth *Auth, token string, dispatchTracked bool) bool {
+	if dispatchTracked && auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		_, configured := MetaRequestCredentials(auth)
+		return token != "" && token == strings.TrimSpace(configured)
+	}
+	return authMatchesTokenPartition(auth, token)
+}
+
 func authRefreshToken(auth *Auth) string {
 	if token := authMetadataString(auth, "refresh_token"); token != "" {
 		return token
@@ -863,7 +871,7 @@ func applyPreservedRejectedTokens(existing, updated *Auth, isRefresh bool) {
 	}
 }
 
-func recordRejectedTokenOnAuth(auth *Auth, failedToken string) bool {
+func recordRejectedTokenOnAuth(auth *Auth, failedToken string, dispatchTracked bool) bool {
 	if auth == nil {
 		return false
 	}
@@ -878,7 +886,7 @@ func recordRejectedTokenOnAuth(auth *Auth, failedToken string) bool {
 			changed = true
 		}
 	}
-	if (authAccessToken(auth) == failedToken || authOuterAccessToken(auth) == failedToken) && auth.RejectedAccessToken != failedToken {
+	if authMatchesExecutionToken(auth, failedToken, dispatchTracked) && auth.RejectedAccessToken != failedToken {
 		auth.RejectedAccessToken = failedToken
 		changed = true
 	}
@@ -1164,19 +1172,34 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 	if isRequestScopedError(execErr) || !isUnauthorizedError(execErr) {
 		return auth, false, nil
 	}
+	dispatch := httpDispatchCredentialFromContext(ctx, auth.ID)
+	if dispatch != nil {
+		if dispatch.auth == nil {
+			return auth, false, nil
+		}
+		auth = dispatch.auth
+	}
 	// A 401 matched by a configured request-scoped rule is the rule's to handle: no rejection, no refresh.
 	if _, ruleMatched := matchRequestScopedErrorAction(auth, execErr, m.requestScopedErrorConfig(ctx)); ruleMatched {
 		return auth, false, nil
 	}
 	failedToken := authAccessTokenForRequest(ctx, auth, clientHeaders...)
+	var registrationEpoch uint64
+	if dispatch != nil {
+		failedToken = dispatch.accessToken
+		if !authMatchesExecutionToken(auth, failedToken, true) {
+			return auth, false, nil
+		}
+		registrationEpoch = auth.RegistrationEpoch
+	}
 	if failedToken != "" {
-		m.markRejectedAccessToken(auth.ID, failedToken, auth.RegistrationEpoch)
+		m.markRejectedExecutionToken(auth.ID, failedToken, auth.RegistrationEpoch, dispatch != nil)
 	}
 	if alreadyTried || !authHasRefreshCredential(auth) || hasUnauthorizedAuthFailure(auth) {
 		return auth, false, nil
 	}
 	log.Debugf("unauthorized response for %s (%s), refreshing credentials before fallback", auth.Provider, auth.ID)
-	refreshed, errRefresh := m.refreshAuthForRequest(ctx, auth.ID, failedToken)
+	refreshed, errRefresh := m.refreshAuthForRequestAtEpoch(ctx, auth.ID, failedToken, registrationEpoch)
 	if errors.Is(errRefresh, ErrDispatchAdmissionRejected) {
 		return auth, false, errRefresh
 	}
@@ -1184,7 +1207,11 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 		log.Debugf("credential refresh before fallback failed for %s (%s): %v", auth.Provider, auth.ID, errRefresh)
 		return auth, false, nil
 	}
-	if failedToken != "" && authAccessTokenForRequest(ctx, refreshed, clientHeaders...) == failedToken && (refreshed.RejectedAccessToken == failedToken || refreshed.RejectedSIWCAccessToken == failedToken) {
+	matched := failedToken != "" && authAccessTokenForRequest(ctx, refreshed, clientHeaders...) == failedToken
+	if dispatch != nil {
+		matched = authMatchesExecutionToken(refreshed, failedToken, true)
+	}
+	if matched && (refreshed.RejectedAccessToken == failedToken || refreshed.RejectedSIWCAccessToken == failedToken) {
 		return auth, false, nil
 	}
 	return refreshed, true, nil
@@ -1244,11 +1271,15 @@ func isForceRefreshContext(ctx context.Context) bool {
 }
 
 func (m *Manager) markRejectedAccessToken(id, failedAccessToken string, registrationEpoch uint64) {
+	m.markRejectedExecutionToken(id, failedAccessToken, registrationEpoch, false)
+}
+
+func (m *Manager) markRejectedExecutionToken(id, failedAccessToken string, registrationEpoch uint64, dispatchTracked bool) {
 	if m == nil || id == "" || failedAccessToken == "" {
 		return
 	}
 	m.mu.Lock()
-	if current := m.auths[id]; current != nil && (registrationEpoch == 0 || current.RegistrationEpoch == registrationEpoch) && recordRejectedTokenOnAuth(current, failedAccessToken) {
+	if current := m.auths[id]; current != nil && (registrationEpoch == 0 || current.RegistrationEpoch == registrationEpoch) && recordRejectedTokenOnAuth(current, failedAccessToken, dispatchTracked) {
 		current.revision = m.nextAuthRevisionLocked()
 		current.Generation++
 		current.UpdatedAt = time.Now()
@@ -1300,8 +1331,9 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	if id == "" {
 		return nil, errors.New("auth id is empty")
 	}
+	dispatchTracked := httpDispatchCredentialFromContext(ctx, id) != nil
 	if failedAccessToken != "" {
-		m.markRejectedAccessToken(id, failedAccessToken, registrationEpoch)
+		m.markRejectedExecutionToken(id, failedAccessToken, registrationEpoch, dispatchTracked)
 	}
 	if locker := m.currentAuthRefreshLocker(); locker != nil {
 		release, ok, errLock := locker.TryLock(ctx, id)
@@ -1361,7 +1393,12 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 
 	// Another request may already have refreshed this credential.
 	if failedAccessToken != "" {
-		if !authMatchesTokenPartition(auth, failedAccessToken) && (authAccessToken(auth) != "" || authOuterAccessToken(auth) != "") {
+		hasAccessToken := authAccessToken(auth) != "" || authOuterAccessToken(auth) != ""
+		if dispatchTracked && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+			_, token := MetaRequestCredentials(auth)
+			hasAccessToken = strings.TrimSpace(token) != ""
+		}
+		if hasAccessToken && !authMatchesExecutionToken(auth, failedAccessToken, dispatchTracked) {
 			return auth.Clone(), nil
 		}
 	}
@@ -1369,7 +1406,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	// Do not repeatedly submit an unchanged refresh grant already known to be terminally rejected.
 	if !forceRefresh && authHasUnchangedRejectedRefreshToken(auth) {
 		checkNow := time.Now()
-		accessTokenRejected := failedAccessToken != "" && authMatchesTokenPartition(auth, failedAccessToken)
+		accessTokenRejected := authMatchesExecutionToken(auth, failedAccessToken, dispatchTracked)
 		if !accessTokenRejected && auth.HasValidAccessToken(checkNow) {
 			shouldReschedule := false
 			shouldUnschedule := false
@@ -1595,7 +1632,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			hasValidAccessToken := current.HasValidAccessToken(now)
 			// failedAccessToken is set only when upstream rejected this exact access
 			// token. Its expiry time no longer proves it is usable.
-			accessTokenRejected := failedAccessToken != "" && authMatchesTokenPartition(current, failedAccessToken)
+			accessTokenRejected := authMatchesExecutionToken(current, failedAccessToken, dispatchTracked)
 			if isDisabled && invalidGrant {
 				current.Unavailable = true
 				current.Status = StatusDisabled
@@ -1765,7 +1802,7 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			updated.StatusMessage = "unauthorized (refresh token invalid)"
 		}
 		if updated.LastError == nil && updated.RefreshError != nil {
-			updated.LastError = refreshAccessError(updated, updated.RefreshError.Message, failedAccessToken != "" && authMatchesTokenPartition(updated, failedAccessToken), hasUnauthorizedAuthFailure(base))
+			updated.LastError = refreshAccessError(updated, updated.RefreshError.Message, authMatchesExecutionToken(updated, failedAccessToken, dispatchTracked), hasUnauthorizedAuthFailure(base))
 			if updated.LastError.Code == "refresh_outcome_unknown" {
 				updated.StatusMessage = updated.LastError.Message
 			}

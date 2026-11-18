@@ -58,13 +58,14 @@ type executionResultAuthSnapshot struct {
 	refreshToken      string
 	credentialVersion uint64
 	registrationEpoch uint64
+	dispatchTracked   bool
 }
 
 func withExecutionResultAuth(ctx context.Context, auth *Auth, clientHeaders ...http.Header) context.Context {
-	return withExecutionResultCredential(ctx, auth, authAccessTokenForRequest(ctx, auth, clientHeaders...))
+	return withExecutionResultCredential(ctx, auth, authAccessTokenForRequest(ctx, auth, clientHeaders...), false)
 }
 
-func withExecutionResultCredential(ctx context.Context, auth *Auth, accessToken string) context.Context {
+func withExecutionResultCredential(ctx context.Context, auth *Auth, accessToken string, dispatchTracked bool) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -77,6 +78,7 @@ func withExecutionResultCredential(ctx context.Context, auth *Auth, accessToken 
 		refreshToken:      authRefreshToken(auth),
 		credentialVersion: auth.CredentialVersion,
 		registrationEpoch: auth.RegistrationEpoch,
+		dispatchTracked:   dispatchTracked,
 	})
 }
 

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -206,7 +205,8 @@ func (h *Handler) Handle(c *gin.Context) {
 						c.JSON(clienterror.HTTPStatusFromErrorOr(errPrep, http.StatusBadGateway), gin.H{"error": errPrep.Error()})
 						return
 					}
-					action, okAction := h.markFailure(ctx, selected, errPrep, nil, prepareSeq)
+					prepareCtx, _ := auth.WithHTTPDispatchCredentialCapture(ctx)
+					action, okAction := h.markFailure(prepareCtx, selected, errPrep, nil, prepareSeq)
 					if isRequestScopedContinue(action, okAction) {
 						lastResp = nil
 						lastErr = errPrep
@@ -298,7 +298,12 @@ func (h *Handler) forwardWithCredential(
 		})
 
 		executionSeq := h.authManager.NextExecutionSeq()
-		resp, errDo := h.authManager.HttpRequest(ctx, selected, upstreamReq)
+		attemptCtx, readDispatchedAuth := auth.WithHTTPDispatchCredentialCapture(ctx)
+		resp, errDo := h.authManager.HttpRequest(attemptCtx, selected, upstreamReq)
+		attempted := readDispatchedAuth()
+		if attempted == nil {
+			attempted = selected
+		}
 		if errDo != nil {
 			helps.RecordAPIResponseError(ctx, cfg, errDo)
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -307,7 +312,7 @@ func (h *Handler) forwardWithCredential(
 			if errors.Is(errDo, auth.ErrDispatchAdmissionRejected) {
 				return nil, "", false, errDo
 			}
-			action, okAction := h.markFailure(ctx, selected, errDo, nil, executionSeq)
+			action, okAction := h.markFailure(attemptCtx, attempted, errDo, nil, executionSeq)
 			return nil, action, okAction, errDo
 		}
 
@@ -325,13 +330,13 @@ func (h *Handler) forwardWithCredential(
 			if errors.Is(errRespRead, errBodyTooLarge) {
 				return nil, "", false, errors.New("Meta response body exceeds 16 MiB limit")
 			}
-			action, okAction := h.markFailure(ctx, selected, errRespRead, nil, executionSeq)
+			action, okAction := h.markFailure(attemptCtx, attempted, errRespRead, nil, executionSeq)
 			return nil, action, okAction, errors.New("Failed to read Meta response")
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized && !alreadyRefreshed {
 			unauthErr := &auth.Error{HTTPStatus: resp.StatusCode, Message: string(respBody)}
-			refreshed, okRefresh, errRefresh := h.authManager.RefreshAfterUnauthorized(ctx, selected, unauthErr, alreadyRefreshed, clientHeaders)
+			refreshed, okRefresh, errRefresh := h.authManager.RefreshAfterUnauthorized(attemptCtx, attempted, unauthErr, alreadyRefreshed, clientHeaders)
 			if errRefresh != nil {
 				return nil, "", false, errRefresh
 			}
@@ -345,11 +350,11 @@ func (h *Handler) forwardWithCredential(
 		var action string
 		var okAction bool
 		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
-			h.markSuccess(ctx, selected, executionSeq)
+			h.markSuccess(attemptCtx, attempted, executionSeq)
 		} else if resp.StatusCode >= http.StatusBadRequest {
 			logging.SetResponseHeaders(ctx, resp.Header.Clone())
 			retryAfter := parseRetryAfterHeader(resp.Header, time.Now())
-			action, okAction = h.markHTTPResponseFailure(ctx, selected, resp.StatusCode, string(respBody), retryAfter, executionSeq)
+			action, okAction = h.markHTTPResponseFailure(attemptCtx, attempted, resp.StatusCode, string(respBody), retryAfter, executionSeq)
 		}
 
 		return &relayAttemptResponse{
@@ -457,7 +462,7 @@ func originFromAuth(a *auth.Auth) (string, error) {
 		}
 	}
 	if rawBaseURL == "" {
-		rawBaseURL = metaauth.DefaultAPIBaseURL
+		rawBaseURL, _ = auth.MetaRequestCredentials(a)
 	}
 	parsed, errParse := url.Parse(rawBaseURL)
 	if errParse != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
@@ -567,27 +572,6 @@ func parseRetryAfterHeader(headers http.Header, now time.Time) *time.Duration {
 	return nil
 }
 
-func metaAccessToken(a *auth.Auth) string {
-	if a == nil {
-		return ""
-	}
-	if a.Metadata != nil {
-		for _, key := range []string{"access_token", "accessToken", "api_key"} {
-			if value, ok := a.Metadata[key].(string); ok && strings.TrimSpace(value) != "" && !strings.HasPrefix(strings.TrimSpace(value), "dca:") {
-				return strings.TrimSpace(value)
-			}
-		}
-	}
-	if a.Attributes != nil {
-		for _, key := range []string{"api_key", "access_token"} {
-			if value := strings.TrimSpace(a.Attributes[key]); value != "" && !strings.HasPrefix(value, "dca:") {
-				return value
-			}
-		}
-	}
-	return ""
-}
-
 func (h *Handler) markSuccess(ctx context.Context, current *auth.Auth, executionSeq uint64) {
 	if h == nil || h.authManager == nil || current == nil {
 		return
@@ -596,7 +580,7 @@ func (h *Handler) markSuccess(ctx context.Context, current *auth.Auth, execution
 		AuthID:   current.ID,
 		Provider: "meta",
 		Success:  true,
-	}, current, metaAccessToken(current), executionSeq, false)
+	}, current, "", executionSeq, false)
 }
 
 func (h *Handler) markHTTPResponseFailure(ctx context.Context, current *auth.Auth, statusCode int, body string, retryAfter *time.Duration, executionSeq uint64) (string, bool) {
@@ -616,7 +600,7 @@ func (h *Handler) markHTTPResponseFailure(ctx context.Context, current *auth.Aut
 	if !shouldMarkCredentialFailure(statusCode) && !isForceCooldown {
 		return action, okAction
 	}
-	h.authManager.MarkExecutionResult(ctx, result, current, metaAccessToken(current), executionSeq, false)
+	h.authManager.MarkExecutionResult(ctx, result, current, "", executionSeq, false)
 	return action, okAction
 }
 
@@ -633,6 +617,6 @@ func (h *Handler) markFailure(ctx context.Context, current *auth.Auth, err error
 		Error:           authErr,
 	}
 	action, okAction := h.authManager.ApplyRequestScopedErrorResult(ctx, current, err, &result)
-	h.authManager.MarkExecutionResult(ctx, result, current, metaAccessToken(current), executionSeq, false)
+	h.authManager.MarkExecutionResult(ctx, result, current, "", executionSeq, false)
 	return action, okAction
 }

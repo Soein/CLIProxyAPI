@@ -1542,7 +1542,7 @@ func isStaleExecutionResult(ctx context.Context, result Result, current *Auth) b
 	if staleEpoch {
 		return true
 	}
-	if snapshot.accessToken != "" && authMatchesTokenPartition(current, snapshot.accessToken) {
+	if authMatchesExecutionToken(current, snapshot.accessToken, snapshot.dispatchTracked) {
 		return false
 	}
 	if isTOSViolationResultError(result.Error) {
@@ -1580,8 +1580,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 // MarkExecutionResult records a dispatch performed outside the manager's execution pipeline.
 // Pass the selected credential snapshot, the token sent upstream, the sequence allocated at
 // dispatch, and whether generation completed successfully. A zero sequence is unordered.
+// An opted-in HTTP capture supplies the credential and bearer when available.
 func (m *Manager) MarkExecutionResult(ctx context.Context, result Result, credential *Auth, accessToken string, sequence uint64, completed bool) {
-	ctx = withExecutionResultCredential(ctx, credential, accessToken)
+	dispatch := httpDispatchCredentialFromContext(ctx, result.AuthID)
+	if dispatch != nil {
+		accessToken = dispatch.accessToken
+		if dispatch.auth != nil {
+			credential = dispatch.auth
+		}
+	}
+	ctx = withExecutionResultCredential(ctx, credential, accessToken, dispatch != nil)
 	ctx = withExecutionResultSeq(ctx, sequence)
 	ctx = withCompletedExecutionResult(ctx, completed)
 	m.MarkResult(ctx, result)
@@ -1615,11 +1623,16 @@ func (m *Manager) markResult(ctx context.Context, result Result, affinityState r
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		snapshot, _ := executionResultAuthFromContext(ctx)
+		if rejectsToken && snapshot.dispatchTracked && !authMatchesExecutionToken(auth, snapshot.accessToken, true) {
+			m.mu.Unlock()
+			m.recordAvailabilityNeutralResultWithAffinity(ctx, result, affinityState, affinityIntermediate)
+			return
+		}
 		if isStaleExecutionResult(ctx, result, auth) {
-			snapshot, _ := executionResultAuthFromContext(ctx)
 			staleEpoch := snapshot.registrationEpoch > 0 && snapshot.registrationEpoch < auth.RegistrationEpoch
 			if !staleEpoch && rejectsToken && snapshot.accessToken != "" {
-				if recordRejectedTokenOnAuth(auth, snapshot.accessToken) {
+				if recordRejectedTokenOnAuth(auth, snapshot.accessToken, snapshot.dispatchTracked) {
 					auth.Generation++
 					auth.revision = m.nextAuthRevisionLocked()
 					auth.UpdatedAt = now
@@ -2249,12 +2262,11 @@ func (m *Manager) markResult(ctx context.Context, result Result, affinityState r
 		}
 
 		if rejectsToken {
-			snapshot, _ := executionResultAuthFromContext(ctx)
 			tokenToReject := snapshot.accessToken
 			if tokenToReject == "" {
 				tokenToReject = authAccessTokenForRequest(ctx, auth, result.Options.Headers)
 			}
-			_ = recordRejectedTokenOnAuth(auth, tokenToReject)
+			_ = recordRejectedTokenOnAuth(auth, tokenToReject, snapshot.dispatchTracked)
 		}
 		if wasTerminalUnauthorized {
 			auth.Unavailable = true

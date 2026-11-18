@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
@@ -304,9 +305,167 @@ func TestRelayDCAOnlyMintsOnceAndUsesMintedOrigin(t *testing.T) {
 	}
 }
 
+func TestRelayRecordsRejectedBearer(t *testing.T) {
+	var mintCalls atomic.Int32
+	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mintCalls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(mintServer.Close)
+	t.Setenv("META_MINT_URL", mintServer.URL)
+
+	for _, tc := range []struct {
+		name         string
+		override     string
+		wantHeader   string
+		wantRejected string
+		redirect     bool
+		failDispatch bool
+		forceCooling bool
+	}{
+		{name: "attribute API key", wantHeader: "Bearer attribute-key", wantRejected: "attribute-key"},
+		{name: "custom bearer", override: "Bearer request-key", wantHeader: "Bearer request-key"},
+		{name: "custom bearer matches unused metadata", override: "BEARER unused-metadata-token", wantHeader: "BEARER unused-metadata-token"},
+		{name: "custom non-bearer", override: "Basic dGVzdA==", wantHeader: "Basic dGVzdA=="},
+		{name: "custom bearer with forced cooldown", override: "Bearer request-key", wantHeader: "Bearer request-key", forceCooling: true},
+		{name: "cross-host redirect strips authorization", redirect: true},
+		{name: "executor fails before observing dispatch", failDispatch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("followup") == "1" {
+					if got := r.Header.Get("Authorization"); got != "Bearer attribute-key" {
+						t.Errorf("follow-up Authorization = %q, want Bearer attribute-key", got)
+					}
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if got := r.Header.Get("Authorization"); got != tc.wantHeader {
+					t.Errorf("upstream Authorization = %q, want %q", got, tc.wantHeader)
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, "invalid upstream authorization")
+			}))
+			t.Cleanup(upstream.Close)
+			if tc.redirect {
+				target := strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1)
+				upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, target+r.URL.Path, http.StatusTemporaryRedirect)
+				}))
+				t.Cleanup(upstream.Close)
+			}
+
+			cfg := &config.Config{}
+			manager := auth.NewManager(nil, nil, nil)
+			meta := executor.NewMetaExecutor(cfg)
+			if tc.failDispatch {
+				manager.RegisterExecutor(&metaDispatchErrorExecutor{MetaExecutor: meta})
+			} else {
+				manager.RegisterExecutor(meta)
+			}
+			cred := &auth.Auth{
+				ID:       "meta-rejected-bearer",
+				Provider: "meta",
+				Status:   auth.StatusActive,
+				Metadata: map[string]any{"access_token": "unused-metadata-token"},
+				Attributes: map[string]string{
+					"api_key":  "attribute-key",
+					"base_url": upstream.URL + "/v1",
+				},
+			}
+			req := httptest.NewRequest(http.MethodGet, "/muse-code/config", nil)
+			if tc.override != "" {
+				cred.Attributes["header:Authorization"] = "$X-Test-Authorization"
+				req.Header.Set("X-Test-Authorization", tc.override)
+			}
+			if tc.wantRejected == "" {
+				cred.Metadata["dca_token"] = "dca:refresh-credential"
+			}
+			if tc.forceCooling {
+				cred.Metadata["request_scoped_errors"] = []config.RequestScopedErrorRule{{
+					Status: http.StatusUnauthorized,
+					Match:  []string{"invalid upstream authorization"},
+					Action: auth.RequestScopedActionStopAndCooldown,
+				}}
+			}
+			registerMetaTestCred(t, manager, cred, "muse-wonder-1.0")
+			rec := httptest.NewRecorder()
+			router := newTestRouter(NewHandler(manager, cfg))
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+			}
+			current, ok := manager.GetByID(cred.ID)
+			if !ok {
+				t.Fatal("credential missing after 401")
+			}
+			if current.RejectedAccessToken != tc.wantRejected {
+				t.Fatalf("rejected token = %q, want %q", current.RejectedAccessToken, tc.wantRejected)
+			}
+			if tc.wantRejected == "" && !current.NextRefreshAfter.IsZero() {
+				t.Fatal("401 scheduled a refresh without a rejected credential bearer")
+			}
+			if tc.forceCooling {
+				if !current.Unavailable || current.NextRetryAfter.IsZero() {
+					t.Fatal("401 did not apply the configured force-cooldown rule")
+				}
+			} else if tc.wantRejected == "" {
+				if tc.override != "" {
+					followup := httptest.NewRecorder()
+					router.ServeHTTP(followup, httptest.NewRequest(http.MethodGet, "/muse-code/config?followup=1", nil))
+					if followup.Code != http.StatusOK {
+						t.Fatalf("follow-up status = %d, want 200; body=%s", followup.Code, followup.Body.String())
+					}
+				}
+				if current.Unavailable || current.Status != auth.StatusActive || !current.NextRetryAfter.IsZero() || current.Failed != 1 {
+					t.Fatalf("unattributed 401 left status=%s unavailable=%t next retry=%v failed=%d", current.Status, current.Unavailable, current.NextRetryAfter, current.Failed)
+				}
+			}
+		})
+	}
+	if mintCalls.Load() != 0 {
+		t.Fatalf("401 triggered %d mints without a rejected credential bearer", mintCalls.Load())
+	}
+}
+
+func TestRelayStorageOnlyCredentialUsesStoredOrigin(t *testing.T) {
+	cfg := &config.Config{}
+	manager := auth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
+	registerMetaTestCred(t, manager, &auth.Auth{
+		ID: "meta-storage-only", Provider: "meta", Status: auth.StatusActive,
+		Storage: &metaauth.MetaTokenStorage{APIKey: "storage-key", BaseURL: "https://regional.example/v1"},
+	}, "muse-wonder-1.0")
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", museCodeRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.String(); got != "https://regional.example/muse-code/config" {
+			t.Errorf("upstream URL = %q, want storage origin", got)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer storage-key" {
+			t.Errorf("upstream Authorization = %q, want Bearer storage-key", got)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/muse-code/config", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	newTestRouter(NewHandler(manager, cfg)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+type metaDispatchErrorExecutor struct{ *executor.MetaExecutor }
+
+func (*metaDispatchErrorExecutor) HttpRequest(context.Context, *auth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &auth.Error{HTTPStatus: http.StatusUnauthorized, Message: "dispatch preparation failed"}
+}
+
 func TestRelayRefreshesOnceOn401AndRetiresOnSecond401(t *testing.T) {
 	var mintCalls atomic.Int32
 	var seenTokens []string
+	cfg := &config.Config{}
+	manager := auth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
+	const authID = "meta-refresh-test"
 
 	var apiURL string
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -320,22 +479,25 @@ func TestRelayRefreshesOnceOn401AndRetiresOnSecond401(t *testing.T) {
 
 	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mintCalls.Add(1)
+		current, ok := manager.GetByID(authID)
+		if !ok {
+			t.Error("credential missing during refresh")
+		} else if current.RejectedAccessToken != "stale-key" {
+			t.Errorf("rejected token before mint = %q, want stale-key", current.RejectedAccessToken)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"api_key":"fresh-minted-key","base_url":"`+apiURL+`/v1"}`)
 	}))
 	defer mintServer.Close()
 	t.Setenv("META_MINT_URL", mintServer.URL)
 
-	cfg := &config.Config{}
-	manager := auth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
 	cred := &auth.Auth{
-		ID:       "meta-refresh-test",
+		ID:       authID,
 		Provider: "meta",
 		Status:   auth.StatusActive,
 		Metadata: map[string]any{
 			"type":         "meta",
-			"access_token": "stale-key",
+			"access_token": "unused-metadata-token",
 			"api_key":      "stale-key",
 			"dca_token":    "dca:valid",
 			"base_url":     apiURL + "/v1",
@@ -360,6 +522,13 @@ func TestRelayRefreshesOnceOn401AndRetiresOnSecond401(t *testing.T) {
 	if len(seenTokens) != 2 || seenTokens[0] != "stale-key" || seenTokens[1] != "fresh-minted-key" {
 		t.Fatalf("seenTokens = %#v, want [stale-key fresh-minted-key]", seenTokens)
 	}
+	current, ok := manager.GetByID(cred.ID)
+	if !ok {
+		t.Fatal("credential missing after retry")
+	}
+	if current.RejectedAccessToken != "fresh-minted-key" {
+		t.Fatalf("rejected token after retry = %q, want fresh-minted-key", current.RejectedAccessToken)
+	}
 
 	// Subsequent requests must NOT re-mint on every request once retired.
 	rec2 := httptest.NewRecorder()
@@ -369,6 +538,65 @@ func TestRelayRefreshesOnceOn401AndRetiresOnSecond401(t *testing.T) {
 	}
 	if mintCalls.Load() != 1 {
 		t.Fatalf("second request triggered extra mint: mintCalls = %d, want 1", mintCalls.Load())
+	}
+}
+
+func TestRelayStale401DoesNotRefreshReplacementCredential(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+	manager := auth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor.NewMetaExecutor(cfg))
+	const authID = "meta-replaced-during-401"
+	var replacementEpoch atomic.Uint64
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if upstreamCalls.Add(1) == 1 {
+			previous, ok := manager.GetByID(authID)
+			if !ok {
+				t.Error("credential missing before replacement")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			manager.Remove(ctx, authID)
+			current, errRegister := manager.Register(ctx, &auth.Auth{
+				ID: authID, Provider: "meta", Status: auth.StatusActive,
+				Metadata:   map[string]any{"access_token": "shared-key", "dca_token": "dca:replacement"},
+				Attributes: previous.Attributes,
+			})
+			if errRegister != nil || current == nil || current.RegistrationEpoch <= previous.RegistrationEpoch {
+				t.Errorf("replacement registration did not advance the epoch, error = %v", errRegister)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			replacementEpoch.Store(current.RegistrationEpoch)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(upstream.Close)
+	var mintCalls atomic.Int32
+	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mintCalls.Add(1)
+		_, _ = io.WriteString(w, `{"api_key":"new-key","base_url":"`+upstream.URL+`/v1"}`)
+	}))
+	t.Cleanup(mintServer.Close)
+	t.Setenv("META_MINT_URL", mintServer.URL)
+	registerMetaTestCred(t, manager, &auth.Auth{
+		ID: authID, Provider: "meta", Status: auth.StatusActive,
+		Metadata:   map[string]any{"access_token": "shared-key", "dca_token": "dca:original"},
+		Attributes: map[string]string{"api_key": "shared-key", "base_url": upstream.URL + "/v1"},
+	}, "muse-wonder-1.0")
+
+	rec := httptest.NewRecorder()
+	newTestRouter(NewHandler(manager, cfg)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/muse-code/config", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if mintCalls.Load() != 0 || upstreamCalls.Load() != 1 {
+		t.Fatalf("stale 401 triggered mint or retry: mint calls = %d, upstream calls = %d", mintCalls.Load(), upstreamCalls.Load())
+	}
+	current, ok := manager.GetByID(authID)
+	if !ok || current.RegistrationEpoch != replacementEpoch.Load() || current.Status != auth.StatusActive || current.RejectedAccessToken != "" {
+		t.Fatal("stale 401 changed the replacement credential")
 	}
 }
 
