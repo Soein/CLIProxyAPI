@@ -55,11 +55,16 @@ type executionResultAuthContextKey struct{}
 type executionResultAuthSnapshot struct {
 	id                string
 	accessToken       string
+	refreshToken      string
 	credentialVersion uint64
 	registrationEpoch uint64
 }
 
 func withExecutionResultAuth(ctx context.Context, auth *Auth, clientHeaders ...http.Header) context.Context {
+	return withExecutionResultCredential(ctx, auth, authAccessTokenForRequest(ctx, auth, clientHeaders...))
+}
+
+func withExecutionResultCredential(ctx context.Context, auth *Auth, accessToken string) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -67,7 +72,11 @@ func withExecutionResultAuth(ctx context.Context, auth *Auth, clientHeaders ...h
 		return ctx
 	}
 	return context.WithValue(ctx, executionResultAuthContextKey{}, executionResultAuthSnapshot{
-		id: auth.ID, accessToken: authAccessTokenForRequest(ctx, auth, clientHeaders...), credentialVersion: auth.CredentialVersion, registrationEpoch: auth.RegistrationEpoch,
+		id:                auth.ID,
+		accessToken:       accessToken,
+		refreshToken:      authRefreshToken(auth),
+		credentialVersion: auth.CredentialVersion,
+		registrationEpoch: auth.RegistrationEpoch,
 	})
 }
 
@@ -406,8 +415,17 @@ func mergeRuntimeCooldownSaveDelta(target, before, after *Auth, preserveConcurre
 	if !after.forceCooldownUntil.Equal(before.forceCooldownUntil) && (!preserveConcurrent || target.forceCooldownUntil.Equal(before.forceCooldownUntil)) {
 		target.forceCooldownUntil = after.forceCooldownUntil
 	}
+	if !after.quotaForceCooldownUntil.Equal(before.quotaForceCooldownUntil) && (!preserveConcurrent || target.quotaForceCooldownUntil.Equal(before.quotaForceCooldownUntil)) {
+		target.quotaForceCooldownUntil = after.quotaForceCooldownUntil
+	}
 	if !after.credQuotaForceUntil.Equal(before.credQuotaForceUntil) && (!preserveConcurrent || target.credQuotaForceUntil.Equal(before.credQuotaForceUntil)) {
 		target.credQuotaForceUntil = after.credQuotaForceUntil
+	}
+	if !after.credentialRetryAfter.Equal(before.credentialRetryAfter) && (!preserveConcurrent || target.credentialRetryAfter.Equal(before.credentialRetryAfter)) {
+		target.credentialRetryAfter = after.credentialRetryAfter
+	}
+	if !after.nonQuotaCooldownUntil.Equal(before.nonQuotaCooldownUntil) && (!preserveConcurrent || target.nonQuotaCooldownUntil.Equal(before.nonQuotaCooldownUntil)) {
+		target.nonQuotaCooldownUntil = after.nonQuotaCooldownUntil
 	}
 	if after.forceCooldownSeeded != before.forceCooldownSeeded && (!preserveConcurrent || target.forceCooldownSeeded == before.forceCooldownSeeded) {
 		target.forceCooldownSeeded = after.forceCooldownSeeded
@@ -427,7 +445,10 @@ func mergeRuntimeCooldownSaveDelta(target, before, after *Auth, preserveConcurre
 		!target.Unavailable && target.NextRetryAfter.IsZero() &&
 		(!target.Quota.Exceeded || target.Quota.NextRecoverAt.IsZero()) {
 		target.forceCooldownUntil = time.Time{}
+		target.quotaForceCooldownUntil = time.Time{}
 		target.credQuotaForceUntil = time.Time{}
+		target.credentialRetryAfter = time.Time{}
+		target.nonQuotaCooldownUntil = time.Time{}
 	}
 }
 

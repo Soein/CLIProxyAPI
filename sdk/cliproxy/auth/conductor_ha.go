@@ -1209,7 +1209,9 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 	affinitySelector, hasAffinity := initialSelector.(*SessionAffinitySelector)
 	trackTransientAffinity := hasAffinity && affinitySelector != nil && (affinitySelector.rebindOnQuotaOnly || affinitySelector.rebindOnNever)
 	trackPinnedAccounting := pinnedAuthID != "" && UnwrapWeightedRoundRobinSelector(initialSelector) != nil
+	var pluginExcluded map[string]struct{}
 	for {
+		effectiveTried := mergeTriedAuthIDs(tried, pluginExcluded)
 		m.mu.RLock()
 		pluginScheduler := m.pluginScheduler
 		candidates := make([]*Auth, 0, len(m.auths))
@@ -1243,7 +1245,10 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 				continue
 			}
-			_, used := tried[candidate.ID]
+			if _, excluded := pluginExcluded[candidate.ID]; excluded {
+				continue
+			}
+			_, used := effectiveTried[candidate.ID]
 			if trackPinnedAccounting && !used {
 				accountingCandidates = append(accountingCandidates, candidate)
 			}
@@ -1282,11 +1287,15 @@ func (m *Manager) pickNextMixedLegacyWithInflight(ctx context.Context, providers
 		}
 		priorityAuths = cloneAuthSlice(priorityAuths)
 
-		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, priorityAuths)
+		selected, handled, excluded, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, effectiveTried, priorityAuths, candidateSnapshots)
+		pluginExcluded = mergeTriedAuthIDs(pluginExcluded, excluded)
 		if errPick != nil {
 			return nil, nil, "", errPick
 		}
 		if !handled {
+			candidateSnapshots = filterAuthsExcluding(candidateSnapshots, excluded)
+			affinitySnapshots = filterAuthsExcluding(affinitySnapshots, excluded)
+			accountingSnapshots = filterAuthsExcluding(accountingSnapshots, excluded)
 			selectorLease := m.acquireSelectorReadLease()
 			selector := selectorLease.selector
 			_, selectorAuths, errSelectorAvailable := m.availableAuthsForSelector(ctx, selector, candidateSnapshots, "mixed", model, time.Now(), pluginSchedulerWantsAcrossPriorities(pluginScheduler), opts.Headers)

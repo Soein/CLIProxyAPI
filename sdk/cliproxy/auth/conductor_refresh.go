@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -1146,6 +1146,13 @@ func (m *Manager) RefreshHomeSelectionAfterUnauthorized(ctx context.Context, sel
 	return current, false, nil
 }
 
+// RefreshAfterUnauthorized refreshes a local credential once after an upstream 401
+// using the same rejection-marking and single-refresh rules as request execution.
+// A dispatch admission rejection is returned to the caller.
+func (m *Manager) RefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool, clientHeaders ...http.Header) (*Auth, bool, error) {
+	return m.tryRefreshAfterUnauthorized(m.newUpstreamAttemptContext(ctx), auth, execErr, alreadyTried, clientHeaders...)
+}
+
 // tryRefreshAfterUnauthorized refreshes local OAuth credentials once after a
 // 401 so the current auth can be retried before fallback/suspend.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool, clientHeaders ...http.Header) (*Auth, bool, error) {
@@ -1429,6 +1436,10 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 			current.LastError = refreshAccessError(current, msg, accessTokenRejected, wasTerminalUnauthorized)
 			if current.LastError.Code == "refresh_outcome_unknown" {
 				current.StatusMessage = current.LastError.Message
+				if current.Status != StatusDisabled {
+					// Job completion reschedules this recovery state, so retain a positive delay.
+					current.NextRefreshAfter = checkNow.Add(refreshCheckInterval)
+				}
 			}
 			m.auths[id] = current
 			if m.scheduler != nil {
@@ -1466,10 +1477,18 @@ func (m *Manager) refreshAuthOnce(ctx context.Context, id, failedAccessToken str
 	}
 	if refreshCanceled {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
+		backoff := time.Second
+		if errors.Is(err, codex.ErrSIWCRefreshDeferred) {
+			backoff = refreshCheckInterval
+		}
+		retryAfter := now.Add(backoff)
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil && current.RegistrationEpoch == base.RegistrationEpoch && current.CredentialVersion == base.CredentialVersion && !CredentialsChanged(base, current) {
-			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
-				current.NextRefreshAfter = now.Add(time.Second)
+			pendingJob := m.refreshJobs[id]
+			isJobPending := pendingJob != nil && pendingJob.registrationEpoch == current.RegistrationEpoch &&
+				current.NextRefreshAfter.Equal(pendingJob.pendingUntil) && base.NextRefreshAfter.Equal(pendingJob.pendingUntil)
+			if isJobPending || current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(retryAfter) {
+				current.NextRefreshAfter = retryAfter
 				current.Generation++
 				current.UpdatedAt = now
 				current.revision = m.nextAuthRevisionLocked()

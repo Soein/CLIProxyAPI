@@ -3,7 +3,6 @@ package util
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 )
 

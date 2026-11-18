@@ -1,13 +1,13 @@
 package util
 
 import (
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 )
 

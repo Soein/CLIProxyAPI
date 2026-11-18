@@ -5,13 +5,13 @@ package codex
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	log "github.com/sirupsen/logrus"
 )

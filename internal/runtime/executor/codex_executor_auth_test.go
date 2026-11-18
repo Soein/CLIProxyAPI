@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
 	"github.com/gorilla/websocket"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -1713,6 +1713,10 @@ func TestCodexExecutorRefreshPostgresCASPersistence(t *testing.T) {
 				path := filepath.Join(pgStore.AuthDir(), id)
 				auth := codexRefreshDiskFixture(path)
 				auth.ID, auth.FileName = id, id
+				// Each case must exchange its own grants because they share a refresh journal.
+				outerRefreshToken, siwcRefreshToken := "outer-refresh-"+id, "siwc-refresh-"+id
+				auth.Metadata["refresh_token"] = outerRefreshToken
+				auth.Metadata["siwc"].(map[string]any)["refresh_token"] = siwcRefreshToken
 				if _, generation, errCreate := pgStore.Restore(ctx, auth, 0); errCreate != nil || generation != 1 {
 					t.Fatalf("create authoritative snapshot A: generation=%d error=%v", generation, errCreate)
 				}
@@ -1751,8 +1755,8 @@ func TestCodexExecutorRefreshPostgresCASPersistence(t *testing.T) {
 				if errRefresh != nil {
 					t.Fatal(errRefresh)
 				}
-				if got := strings.Join(*requests, ","); got != "outer-refresh-A,siwc-refresh-A" {
-					t.Fatalf("refresh used mirror credentials: %q", got)
+				if got, want := strings.Join(*requests, ","), outerRefreshToken+","+siwcRefreshToken; got != want {
+					t.Fatalf("refresh grants = %q, want authoritative grants %q", got, want)
 				}
 				if got, errRead := os.ReadFile(path); errRead != nil || string(got) != string(original) {
 					t.Fatalf("executor changed mirror before CAS: %s, %v", got, errRead)

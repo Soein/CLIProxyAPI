@@ -3,7 +3,6 @@ package management
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -34,31 +34,35 @@ func (s *uploadPathLockingStore) Save(context.Context, *coreauth.Auth) (string, 
 
 func (*uploadPathLockingStore) Delete(context.Context, string) error { return nil }
 
+type uploadVersionedStore struct {
+	restoreCalls    int
+	restoreExpected uint64
+	active          *coreauth.Auth
+}
+
 type uploadTombstoneRestoreStore struct {
+	uploadVersionedStore
 	fence            uint64
 	tombstoneVersion uint64
-	restoreCalls     int
-	restoreExpected  uint64
-	active           *coreauth.Auth
 }
 
-func (*uploadTombstoneRestoreStore) List(context.Context) ([]*coreauth.Auth, error) {
+func (*uploadVersionedStore) List(context.Context) ([]*coreauth.Auth, error) {
 	return nil, nil
 }
 
-func (*uploadTombstoneRestoreStore) GetByID(context.Context, string) (*coreauth.Auth, error) {
+func (*uploadVersionedStore) GetByID(context.Context, string) (*coreauth.Auth, error) {
 	return nil, nil
 }
 
-func (*uploadTombstoneRestoreStore) Save(context.Context, *coreauth.Auth) (string, error) {
+func (*uploadVersionedStore) Save(context.Context, *coreauth.Auth) (string, error) {
 	return "", coreauth.ErrAuthStoreDeleted
 }
 
-func (*uploadTombstoneRestoreStore) SaveVersioned(context.Context, *coreauth.Auth, uint64) (string, uint64, error) {
+func (*uploadVersionedStore) SaveVersioned(context.Context, *coreauth.Auth, uint64) (string, uint64, error) {
 	return "", 0, coreauth.ErrAuthStoreDeleted
 }
 
-func (s *uploadTombstoneRestoreStore) Restore(_ context.Context, auth *coreauth.Auth, expected uint64) (string, uint64, error) {
+func (s *uploadVersionedStore) Restore(_ context.Context, auth *coreauth.Auth, expected uint64) (string, uint64, error) {
 	s.restoreCalls++
 	s.restoreExpected = expected
 	s.active = auth.Clone()
@@ -66,7 +70,7 @@ func (s *uploadTombstoneRestoreStore) Restore(_ context.Context, auth *coreauth.
 	return auth.ID, expected + 1, nil
 }
 
-func (*uploadTombstoneRestoreStore) Delete(context.Context, string) error { return nil }
+func (*uploadVersionedStore) Delete(context.Context, string) error { return nil }
 
 func (s *uploadTombstoneRestoreStore) AuthLifecycleFence(context.Context) (uint64, error) {
 	return s.fence, nil
@@ -258,6 +262,15 @@ func TestUploadAuthFile_HonorsSharedPathLock(t *testing.T) {
 }
 
 func TestUploadAuthFileRestoresWriterTombstoneDespiteStaleLocalRuntime(t *testing.T) {
+	for _, version := range []string{"v0", "v8"} {
+		t.Run(version, func(t *testing.T) {
+			testUploadAuthFileRestoresWriterTombstone(t, version)
+		})
+	}
+}
+
+func testUploadAuthFileRestoresWriterTombstone(t *testing.T, version string) {
+	t.Helper()
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -297,11 +310,17 @@ func TestUploadAuthFileRestoresWriterTombstoneDespiteStaleLocalRuntime(t *testin
 	}
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
-	request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	path, upload := "/v0/management/auth-files", h.UploadAuthFile
+	if version == "v8" {
+		// Embedders can supply a core manager that uses a different store.
+		h.tokenStore = &uploadVersionedStore{}
+		path, upload = "/v8/management/credentials", h.UploadAuthFileV8
+	}
+	request := httptest.NewRequest(http.MethodPost, path, &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	ginCtx.Request = request
 
-	h.UploadAuthFile(ginCtx)
+	upload(ginCtx)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("upload status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())

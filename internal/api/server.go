@@ -22,6 +22,7 @@ import (
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/musecode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -29,6 +30,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/wstunnel"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
@@ -141,6 +143,8 @@ type Server struct {
 	// handlers contains the API handlers for processing requests.
 	handlers         *handlers.BaseAPIHandler
 	codexLiveHandler *codexlive.Handler
+	museCodeHandler  *musecode.Handler
+	tunnelHub        *wstunnel.Hub
 
 	// cfg holds the current server configuration.
 	cfgMu sync.RWMutex
@@ -174,6 +178,13 @@ type Server struct {
 
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
+
+	// interceptorHost is the resolved PluginInterceptorHost installed on request
+	// handlers. When a caller provides their own host via
+	// WithPluginInterceptorHost, interceptor calls and capability detection
+	// delegate to that host while plugin model routing, lifecycle callbacks, and
+	// websocket observers stay delegated to pluginHost.
+	interceptorHost handlers.PluginInterceptorHost
 
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
@@ -246,6 +257,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s := &Server{
 		engine:                       engine,
 		handlers:                     handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
+		tunnelHub:                    wstunnel.NewHub(wstunnel.Options{}),
 		cfg:                          cfg,
 		accessManager:                accessManager,
 		configFilePath:               configFilePath,
@@ -258,6 +270,22 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		activeRequests:               activeRequests,
 		forceCloseWait:               forceCloseWaitForConfig(cfg),
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
+	}
+
+	// Resolve the interceptor host once so startup and reload share the same
+	// wiring. A caller-provided host keeps interceptor dispatch and capability
+	// detection on the embedder implementation while model routing, lifecycle
+	// callbacks, and websocket observers remain delegated to the internal
+	// plugin host. Typed-nil values are normalized first so they cannot defeat
+	// SetPluginHost's own nil-interface normalization.
+
+	if custom := normalizeInterceptorHost(optionState.pluginInterceptorHost); custom != nil {
+		s.interceptorHost = &delegatedInterceptorHost{
+			primary:    custom,
+			pluginHost: optionState.pluginHost,
+		}
+	} else {
+		s.interceptorHost = optionState.pluginHost
 	}
 
 	// Add middleware
@@ -294,7 +322,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	openai.SetResponsesWebsocketCompressionEnabled(cfg.Codex.WebsocketCompressionEnabled())
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
-	s.handlers.SetPluginHost(optionState.pluginHost)
+	s.handlers.SetPluginHost(s.interceptorHost)
 	if optionState.pluginHost != nil {
 		optionState.pluginHost.SetModelExecutor(s.handlers)
 		optionState.pluginHost.SetAuthManager(authManager)
@@ -611,12 +639,10 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop immediately closes HTTP connections and waits for the serving loop and
-// tracked handlers to exit before returning. The bounded completion check keeps
-// cluster ownership leases from being released while handlers are still running.
-//
-// Parameters:
-//   - ctx: Context passed for compatibility.
+// Stop closes the listeners and optionally drains in-flight HTTP connections
+// for up to server.shutdown-timeout seconds, bounded by ctx. It then force-closes
+// remaining connections and checks that the serving loop and tracked handlers
+// have exited, so the caller can safely release cluster ownership leases.
 //
 // Returns:
 //   - error: An error if the server fails to stop or confirm handler completion.
@@ -632,14 +658,30 @@ func (s *Server) Stop(ctx context.Context) error {
 		default:
 		}
 	}
+	var errShutdown error
+	if cfg := s.getConfig(); cfg != nil && cfg.ShutdownTimeoutSeconds > 0 {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		s.closeListeners()
+		drainCtx, cancelDrain := context.WithTimeout(ctx, time.Duration(cfg.ShutdownTimeoutSeconds)*time.Second)
+		errShutdown = s.server.Shutdown(drainCtx)
+		cancelDrain()
+		if errors.Is(errShutdown, context.DeadlineExceeded) || errors.Is(errShutdown, context.Canceled) {
+			errShutdown = nil
+		}
+	}
 	errClose := s.ForceStop()
 	forceCtx, cancel := context.WithTimeout(context.Background(), s.forceCloseWait)
 	defer cancel()
 	errWait := s.waitUntilStopped(forceCtx, requestsDrained)
-	if errClose != nil || errWait != nil {
+	if errShutdown != nil || errClose != nil || errWait != nil {
 		var errStop error
+		if errShutdown != nil {
+			errStop = fmt.Errorf("failed to drain HTTP server: %w", errShutdown)
+		}
 		if errClose != nil {
-			errStop = fmt.Errorf("failed to force-close HTTP server: %w", errClose)
+			errStop = errors.Join(errStop, fmt.Errorf("failed to force-close HTTP server: %w", errClose))
 		}
 		if errWait != nil {
 			errStop = errors.Join(errStop, fmt.Errorf("failed to confirm HTTP server stopped after force-close: %w", errWait))
@@ -663,6 +705,9 @@ func (s *Server) ForceStop() error {
 	s.closeListeners()
 	if s.codexLiveHandler != nil {
 		s.codexLiveHandler.Close()
+	}
+	if s.tunnelHub != nil {
+		s.tunnelHub.Close()
 	}
 	return normalizeHTTPServeError(s.server.Close())
 }

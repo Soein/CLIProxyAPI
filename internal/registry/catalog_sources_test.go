@@ -3,7 +3,6 @@ package registry
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/MoeForge/moego/json"
 )
 
 func TestCatalogFetcherSources(t *testing.T) {

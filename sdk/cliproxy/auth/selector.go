@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"maps"
 	"math"
 	"net/http"
 	"reflect"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,7 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
+	"github.com/MoeForge/moego/regexp"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
@@ -1314,6 +1314,25 @@ func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model stri
 			}
 		}
 		return true, blockReasonCooldown, credNext
+	}
+	if !auth.credentialRetryAfter.IsZero() && auth.credentialRetryAfter.After(now) {
+		credNext := auth.credentialRetryAfter
+		if model != "" && len(auth.ModelStates) > 0 {
+			modelKey := canonicalModelLookupKey(model)
+			for stateModel, state := range auth.ModelStates {
+				if state == nil || canonicalModelLookupKey(stateModel) != modelKey {
+					continue
+				}
+				if state.Status == StatusDisabled {
+					return true, blockReasonDisabled, time.Time{}
+				}
+				stateBlocked, _, next := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+				if stateBlocked && next.After(credNext) {
+					credNext = next
+				}
+			}
+		}
+		return true, blockReasonOther, credNext
 	}
 	unavailable := codexRefreshUnavailableForRequest(ctx, auth, now, clientHeaders...)
 	if model != "" {

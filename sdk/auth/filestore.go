@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"

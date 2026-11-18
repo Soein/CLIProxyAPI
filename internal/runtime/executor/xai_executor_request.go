@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
@@ -70,6 +70,17 @@ func (p *xaiPreparedRequest) ensureDoc() *ojson.Doc {
 		p.doc = ojson.NewDoc(p.body)
 	}
 	return p.doc
+}
+
+// normalizeXAIWebsocketRequestDoc prepares business fields before payload rules.
+func normalizeXAIWebsocketRequestDoc(doc *ojson.Doc) {
+	_ = doc.Delete("stream")
+	_ = doc.Delete("stream_options")
+	_ = doc.Delete("background")
+	_ = doc.Set("store", true)
+	if strings.TrimSpace(doc.Get("previous_response_id").String()) != "" {
+		_ = doc.Delete("instructions")
+	}
 }
 
 type xaiNamespaceToolRef struct {

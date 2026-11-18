@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"compress/flate"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
@@ -195,11 +195,14 @@ func (s *xaiWebsocketIDState) prependTranscriptInputDoc(doc *ojson.Doc) bool {
 	return doc.SetRawBytes("input", xaiMarshalRawMessages(merged)) == nil
 }
 
-func (s *xaiWebsocketIDState) recordTranscriptTurn(requestPayload []byte, completedPayload []byte, reset bool) {
-	if s == nil || len(requestPayload) == 0 || len(completedPayload) == 0 {
+func (s *xaiWebsocketIDState) recordTranscriptTurn(inputSnapshot []json.RawMessage, completedPayload []byte, reset bool) {
+	if s == nil || len(completedPayload) == 0 {
 		return
 	}
-	inputItems := xaiJSONRawMessages(ojson.GetBytesNoCopy(requestPayload, "input"))
+	inputItems := make([]json.RawMessage, 0, len(inputSnapshot))
+	for _, item := range inputSnapshot {
+		inputItems = append(inputItems, bytes.Clone(item))
+	}
 	outputItems := xaiJSONRawMessages(ojson.GetBytesNoCopy(completedPayload, "response.output"))
 
 	s.mu.Lock()
@@ -354,7 +357,6 @@ func applyXAIWebsocketRequestContinuity(prepared *xaiPreparedRequest, mapper *xa
 	}
 	if targetChanged {
 		mapper.upstreamPreviousID = ""
-		mapper.state.resetOpaqueContinuityForTargetChange()
 	}
 	doc := prepared.ensureDoc()
 	mapper.upstreamRequestPayloadDoc(doc)
@@ -585,8 +587,11 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	doc := prepared.ensureDoc()
 	sanitizeXAIInputEncryptedContentForBaseURLDoc(doc, baseURL)
 	wsHeaders := applyXAIWebsocketHeaders(ctx, http.Header{}, auth, token, prepared.sessionID, opts.Headers)
-	wsReqBody := buildXAIWebsocketRequestBodyDoc(ctx, doc, prepared.finalizePayload)
-	prepared.body = wsReqBody
+	normalizeXAIWebsocketRequestDoc(doc)
+	// Keep provider-normalized input independent of payload mutations and transport retries.
+	transcriptInput := xaiJSONRawMessages(doc.Get("input"))
+	helps.FinalizePayloadDoc(helps.WithPayloadFinalizer(ctx, prepared.finalizePayload), doc)
+	wsReqBody := buildXAIWebsocketRequestBodyDoc(doc)
 	reporter.SetTranslatedReasoningEffort(wsReqBody, e.Identifier())
 	requestType := strings.TrimSpace(ojson.GetBytesNoCopy(req.Payload, "type").String())
 	transcriptReset := strings.TrimSpace(ojson.GetBytesNoCopy(wsReqBody, "previous_response_id").String()) == "" &&
@@ -638,6 +643,10 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		}
 		unlockStreamSession()
 		return nil, errDial
+	}
+	if targetChanged && idMapper != nil {
+		// The new connection owns continuity even if its request ends incomplete.
+		idMapper.state.resetOpaqueContinuityForTargetChange()
 	}
 	if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 		unlockStreamSession()
@@ -692,23 +701,23 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					return nil, errBind
 				}
 				readCh = sess.activate(conn)
-				wsReqBodyRetry := wsReqBody
+				// Transport retries reuse the exact final frame.
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
 					Headers:   wsHeaders.Clone(),
-					Body:      wsReqBodyRetry,
+					Body:      wsReqBody,
 					Provider:  e.Identifier(),
 					AuthID:    authID,
 					AuthLabel: authLabel,
 					AuthType:  authType,
 					AuthValue: authValue,
 				})
-				logXAIWebsocketRequest(executionSessionID, authID, wsURL, wsReqBodyRetry)
+				logXAIWebsocketRequest(executionSessionID, authID, wsURL, wsReqBody)
 				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 				reporter.StartResponseTTFT()
 				cliproxyexecutor.MarkUpstreamAttempt(ctx)
-				if errSendRetry := writeXAIWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
+				if errSendRetry := writeXAIWebsocketMessage(sess, connRetry, wsReqBody); errSendRetry != nil {
 					errSendRetry = mapXAIWebsocketWriteError(sess, connRetry, errSendRetry)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
@@ -716,7 +725,6 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					sess.reqMu.Unlock()
 					return nil, errSendRetry
 				}
-				wsReqBody = wsReqBodyRetry
 			} else {
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
@@ -937,7 +945,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						if warmupRequest {
 							warmupCompletedPayload = buildXAIWebsocketWarmupCompletedPayload(payload)
 							if idMapper != nil && idMapper.state != nil && !recordedTranscript {
-								idMapper.state.recordTranscriptTurn(wsReqBody, warmupCompletedPayload, transcriptReset)
+								idMapper.state.recordTranscriptTurn(transcriptInput, warmupCompletedPayload, transcriptReset)
 								recordedTranscript = true
 							}
 							logXAIWebsocketWarmupCompleted(executionSessionID, authID, wsURL, payload)
@@ -950,13 +958,13 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						payload = xaiNormalizeReasoningSummaryData(payload)
 						cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, payload)
 						if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
-							idMapper.state.recordTranscriptTurn(wsReqBody, payload, transcriptReset)
+							idMapper.state.recordTranscriptTurn(transcriptInput, payload, transcriptReset)
 							recordedTranscript = true
 						}
 					case "response.done":
 						logXAIWebsocketTerminalResponse(executionSessionID, authID, wsURL, eventType, payload)
 						if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
-							idMapper.state.recordTranscriptTurn(wsReqBody, payload, transcriptReset)
+							idMapper.state.recordTranscriptTurn(transcriptInput, payload, transcriptReset)
 							recordedTranscript = true
 						}
 					case "response.incomplete":
@@ -1001,7 +1009,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 
 					payload = normalizeCodexWebsocketCompletion(payload)
 					line := encodeCodexWebsocketAsSSE(payload)
-					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param, claudeInputTokens)
+					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, wsReqBody, line, &param, claudeInputTokens)
 					if helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 						invalidatePatchAttempt()
 					}
@@ -1020,7 +1028,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					if len(warmupCompletedPayload) > 0 {
 						reporter.MarkTerminal("completed")
 						line = encodeCodexWebsocketAsSSE(warmupCompletedPayload)
-						chunks = helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, line, &param, claudeInputTokens)
+						chunks = helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, wsReqBody, line, &param, claudeInputTokens)
 						if helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 							invalidatePatchAttempt()
 						}
@@ -1746,27 +1754,10 @@ func closeXAIWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 }
 
-func buildXAIWebsocketRequestBody(body []byte, finalizers ...helps.PayloadFinalizer) []byte {
-	if len(body) == 0 {
-		return nil
-	}
-	return buildXAIWebsocketRequestBodyDoc(context.Background(), ojson.NewDoc(body), finalizers...)
-}
-
-func buildXAIWebsocketRequestBodyDoc(ctx context.Context, doc *ojson.Doc, finalizers ...helps.PayloadFinalizer) []byte {
+// buildXAIWebsocketRequestBodyDoc only adds transport framing to a final business body.
+func buildXAIWebsocketRequestBodyDoc(doc *ojson.Doc) []byte {
 	if doc == nil || doc.Len() == 0 {
 		return nil
-	}
-	_ = doc.Set("type", "response.create")
-	_ = doc.Delete("stream")
-	_ = doc.Delete("stream_options")
-	_ = doc.Delete("background")
-	_ = doc.Set("store", true)
-	if strings.TrimSpace(doc.Get("previous_response_id").String()) != "" {
-		_ = doc.Delete("instructions")
-	}
-	if len(finalizers) > 0 && finalizers[0] != nil {
-		helps.FinalizePayloadDoc(helps.WithPayloadFinalizer(ctx, finalizers[0]), doc)
 	}
 	_ = doc.Set("type", "response.create")
 	return doc.Bytes()

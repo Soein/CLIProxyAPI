@@ -329,6 +329,65 @@ func TestHASharding_PluginSchedulerDelegateBuiltinOnlyUsesOwnedCandidates(t *tes
 			t.Fatalf("plugin candidates = %#v, want only z-local", plugin.requests)
 		}
 	})
+
+	t.Run("exclusion promotes the next owned priority", func(t *testing.T) {
+		manager, plugin := newManager(t, "test-a", "test-b")
+		manager.SetAuthRing(&stubRing{ready: true, mine: map[string]bool{"a-remote": false, "z-local": true, "low-local": true}})
+		plugin.resp.ExcludeCandidates = []string{"z-local"}
+		for _, candidate := range []*Auth{
+			{ID: "a-remote", Provider: "test-a", Attributes: map[string]string{"priority": "100"}},
+			{ID: "z-local", Provider: "test-b", Attributes: map[string]string{"priority": "50"}},
+			{ID: "low-local", Provider: "test-b"},
+		} {
+			if _, err := manager.Register(t.Context(), candidate); err != nil {
+				t.Fatalf("Register(%s): %v", candidate.ID, err)
+			}
+		}
+		selected, _, provider, err := manager.pickNextMixed(t.Context(), []string{"test-a", "test-b"}, "", cliproxyexecutor.Options{}, nil)
+		if err != nil || selected == nil || selected.ID != "low-local" || provider != "test-b" {
+			t.Fatalf("pickNextMixed() = (%#v, %q, %v), want (low-local, test-b, nil)", selected, provider, err)
+		}
+		if len(plugin.requests) != 1 || len(plugin.requests[0].Candidates) != 1 || plugin.requests[0].Candidates[0].ID != "z-local" {
+			t.Fatalf("plugin candidates = %#v, want only z-local", plugin.requests)
+		}
+	})
+}
+
+func TestHASharding_CodexContinuityUsesTheEligibleShard(t *testing.T) {
+	manager := newHAShardingManager(t, &RoundRobinSelector{}, "codex")
+	manager.SetSpilloverEnabled(true)
+	registerHAAuth(t, manager, "local", "codex")
+	registerHAAuth(t, manager, "remote", "codex")
+	providers := []string{"codex"}
+	candidates := func() []pluginapi.SchedulerContinuityCandidate {
+		return manager.buildCodexContinuityCandidates(t.Context(), providers, "", cliproxyexecutor.Options{}, 0, false, 0, time.Now())
+	}
+	if got := candidates(); len(got) != 1 || got[0].ID != "local" || got[0].InCooldown {
+		t.Fatalf("healthy owned shard: %v, want ready local credential only", got)
+	}
+	retryAfter := time.Minute
+	manager.MarkResult(t.Context(), Result{
+		AuthID:          "local",
+		Provider:        "codex",
+		CredentialScope: true,
+		Error:           &Error{HTTPStatus: 429, Message: "quota exhausted"},
+		RetryAfter:      &retryAfter,
+	})
+	if got := candidates(); len(got) != 2 || got[0].ID != "local" || !got[0].InCooldown || got[1].ID != "remote" || got[1].InCooldown {
+		t.Fatalf("exhausted owned shard with spillover: %v, want cooling local and ready remote", got)
+	}
+	manager.SetSpilloverEnabled(false)
+	if got := candidates(); len(got) != 1 || got[0].ID != "local" || !got[0].InCooldown {
+		t.Fatalf("strict shard: %v, want cooling local credential only", got)
+	}
+	if _, ready, cooling := manager.earliestPoolCooldownForModelAt(t.Context(), providers, "", cliproxyexecutor.Options{}, time.Now()); ready || !cooling {
+		t.Fatalf("strict shard pool status = (ready=%v, cooling=%v), want only cooling", ready, cooling)
+	}
+	manager.SetSpilloverEnabled(true)
+	manager.SetAuthRing(&stubRing{ready: false})
+	if got := candidates(); len(got) != 0 {
+		t.Fatalf("unready ring candidates = %v, want none", got)
+	}
 }
 
 func TestHASharding_RouteAwareLegacySelectionEnforcesOwnership(t *testing.T) {

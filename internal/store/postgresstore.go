@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -214,6 +214,7 @@ type PostgresStore struct {
 	persistAuthExpectedFn func(context.Context, string, []byte, uint64) (uint64, bool, error)
 	refreshSchemaMu       sync.Mutex
 	refreshSchemaReady    bool
+	refreshClaims         sync.Map
 }
 
 var (

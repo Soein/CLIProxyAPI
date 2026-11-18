@@ -3,7 +3,6 @@ package management
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -1239,15 +1239,7 @@ func (h *Handler) deleteTokenRecord(ctx context.Context, path string, expectedGe
 	return store.Delete(ctx, path)
 }
 
-func (h *Handler) deleteTokenRecordAndAuths(ctx context.Context, path string, fallbackID string) error {
-	if h == nil || h.authManager == nil {
-		expectedGeneration, errGeneration := h.authStoreGenerationForDelete(ctx, path, fallbackID, nil)
-		if errGeneration != nil {
-			return errGeneration
-		}
-		return h.deleteTokenRecord(ctx, path, expectedGeneration)
-	}
-	ids := h.authIDsForPath(path, fallbackID)
+func (h *Handler) deleteTokenRecordAndAuths(ctx context.Context, path string, fallbackID string, ids []string) error {
 	expectedGeneration, errGeneration := h.authStoreGenerationForDelete(ctx, path, fallbackID, ids)
 	if errGeneration != nil {
 		return errGeneration
@@ -1488,7 +1480,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 				AuthDir:          authDir,
 				Now:              time.Now(),
 				IDGenerator:      synthesizer.NewStableIDGenerator(),
-				PluginAuthParser: h.pluginHost,
+				PluginAuthParser: h.pluginHostSnapshot(),
 			}, savedPath, data)
 			if errSynthesize != nil {
 				return savedPath, fmt.Errorf("synthesize persisted auth failed: %w", errSynthesize)
