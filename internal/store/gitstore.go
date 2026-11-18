@@ -567,6 +567,29 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+// PersistAuthFileUpload runs update with exclusive access to the source file and
+// repository. update writes the mirror, invokes persist synchronously, and can
+// restore the mirror on failure before any watcher persistence can read it.
+func (s *GitTokenStore) PersistAuthFileUpload(ctx context.Context, path, resolvedPath string, update func(persist func() error) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockPath := authfilelock.Lock(path, resolvedPath)
+	defer unlockPath()
+	if errEnsure := s.ensureRepositoryContextLocked(ctx); errEnsure != nil {
+		return errEnsure
+	}
+	relPath, errRel := s.relativeToRepo(path)
+	if errRel != nil {
+		return errRel
+	}
+	if info, errStat := os.Lstat(path); errStat == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("git token store: cannot persist uploaded credentials through a symlink")
+	}
+	return update(func() error {
+		return s.commitAndPushContextLocked(ctx, "Upload auth "+filepath.Base(path), relPath)
+	})
+}
+
 // PersistAuthFiles commits and pushes the provided paths to the remote repository.
 // It no-ops when the store is not fully configured or when there are no paths.
 func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, paths ...string) error {

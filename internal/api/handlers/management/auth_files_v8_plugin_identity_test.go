@@ -118,6 +118,222 @@ func registerDummyModelForClient(t *testing.T, clientID, provider string) {
 	})
 }
 
+type v8UploadMirrorStore struct {
+	memoryAuthStore
+	persist func(string) error
+}
+
+func (s *v8UploadMirrorStore) PersistAuthFiles(_ context.Context, _ string, paths ...string) error {
+	if len(paths) != 1 {
+		return fmt.Errorf("expected one source path, got %v", paths)
+	}
+	return s.persist(paths[0])
+}
+
+func TestUploadAuthFileV8_BackendFailureKeepsPreviousCredentialAndCanRetry(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	const name = "provider.json"
+	const previous = `{"type":"qwen","email":"previous@example.com"}`
+	const replacement = `{"type":"qwen","email":"replacement@example.com"}`
+	authDir := t.TempDir()
+	dest := filepath.Join(authDir, name)
+	store := &v8UploadMirrorStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = store
+	router := newV8AndV0AuthRouter(h)
+	upload := func(payload string) *httptest.ResponseRecorder {
+		return performUploadRequest(t, router, "/v8/management/credentials", false,
+			map[string]string{name: payload}, []string{name})
+	}
+	var remote string
+	var backendErr error
+	store.persist = func(path string) error {
+		if path != dest {
+			return fmt.Errorf("unexpected source path %q", path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if backendErr != nil {
+			return backendErr
+		}
+		remote = string(data)
+		return nil
+	}
+	if rec := upload(previous); rec.Code != http.StatusOK {
+		t.Fatalf("seed upload status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	backendErr = errors.New("backend rejected write")
+	if rec := upload(replacement); rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), backendErr.Error()) {
+		t.Fatalf("upload status = %d, body = %s, want HTTP 500 with persistence error", rec.Code, rec.Body.String())
+	}
+	if current, _ := manager.GetByID(name); current == nil || current.Label != "previous@example.com" {
+		t.Fatalf("manager changed the credential after a failed write: %+v", current)
+	}
+	if data, err := os.ReadFile(dest); err != nil || string(data) != previous || remote != previous {
+		t.Fatalf("failed write changed credential source: mirror %q (%v), remote %q", data, err, remote)
+	}
+	backendErr = nil
+	if rec := upload(replacement); rec.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if current, _ := manager.GetByID(name); current == nil || current.Label != "replacement@example.com" || remote != replacement {
+		t.Fatalf("retry did not commit the replacement: manager %+v, remote %q", current, remote)
+	}
+}
+
+func TestUploadAuthFileV8_FailedBackendDoesNotPublishWatcherSnapshot(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	const name = "watched.json"
+	const payload = `{"type":"qwen","email":"pending@example.com"}`
+	cfg := &config.Config{AuthDir: t.TempDir()}
+	store := &v8UploadMirrorStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	var watcherPublished bool
+	store.persist = func(path string) error {
+		data, errRead := os.ReadFile(path)
+		if errRead != nil {
+			t.Fatalf("read uploaded mirror: %v", errRead)
+		}
+		observed, errSynthesize := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
+			Config: cfg, AuthDir: cfg.AuthDir, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator(),
+		}, path, data)
+		if errSynthesize != nil || len(observed) != 1 {
+			t.Fatalf("watcher observation = %+v (%v), want one credential", observed, errSynthesize)
+		}
+		if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), observed[0]); errRegister != nil {
+			t.Fatalf("register watcher snapshot: %v", errRegister)
+		}
+		_, watcherPublished = manager.GetByID(name)
+		return errors.New("backend rejected write")
+	}
+	rec := performUploadRequest(t, newV8AndV0AuthRouter(h), "/v8/management/credentials", false,
+		map[string]string{name: payload}, []string{name})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("upload status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if watcherPublished || len(managerAuthIDs(manager)) != 0 {
+		t.Fatalf("failed upload became active through watcher publication: %v", managerAuthIDs(manager))
+	}
+	if _, errStat := os.Stat(filepath.Join(cfg.AuthDir, name)); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("failed upload left a new mirror on disk: %v", errStat)
+	}
+}
+
+func TestUploadAuthFileV8_FailedBackendPreservesConcurrentFileEdit(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	const name = "edited.json"
+	const concurrent = `{"type":"qwen","email":"concurrent@example.com"}`
+	cfg := &config.Config{AuthDir: t.TempDir()}
+	store := &v8UploadMirrorStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	store.persist = func(path string) error {
+		if errWrite := os.WriteFile(path, []byte(concurrent), 0o600); errWrite != nil {
+			t.Fatalf("simulate file edit during upload: %v", errWrite)
+		}
+		return errors.New("backend rejected write")
+	}
+	rec := performUploadRequest(t, newV8AndV0AuthRouter(h), "/v8/management/credentials", false,
+		map[string]string{name: `{"type":"qwen","email":"upload@example.com"}`}, []string{name})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("upload status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if data, err := os.ReadFile(filepath.Join(cfg.AuthDir, name)); err != nil || string(data) != concurrent {
+		t.Fatalf("failed upload lost the concurrent edit: mirror %q (%v)", data, err)
+	}
+}
+
+func TestUploadAuthFileV8_PlainStoreMirrorWriteFailureDoesNotSave(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	const name = "blocked.json"
+	authDir := t.TempDir()
+	if errMkdir := os.Mkdir(filepath.Join(authDir, name), 0o700); errMkdir != nil {
+		t.Fatalf("create directory at upload destination: %v", errMkdir)
+	}
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	rec := performUploadRequest(t, newV8AndV0AuthRouter(h), "/v8/management/credentials", false,
+		map[string]string{name: `{"type":"qwen"}`}, []string{name})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("upload status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if stored, errList := store.List(context.Background()); errList != nil || len(stored) != 0 {
+		t.Fatalf("failed mirror write persisted a credential: %v (%v)", stored, errList)
+	}
+}
+
+func TestUploadAuthFileV8_PersisterRejectsDanglingSymlink(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	const name = "dangling.json"
+	authDir := t.TempDir()
+	target := filepath.Join(authDir, "missing.json")
+	link := filepath.Join(authDir, name)
+	if errLink := os.Symlink(target, link); errLink != nil {
+		t.Skipf("symlinks unavailable: %v", errLink)
+	}
+	var persisted bool
+	store := &v8UploadMirrorStore{persist: func(string) error {
+		persisted = true
+		return nil
+	}}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	rec := performUploadRequest(t, newV8AndV0AuthRouter(h), "/v8/management/credentials", false,
+		map[string]string{name: `{"type":"qwen"}`}, []string{name})
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "symlink") || persisted {
+		t.Fatalf("upload status = %d, body = %s, persisted = %t; want symlink rejection before persisting", rec.Code, rec.Body.String(), persisted)
+	}
+	if actual, errLink := os.Readlink(link); errLink != nil || actual != target {
+		t.Fatalf("upload changed symlink: got %q (%v), want %q", actual, errLink, target)
+	}
+	if _, errStat := os.Stat(target); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("upload changed absent symlink target: %v", errStat)
+	}
+}
+
+func TestUploadAuthFileV8_PlainStoreSavesSourceOnceForPluginAliases(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	const name = "vendor.json"
+	const payload = `{"type":"vendor", "access_token":"source-token"}`
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	host := pluginhost.New()
+	host.RegisterPluginForTest("vendor-plugin", pluginapi.Plugin{
+		Capabilities: pluginapi.Capabilities{AuthProvider: &v8UploadTestAuthProvider{
+			testAuthProvider: testAuthProvider{identifier: "vendor", identifiers: []string{"vendor"}},
+			parseFn: func(_ context.Context, _ pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+				return pluginapi.AuthParseResponse{Handled: true, Auths: []pluginapi.AuthData{
+					{Provider: "vendor", ID: "project-a", StorageJSON: []byte(`{"type":"vendor","access_token":"alias-a"}`)},
+					{Provider: "vendor", ID: "project-b", StorageJSON: []byte(`{"type":"vendor","access_token":"alias-b"}`)},
+				}}, nil
+			},
+		}},
+	})
+	h.SetPluginHost(host)
+	rec := performUploadRequest(t, newV8AndV0AuthRouter(h), "/v8/management/credentials", false,
+		map[string]string{name: payload}, []string{name})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	stored, errList := store.List(context.Background())
+	if errList != nil || len(stored) != 1 || stored[0].ID != name || stored[0].Metadata["access_token"] != "source-token" {
+		t.Fatalf("stored records = %+v (%v), want only the original source credential", stored, errList)
+	}
+	if ids := managerAuthIDs(manager); len(ids) != 2 || ids[0] != "project-a" || ids[1] != "project-b" {
+		t.Fatalf("runtime identities = %v, want both plugin aliases", ids)
+	}
+	if data, err := os.ReadFile(filepath.Join(authDir, name)); err != nil || string(data) != payload {
+		t.Fatalf("local source = %q (%v), want exact bytes %q", data, err, payload)
+	}
+}
+
 func TestUploadAuthFileV8_VersionedStorePublishesCanonicalSource(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	const filename = "vendor.json"

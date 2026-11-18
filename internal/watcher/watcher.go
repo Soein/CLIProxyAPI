@@ -82,6 +82,7 @@ type Watcher struct {
 	oldConfigYaml              []byte
 
 	deferredFileSnapshotRereads map[string]*coreauth.Auth // Guarded by clientsMutex; coalesced by source path.
+	deferredAuthFileEvents      map[string]struct{}       // Guarded by clientsMutex; coalesced by source path.
 	fileSnapshotRereadStop      chan struct{}
 	fileSnapshotRereadWG        sync.WaitGroup
 }
@@ -181,6 +182,7 @@ func (w *Watcher) Stop() error {
 		w.fileSnapshotRereadStop = nil
 	}
 	w.deferredFileSnapshotRereads = nil
+	w.deferredAuthFileEvents = nil
 	w.clientsMutex.Unlock()
 	w.fileSnapshotRereadWG.Wait()
 	w.stopDispatch()

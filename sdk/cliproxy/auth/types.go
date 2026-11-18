@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 )
 
 // PostAuthHook defines a function that is called after an Auth record is created
@@ -393,8 +394,8 @@ func authFileDigestMatchesDisk(path, digest string) bool {
 	if path == "" || digest == "" {
 		return false
 	}
-	data, errRead := readAuthSnapshotFileFunc(path)
-	return errRead == nil && len(data) > 0 && canonicalAuthFileDigest(data) == digest
+	data, pending, errRead := authfilelock.ReadCommittedFile(path, readAuthSnapshotFileFunc)
+	return pending == nil && errRead == nil && len(data) > 0 && canonicalAuthFileDigest(data) == digest
 }
 
 // SameFileSnapshot reports whether two unversioned file snapshots observed the
@@ -416,15 +417,7 @@ func (a *Auth) FileSnapshotMatchesDisk() bool {
 	if !a.HasFileSnapshot() {
 		return true
 	}
-	path := a.FileSnapshotPath()
-	if path == "" {
-		return false
-	}
-	data, errRead := readAuthSnapshotFileFunc(path)
-	if errRead != nil || len(data) == 0 {
-		return false
-	}
-	return canonicalAuthFileDigest(data) == a.fileSnapshotDigest
+	return authFileDigestMatchesDisk(a.FileSnapshotPath(), a.fileSnapshotDigest)
 }
 
 const (

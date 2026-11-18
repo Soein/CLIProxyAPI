@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -113,18 +114,12 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 						continue
 					}
 					fullPath := filepath.Join(resolvedAuthDir, name)
-					data, errReadFile := os.ReadFile(fullPath)
-					if errReadFile != nil {
-						if !errors.Is(errReadFile, fs.ErrNotExist) {
-							if incompleteRescanPaths == nil {
-								incompleteRescanPaths = make(map[string]struct{})
-							}
-							incompleteRescanPaths[w.normalizeAuthPath(fullPath)] = struct{}{}
-						}
+					data, pending, errReadFile := authfilelock.ReadCommittedFile(fullPath, os.ReadFile)
+					if errors.Is(errReadFile, fs.ErrNotExist) {
 						continue
 					}
 					normalizedPath := w.normalizeAuthPath(fullPath)
-					if !json.Valid(data) {
+					if pending != nil || errReadFile != nil || !json.Valid(data) {
 						if incompleteRescanPaths == nil {
 							incompleteRescanPaths = make(map[string]struct{})
 						}
@@ -358,7 +353,10 @@ func (w *Watcher) addOrUpdateClientLocked(path string) {
 		return
 	}
 	w.observeAuthFile(path)
-	data, errRead := os.ReadFile(path)
+	data, errRead := w.readAuthEventFile(path, os.ReadFile)
+	if errors.Is(errRead, errAuthUploadPending) {
+		return
+	}
 	if errRead != nil {
 		log.Errorf("failed to read auth file %s: %v", filepath.Base(path), errRead)
 		return

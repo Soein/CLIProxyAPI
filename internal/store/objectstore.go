@@ -227,6 +227,10 @@ func (s *ObjectTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error)
 	if dir == "" {
 		return nil, fmt.Errorf("object store: auth directory not configured")
 	}
+	// An explicit upload may still need to restore the previous mirror if its
+	// object write fails. Load only after the upload has finished.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	entries := make([]*cliproxyauth.Auth, 0, 32)
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -275,6 +279,19 @@ func (s *ObjectTokenStore) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	return nil
+}
+
+// PersistAuthFileUpload runs update with exclusive access to the source file and
+// remote writes. update writes the mirror, invokes persist synchronously, and
+// can restore the mirror before any watcher persistence can read it.
+func (s *ObjectTokenStore) PersistAuthFileUpload(ctx context.Context, path, resolvedPath string, update func(persist func() error) error) error {
+	unlockPath := authfilelock.Lock(path, resolvedPath)
+	defer unlockPath()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return update(func() error {
+		return s.uploadAuth(ctx, path)
+	})
 }
 
 // PersistAuthFiles uploads the provided auth files to the object storage backend.

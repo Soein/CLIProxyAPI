@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,8 +14,11 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 	log "github.com/sirupsen/logrus"
 )
+
+var errAuthUploadPending = errors.New("auth file upload is pending")
 
 func matchProvider(provider string, targets []string) (string, bool) {
 	p := strings.ToLower(strings.TrimSpace(provider))
@@ -140,6 +144,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		if w.shouldDebounceRemove(normalizedName, now) {
+			w.checkAuthFileForRemoval(event.Name)
 			log.Debugf("debouncing remove event for %s", filepath.Base(event.Name))
 			return
 		}
@@ -149,10 +154,11 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		if !w.isPathInAuthDir(normalizedName, w.currentAuthDir()) {
 			return
 		}
-		statSucceeded := false
-		if _, statErr := os.Stat(event.Name); statErr == nil {
-			statSucceeded = true
-		} else if w.isKnownAuthFile(event.Name) {
+		exists, pending := w.checkAuthFileForRemoval(event.Name)
+		if pending {
+			return
+		}
+		if !exists && w.isKnownAuthFile(event.Name) {
 			// On macOS (and under disk I/O pressure), atomic replace (e.g. os.Rename from temp file)
 			// can trigger a NOTE_DELETE before the target inode is fully visible. Retry briefly
 			// before treating a known auth file as permanently removed.
@@ -161,37 +167,100 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 				if !w.isPathInAuthDir(normalizedName, w.currentAuthDir()) {
 					return
 				}
-				if _, retryErr := os.Stat(event.Name); retryErr == nil {
-					statSucceeded = true
+				exists, pending = w.checkAuthFileForRemoval(event.Name)
+				if pending {
+					return
+				}
+				if exists {
 					break
 				}
 			}
 		}
-		if statSucceeded {
-			if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
-				log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
+		if !exists {
+			if !w.isKnownAuthFile(event.Name) {
+				log.Debugf("ignoring remove for unknown auth file: %s", filepath.Base(event.Name))
 				return
 			}
 			log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-			w.addOrUpdateClientLocked(event.Name)
+			w.removeClientLocked(event.Name)
 			return
 		}
-		if !w.isKnownAuthFile(event.Name) {
-			log.Debugf("ignoring remove for unknown auth file: %s", filepath.Base(event.Name))
-			return
+	}
+	if unchanged, errSame := w.authFileUnchanged(event.Name); unchanged || errors.Is(errSame, errAuthUploadPending) {
+		if unchanged {
+			log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
 		}
-		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.removeClientLocked(event.Name)
 		return
 	}
-	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
-		if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
-			log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
+	log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
+	w.addOrUpdateClientLocked(event.Name)
+}
+
+func (w *Watcher) checkAuthFileForRemoval(path string) (exists, pending bool) {
+	_, errStat := w.readAuthEventFile(path, statAuthFile)
+	return errStat == nil, errors.Is(errStat, errAuthUploadPending)
+}
+
+func statAuthFile(path string) ([]byte, error) {
+	_, errStat := os.Stat(path)
+	return nil, errStat
+}
+
+func (w *Watcher) readAuthEventFile(path string, read func(string) ([]byte, error)) ([]byte, error) {
+	data, pending, errRead := authfilelock.ReadCommittedFile(path, read)
+	if pending == nil {
+		return data, errRead
+	}
+	w.deferAuthFileEvent(path, pending)
+	return nil, errAuthUploadPending
+}
+
+// deferAuthFileEvent waits outside watcher locks and rechecks the final mirror.
+func (w *Watcher) deferAuthFileEvent(path string, done <-chan struct{}) {
+	key := w.normalizeAuthPath(path)
+	if absolute, errAbs := filepath.Abs(key); errAbs == nil {
+		key = w.normalizeAuthPath(absolute)
+	}
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	if w.stopped.Load() {
+		return
+	}
+	if _, exists := w.deferredAuthFileEvents[key]; exists {
+		return
+	}
+	if w.deferredAuthFileEvents == nil {
+		w.deferredAuthFileEvents = make(map[string]struct{})
+	}
+	w.deferredAuthFileEvents[key] = struct{}{}
+	if w.fileSnapshotRereadStop == nil {
+		w.fileSnapshotRereadStop = make(chan struct{})
+	}
+	stop := w.fileSnapshotRereadStop
+	w.fileSnapshotRereadWG.Add(1)
+	go func() {
+		defer w.fileSnapshotRereadWG.Done()
+		select {
+		case <-done:
+		case <-stop:
 			return
 		}
-		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.addOrUpdateClientLocked(event.Name)
-	}
+		w.authRescanMu.Lock()
+		defer w.authRescanMu.Unlock()
+		w.clientsMutex.Lock()
+		delete(w.deferredAuthFileEvents, key)
+		current := !w.stopped.Load() && w.isPathInCurrentAuthDirLocked(path)
+		w.clientsMutex.Unlock()
+		if !current {
+			return
+		}
+		_, errStat := w.readAuthEventFile(path, statAuthFile)
+		if errStat == nil {
+			w.addOrUpdateClientLocked(path)
+		} else if os.IsNotExist(errStat) && w.isKnownAuthFile(path) {
+			w.removeClientLocked(path)
+		}
+	}()
 }
 
 // observeAuthFile invalidates in-flight scans even if hash or content deduplication
@@ -220,7 +289,7 @@ func (w *Watcher) observeAuthFile(path string) {
 }
 
 func (w *Watcher) authFileUnchanged(path string) (bool, error) {
-	data, errRead := os.ReadFile(path)
+	data, errRead := w.readAuthEventFile(path, os.ReadFile)
 	if errRead != nil {
 		return false, errRead
 	}

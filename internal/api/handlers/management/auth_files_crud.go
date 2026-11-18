@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -358,6 +359,9 @@ func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte)
 	dst = filepath.Clean(dst)
 
 	store := h.authManager.GetStore()
+	if store == nil {
+		store = h.tokenStoreWithBaseDir()
+	}
 	_, versioned := store.(coreauth.VersionedAuthStore)
 	// Versioned stores address credentials by source ID on other nodes and
 	// after reload. Publish that same canonical identity for those stores.
@@ -378,14 +382,11 @@ func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte)
 		}
 	} else {
 		needCodexLock := h.shouldLockCodexAuthFileV8(dst, metadata, auths)
-		releaseFile := authfilelock.Lock(dst, canonicalV8AuthFilePath(dst))
-		errWrite := h.writeAuthFileBytesV8(dst, data, needCodexLock)
-		releaseFile()
-		if errWrite != nil {
-			return fmt.Errorf("failed to write file: %w", errWrite)
+		if errPersist := h.persistV8UploadedAuthFile(ctx, store, dst, data, needCodexLock); errPersist != nil {
+			return errPersist
 		}
 	}
-	if errReconcile := h.reconcileV8UploadedAuths(ctx, dst, auths, !versioned); errReconcile != nil {
+	if errReconcile := h.reconcileV8UploadedAuths(ctx, dst, auths); errReconcile != nil {
 		return errReconcile
 	}
 	if h.postAuthPersistHook != nil {
@@ -399,6 +400,122 @@ func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte)
 		}
 	}
 	return nil
+}
+
+func (h *Handler) persistV8UploadedAuthFile(ctx context.Context, store coreauth.Store, dst string, data []byte, lockCodex bool) error {
+	if _, fileStore := store.(*sdkAuth.FileTokenStore); store == nil || fileStore {
+		unlockPath := authfilelock.Lock(dst, canonicalV8AuthFilePath(dst))
+		defer unlockPath()
+		if errWrite := h.writeAuthFileBytesV8(dst, data, lockCodex); errWrite != nil {
+			return fmt.Errorf("failed to write file: %w", errWrite)
+		}
+		return nil
+	}
+	resolvedDst, errResolve := resolveV8AuthMirror(dst)
+	if errResolve != nil {
+		return errResolve
+	}
+	finishUpload := authfilelock.BeginUpload(dst, resolvedDst)
+	defer finishUpload()
+
+	if persister, ok := store.(interface {
+		PersistAuthFiles(context.Context, string, ...string) error
+	}); ok {
+		if uploader, ok := store.(interface {
+			PersistAuthFileUpload(context.Context, string, string, func(func() error) error) error
+		}); ok {
+			return uploader.PersistAuthFileUpload(ctx, dst, resolvedDst, func(persist func() error) error {
+				// The backend owns both file and persistence locks for this callback.
+				return h.writeAndPersistV8AuthMirror(dst, resolvedDst, data, lockCodex, func(...string) func() { return func() {} }, persist)
+			})
+		}
+		return h.writeAndPersistV8AuthMirror(dst, resolvedDst, data, lockCodex, authfilelock.Lock, func() error {
+			return persister.PersistAuthFiles(ctx, "Upload auth "+filepath.Base(dst), dst)
+		})
+	}
+	// Plugin identities are runtime projections of the uploaded source.
+	source, _, errBuild := h.buildAuthsFromFileDataV8(dst, data, false)
+	if errBuild != nil {
+		return errBuild
+	}
+	source[0].ClearFileSnapshot()
+	return h.writeAndPersistV8AuthMirror(dst, resolvedDst, data, lockCodex, authfilelock.Lock, func() error {
+		_, errSave := store.Save(coreauth.WithAuthCreationIntent(ctx), source[0])
+		return errSave
+	})
+}
+
+func resolveV8AuthMirror(dst string) (string, error) {
+	info, errStat := os.Lstat(dst)
+	if errors.Is(errStat, os.ErrNotExist) {
+		return canonicalV8AuthFilePath(dst), nil
+	}
+	if errStat != nil {
+		return "", fmt.Errorf("inspect auth file before upload: %w", errStat)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return canonicalV8AuthFilePath(dst), nil
+	}
+	target, errResolve := filepath.EvalSymlinks(dst)
+	if errResolve != nil {
+		return "", fmt.Errorf("resolve auth file symlink before upload: %w", errResolve)
+	}
+	return target, nil
+}
+
+func (h *Handler) writeAndPersistV8AuthMirror(dst, resolvedDst string, data []byte, lockCodex bool, lockPath func(...string) func(), persist func() error) error {
+	unlockPath := lockPath(dst, resolvedDst)
+	currentTarget, errResolve := resolveV8AuthMirror(dst)
+	if errResolve != nil || currentTarget != resolvedDst {
+		unlockPath()
+		if errResolve != nil {
+			return errResolve
+		}
+		return fmt.Errorf("auth file destination changed during upload")
+	}
+	previous, errRead := os.ReadFile(dst)
+	if errRead != nil && !errors.Is(errRead, os.ErrNotExist) {
+		unlockPath()
+		return fmt.Errorf("read auth file before upload: %w", errRead)
+	}
+	errWrite := h.writeAuthFileBytesV8(dst, data, lockCodex)
+	writtenTarget := canonicalV8AuthFilePath(dst)
+	writtenFile, errStat := os.Stat(writtenTarget)
+	unlockPath()
+	if errWrite != nil {
+		return fmt.Errorf("failed to write file: %w", errWrite)
+	}
+	if errPersist := persist(); errPersist != nil {
+		errRestore := errStat
+		if errRestore == nil {
+			unlockRollback := lockPath(dst, writtenTarget)
+			errRestore = h.restoreV8AuthMirror(dst, writtenTarget, writtenFile, data, previous, errRead == nil, lockCodex)
+			unlockRollback()
+		}
+		if errRestore != nil && !errors.Is(errRestore, os.ErrNotExist) {
+			errPersist = errors.Join(errPersist, fmt.Errorf("restore auth file after failed upload: %w", errRestore))
+		}
+		return fmt.Errorf("persist uploaded auth file: %w", errPersist)
+	}
+	return nil
+}
+
+func (h *Handler) restoreV8AuthMirror(dst, writtenTarget string, writtenFile os.FileInfo, uploaded, previous []byte, existed, lockCodex bool) error {
+	if canonicalV8AuthFilePath(dst) != writtenTarget {
+		return nil
+	}
+	currentFile, errStat := os.Stat(writtenTarget)
+	if errStat != nil || !os.SameFile(writtenFile, currentFile) {
+		return errStat
+	}
+	current, errRead := os.ReadFile(writtenTarget)
+	if errRead != nil || !bytes.Equal(current, uploaded) {
+		return errRead
+	}
+	if existed {
+		return h.writeAuthFileBytesV8(dst, previous, lockCodex)
+	}
+	return os.Remove(writtenTarget)
 }
 
 func (h *Handler) writeAuthFileBytesV8(dst string, data []byte, lockCodex bool) error {
@@ -1081,7 +1198,7 @@ func parseV8AuthMetadataObject(data []byte) (map[string]any, error) {
 	return make(map[string]any), nil
 }
 
-func (h *Handler) reconcileV8UploadedAuths(ctx context.Context, dst string, auths []*coreauth.Auth, persistFile bool) error {
+func (h *Handler) reconcileV8UploadedAuths(ctx context.Context, dst string, auths []*coreauth.Auth) error {
 	if h == nil || h.authManager == nil {
 		return nil
 	}
@@ -1106,15 +1223,6 @@ func (h *Handler) reconcileV8UploadedAuths(ctx context.Context, dst string, auth
 		}
 		if h.authMatchesV8SourcePath(existing, dst, resolvedDst) {
 			h.removeAuthAndUnregister(skipPersistCtx, existing.ID)
-		}
-	}
-	if persistFile {
-		if persister, ok := h.tokenStoreWithBaseDir().(interface {
-			PersistAuthFiles(context.Context, string, ...string) error
-		}); ok {
-			if errPersist := persister.PersistAuthFiles(ctx, fmt.Sprintf("Upload auth %s", filepath.Base(dst)), dst); errPersist != nil {
-				log.WithError(errPersist).Warnf("failed to persist uploaded auth file %s to backing store", filepath.Base(dst))
-			}
 		}
 	}
 	return nil

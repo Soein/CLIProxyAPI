@@ -715,6 +715,42 @@ func TestGitTokenStoreSaveRetryAfterLeaseConflictCommitsMatchingContent(t *testi
 	assertRemoteTreePath(t, remoteDir, "master", "auths/concurrent.json", true)
 }
 
+func TestGitTokenStorePersistAuthFileUploadRetriesFailedPush(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "remote master branch\n"})
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatalf("EnsureRepository: %v", errEnsure)
+	}
+	path := filepath.Join(store.AuthDir(), "uploaded.json")
+	const payload = "{\n  \"type\": \"vendor\", \"access_token\": \"uploaded\"\n}\n"
+	ctx := context.Background()
+	upload := func() error {
+		return store.PersistAuthFileUpload(ctx, path, path, func(persist func() error) error {
+			if errWrite := os.WriteFile(path, []byte(payload), 0o600); errWrite != nil {
+				return errWrite
+			}
+			if errPersist := persist(); errPersist != nil {
+				return errors.Join(errPersist, os.Remove(path))
+			}
+			return nil
+		})
+	}
+	errRejected := errors.New("push rejected")
+	store.pushFn = func(context.Context, *git.Repository, *git.PushOptions) error { return errRejected }
+	if errUpload := upload(); !errors.Is(errUpload, errRejected) {
+		t.Fatalf("first upload = %v, want push rejection", errUpload)
+	}
+	assertRemoteTreePath(t, remoteDir, "master", "auths/uploaded.json", false)
+
+	store.pushFn = nil
+	if errUpload := upload(); errUpload != nil {
+		t.Fatalf("retry upload: %v", errUpload)
+	}
+	assertRemoteFileContents(t, remoteDir, "master", "auths/uploaded.json", payload)
+}
+
 func TestGitTokenStoreConcurrentInitializationDoesNotOverwriteCreatedBranch(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := filepath.Join(root, "remote.git")

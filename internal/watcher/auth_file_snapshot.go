@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/authfilelock"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
@@ -36,7 +37,10 @@ func (w *Watcher) SnapshotAuthFile(path string) ([]*coreauth.Auth, error) {
 	}
 	authDir = filepath.Clean(absoluteAuthDir)
 	path = filepath.Clean(absolutePath)
-	data, errReadFile := os.ReadFile(path)
+	data, pending, errReadFile := authfilelock.ReadCommittedFile(path, os.ReadFile)
+	if pending != nil {
+		return nil, errAuthUploadPending
+	}
 	if errReadFile != nil {
 		return nil, fmt.Errorf("read auth file: %w", errReadFile)
 	}
